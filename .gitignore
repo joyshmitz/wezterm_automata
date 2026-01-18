@@ -1,2 +1,51 @@
-# bv (beads viewer) local config and caches
+# Rust build artifacts
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# macOS resource forks
+._*
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Beads viewer local config
 .bv/
+
+# Legacy WezTerm source (vendored for reference)
+legacy_wezterm/
+
+# SQLite databases (runtime)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Log files
+*.log
+logs/
+
+# Test artifacts
+test_output/
+coverage/
+*.profraw
+*.profdata
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Generated documentation (build on demand)
+doc/

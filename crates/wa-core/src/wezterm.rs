@@ -14,6 +14,10 @@ use serde_json::Value;
 
 use crate::Result;
 use crate::error::WeztermError;
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
+use tokio::time::{Instant, sleep};
 
 /// Pane size information
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -495,9 +499,269 @@ impl WeztermClient {
     }
 }
 
+// =============================================================================
+// PaneWaiter: shared wait-for logic (substring/regex) with timeout/backoff
+// =============================================================================
+
+/// Source of pane text for wait operations.
+///
+/// This abstraction allows PaneWaiter to be tested without invoking WezTerm.
+pub trait PaneTextSource {
+    /// Future returned by get_text.
+    type Fut<'a>: Future<Output = Result<String>> + Send + 'a
+    where
+        Self: 'a;
+
+    /// Fetch the pane text. Implementations may ignore tail_lines and return full text.
+    fn get_text(&self, pane_id: u64, escapes: bool) -> Self::Fut<'_>;
+}
+
+impl PaneTextSource for WeztermClient {
+    type Fut<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
+
+    fn get_text(&self, pane_id: u64, escapes: bool) -> Self::Fut<'_> {
+        Box::pin(async move { self.get_text(pane_id, escapes).await })
+    }
+}
+
+/// Wait matcher kinds for pane text.
+#[derive(Debug, Clone)]
+pub enum WaitMatcher {
+    /// Simple substring match (fast path).
+    Substring(String),
+    /// Regex match (explicit; use for structured patterns).
+    Regex(fancy_regex::Regex),
+}
+
+impl WaitMatcher {
+    /// Create a substring matcher.
+    #[must_use]
+    pub fn substring(value: impl Into<String>) -> Self {
+        Self::Substring(value.into())
+    }
+
+    /// Create a regex matcher from a compiled regex.
+    #[must_use]
+    pub fn regex(regex: fancy_regex::Regex) -> Self {
+        Self::Regex(regex)
+    }
+
+    fn matches(&self, haystack: &str) -> Result<bool> {
+        match self {
+            Self::Substring(needle) => Ok(haystack.contains(needle)),
+            Self::Regex(regex) => regex
+                .is_match(haystack)
+                .map_err(|e| crate::error::PatternError::InvalidRegex(e.to_string()).into()),
+        }
+    }
+
+    fn description(&self) -> String {
+        match self {
+            Self::Substring(needle) => format!(
+                "substring(len={}, hash={:016x})",
+                needle.len(),
+                stable_hash(needle.as_bytes())
+            ),
+            Self::Regex(regex) => {
+                let pattern = regex.as_str();
+                format!(
+                    "regex(len={}, hash={:016x})",
+                    pattern.len(),
+                    stable_hash(pattern.as_bytes())
+                )
+            }
+        }
+    }
+}
+
+/// Options for wait-for polling behavior.
+#[derive(Debug, Clone)]
+pub struct WaitOptions {
+    /// Number of tail lines to consider for matching (0 = empty).
+    pub tail_lines: usize,
+    /// Whether to include escape sequences.
+    pub escapes: bool,
+    /// Initial polling interval.
+    pub poll_initial: Duration,
+    /// Maximum polling interval.
+    pub poll_max: Duration,
+    /// Maximum number of polls before forcing timeout.
+    pub max_polls: usize,
+}
+
+impl Default for WaitOptions {
+    fn default() -> Self {
+        Self {
+            tail_lines: 200,
+            escapes: false,
+            poll_initial: Duration::from_millis(50),
+            poll_max: Duration::from_millis(1000),
+            max_polls: 10_000,
+        }
+    }
+}
+
+/// Outcome of a wait-for operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitResult {
+    /// Matcher satisfied within timeout.
+    Matched { elapsed_ms: u64, polls: usize },
+    /// Timeout elapsed (or max_polls reached) without a match.
+    TimedOut {
+        elapsed_ms: u64,
+        polls: usize,
+        last_tail_hash: Option<u64>,
+    },
+}
+
+/// Shared waiter for polling pane text until a matcher succeeds.
+pub struct PaneWaiter<'a, S: PaneTextSource + Sync + ?Sized> {
+    source: &'a S,
+    options: WaitOptions,
+}
+
+impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
+    /// Create a new PaneWaiter with default options.
+    #[must_use]
+    pub fn new(source: &'a S) -> Self {
+        Self {
+            source,
+            options: WaitOptions::default(),
+        }
+    }
+
+    /// Override default wait options.
+    #[must_use]
+    pub fn with_options(mut self, options: WaitOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Wait for a matcher to appear in the pane within the given timeout.
+    pub async fn wait_for(
+        &self,
+        pane_id: u64,
+        matcher: &WaitMatcher,
+        timeout: Duration,
+    ) -> Result<WaitResult> {
+        let matcher_desc = matcher.description();
+        let start = Instant::now();
+        let deadline = start + timeout;
+        let mut polls = 0usize;
+        let mut interval = self.options.poll_initial;
+        tracing::info!(
+            pane_id,
+            timeout_ms = ms_u64(timeout),
+            matcher = %matcher_desc,
+            "wait_for start"
+        );
+
+        loop {
+            polls += 1;
+            let text = self.source.get_text(pane_id, self.options.escapes).await?;
+            let tail = tail_text(&text, self.options.tail_lines);
+            let tail_hash = stable_hash(tail.as_bytes());
+
+            if matcher.matches(&tail)? {
+                let elapsed_ms = elapsed_ms(start);
+                tracing::info!(
+                    pane_id,
+                    elapsed_ms,
+                    polls,
+                    matcher = %matcher_desc,
+                    "wait_for matched"
+                );
+                return Ok(WaitResult::Matched { elapsed_ms, polls });
+            }
+
+            let now = Instant::now();
+            if now >= deadline || polls >= self.options.max_polls {
+                let elapsed_ms = elapsed_ms(start);
+                tracing::info!(
+                    pane_id,
+                    elapsed_ms,
+                    polls,
+                    matcher = %matcher_desc,
+                    "wait_for timeout"
+                );
+                return Ok(WaitResult::TimedOut {
+                    elapsed_ms,
+                    polls,
+                    last_tail_hash: Some(tail_hash),
+                });
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let sleep_duration = if interval > remaining {
+                remaining
+            } else {
+                interval
+            };
+
+            sleep(sleep_duration).await;
+            interval = interval.saturating_mul(2);
+            if interval > self.options.poll_max {
+                interval = self.options.poll_max;
+            }
+        }
+    }
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64; // FNV-1a offset basis
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+fn tail_text(text: &str, tail_lines: usize) -> String {
+    if tail_lines == 0 {
+        return String::new();
+    }
+
+    let bytes = text.as_bytes();
+    let mut iter = memchr::memrchr_iter(b'\n', bytes);
+    let mut cutoff = None;
+
+    // If text ends with \n, that trailing newline is part of the last line,
+    // not a separator. We need to skip one extra newline to get the right count.
+    let count = if bytes.last() == Some(&b'\n') {
+        tail_lines + 1
+    } else {
+        tail_lines
+    };
+
+    for _ in 0..count {
+        if let Some(pos) = iter.next() {
+            cutoff = Some(pos);
+        } else {
+            // Not enough lines, return everything
+            return text.to_string();
+        }
+    }
+
+    // cutoff points to the newline BEFORE our desired output
+    match cutoff {
+        Some(pos) if pos + 1 < bytes.len() => text[pos + 1..].to_string(),
+        _ => text.to_string(),
+    }
+}
+
+fn ms_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn pane_info_deserializes_minimal() {
@@ -711,5 +975,132 @@ mod tests {
         let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         let wez_err = WeztermClient::categorize_io_error(&e);
         assert!(matches!(wez_err, WeztermError::CommandFailed(_)));
+    }
+
+    #[derive(Clone)]
+    struct TestTextSource {
+        sequence: Arc<Vec<String>>,
+        index: Arc<AtomicUsize>,
+    }
+
+    impl TestTextSource {
+        fn new(sequence: Vec<&str>) -> Self {
+            Self {
+                sequence: Arc::new(sequence.into_iter().map(str::to_string).collect()),
+                index: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl PaneTextSource for TestTextSource {
+        type Fut<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            let idx = self.index.fetch_add(1, Ordering::SeqCst);
+            let text = self
+                .sequence
+                .get(idx)
+                .cloned()
+                .or_else(|| self.sequence.last().cloned())
+                .unwrap_or_default();
+            Box::pin(async move { Ok(text) })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiter_matches_substring() {
+        let source = TestTextSource::new(vec!["booting...", "ready: prompt"]);
+        let waiter = PaneWaiter::new(&source).with_options(WaitOptions {
+            tail_lines: 50,
+            escapes: false,
+            poll_initial: Duration::from_secs(1),
+            poll_max: Duration::from_secs(1),
+            max_polls: 10,
+        });
+
+        let matcher = WaitMatcher::substring("ready");
+        let mut fut = Box::pin(waiter.wait_for(1, &matcher, Duration::from_secs(5)));
+
+        for _ in 0..3 {
+            tokio::select! {
+                result = &mut fut => {
+                    let result = result.expect("wait_for");
+                    match result {
+                        WaitResult::Matched { polls, .. } => {
+                            assert!(polls >= 2, "expected at least two polls");
+                        }
+                        WaitResult::TimedOut { .. } => panic!("unexpected timeout"),
+                    }
+                    return;
+                }
+                () = tokio::time::advance(Duration::from_secs(1)) => {}
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let result = fut.await.expect("wait_for");
+        match result {
+            WaitResult::Matched { polls, .. } => {
+                assert!(polls >= 2, "expected at least two polls");
+            }
+            WaitResult::TimedOut { .. } => panic!("unexpected timeout"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiter_times_out() {
+        let source = TestTextSource::new(vec!["still waiting"]);
+        let waiter = PaneWaiter::new(&source).with_options(WaitOptions {
+            tail_lines: 10,
+            escapes: false,
+            poll_initial: Duration::from_secs(1),
+            poll_max: Duration::from_secs(1),
+            max_polls: 100,
+        });
+
+        let matcher = WaitMatcher::substring("never");
+        let mut fut = Box::pin(waiter.wait_for(1, &matcher, Duration::from_secs(2)));
+
+        for _ in 0..4 {
+            tokio::select! {
+                result = &mut fut => {
+                    let result = result.expect("wait_for");
+                    match result {
+                        WaitResult::TimedOut {
+                            polls,
+                            last_tail_hash,
+                            ..
+                        } => {
+                            assert!(polls >= 1);
+                            assert!(last_tail_hash.is_some());
+                        }
+                        WaitResult::Matched { .. } => panic!("unexpected match"),
+                    }
+                    return;
+                }
+                () = tokio::time::advance(Duration::from_secs(1)) => {}
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let result = fut.await.expect("wait_for");
+        match result {
+            WaitResult::TimedOut {
+                polls,
+                last_tail_hash,
+                ..
+            } => {
+                assert!(polls >= 1);
+                assert!(last_tail_hash.is_some());
+            }
+            WaitResult::Matched { .. } => panic!("unexpected match"),
+        }
+    }
+
+    #[test]
+    fn tail_text_limits_lines() {
+        let text = "one\ntwo\nthree\nfour\n";
+        let tail = tail_text(text, 2);
+        assert_eq!(tail, "three\nfour\n");
     }
 }

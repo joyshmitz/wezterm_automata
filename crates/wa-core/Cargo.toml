@@ -29,13 +29,25 @@ fancy-regex.workspace = true
 # Database
 rusqlite.workspace = true
 
+# Config
+toml.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 proptest = "1.5"
 
 [features]
 default = []
-# Optional heavy integrations - feature-gated
+# Public feature flags (stable surface)
+vendored = ["vendored-wezterm"]
+browser = ["browser-automation"]
+mcp = ["mcp-server"]
+web = []
+tui = []
+metrics = []
+distributed = []
+
+# Optional heavy integrations - feature-gated (internal)
 vendored-wezterm = []
 browser-automation = []
 mcp-server = []

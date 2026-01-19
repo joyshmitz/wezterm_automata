@@ -92,6 +92,9 @@ pub enum StorageError {
 /// Pattern-specific errors
 #[derive(Error, Debug)]
 pub enum PatternError {
+    #[error("Invalid rule: {0}")]
+    InvalidRule(String),
+
     #[error("Invalid regex: {0}")]
     InvalidRegex(String),
 
@@ -124,8 +127,17 @@ pub enum ConfigError {
     #[error("Config file not found: {0}")]
     FileNotFound(String),
 
+    #[error("Failed to read config file {0}: {1}")]
+    ReadFailed(String, String),
+
     #[error("Parse error: {0}")]
     ParseError(String),
+
+    #[error("Failed to parse config: {0}")]
+    ParseFailed(String),
+
+    #[error("Failed to serialize config: {0}")]
+    SerializeFailed(String),
 
     #[error("Validation error: {0}")]
     ValidationError(String),

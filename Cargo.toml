@@ -5,6 +5,11 @@ members = [
     "crates/wa-core",
 ]
 
+# Crate boundary rules:
+# - wa-core: business logic only (no UI/transport deps by default)
+# - wa: thin CLI wrapper over wa-core
+# - optional frontends (mcp/web/tui/browser) are feature-gated
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
@@ -57,6 +62,9 @@ rusqlite = { version = "0.32", features = ["bundled", "backup", "functions"] }
 aho-corasick = "1.1"
 memchr = "2.7"
 fancy-regex = "0.14"
+
+# Config
+toml = "0.8"
 
 # Internal crates
 wa-core = { path = "crates/wa-core" }

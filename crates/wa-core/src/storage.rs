@@ -2672,8 +2672,7 @@ mod tests {
         // The query plan should use the idx_segments_pane_seq index
         assert!(
             plan.contains("idx_segments_pane_seq") || plan.contains("USING INDEX"),
-            "Query should use the pane_seq index, got: {}",
-            plan
+            "Query should use the pane_seq index, got: {plan}"
         );
     }
 

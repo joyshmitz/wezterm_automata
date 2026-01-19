@@ -613,6 +613,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delta_subscriber_only_sees_delta_events() {
+        let bus = EventBus::new(10);
+        let mut delta_sub = bus.subscribe_deltas();
+
+        bus.publish(Event::SegmentCaptured {
+            pane_id: 5,
+            seq: 1,
+            content_len: 10,
+        });
+
+        let event = delta_sub.recv().await.unwrap();
+        assert!(matches!(event, Event::SegmentCaptured { pane_id: 5, .. }));
+
+        bus.publish(Event::PaneDiscovered {
+            pane_id: 5,
+            domain: "local".to_string(),
+            title: "shell".to_string(),
+        });
+
+        assert!(delta_sub.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn detection_subscriber_receives_pattern_events() {
+        let bus = EventBus::new(10);
+        let mut detection_sub = bus.subscribe_detections();
+
+        let detection = Detection {
+            rule_id: "codex.test".to_string(),
+            agent_type: crate::patterns::AgentType::Codex,
+            event_type: "test".to_string(),
+            severity: crate::patterns::Severity::Info,
+            confidence: 0.9,
+            extracted: serde_json::json!({}),
+            matched_text: "anchor".to_string(),
+        };
+
+        bus.publish(Event::PatternDetected {
+            pane_id: 1,
+            detection,
+        });
+
+        let event = detection_sub.recv().await.unwrap();
+        assert!(matches!(event, Event::PatternDetected { pane_id: 1, .. }));
+    }
+
+    #[tokio::test]
     async fn subscriber_drop_decrements_count() {
         let bus = EventBus::new(10);
 
@@ -682,6 +729,34 @@ mod tests {
         // Lag should be tracked in metrics
         let metrics = bus.metrics().snapshot();
         assert!(metrics.subscriber_lag_events > 0 || sub.lagged_count() > 0);
+    }
+
+    #[test]
+    fn stats_report_queue_depths_and_lag() {
+        let bus = EventBus::new(2);
+        let _delta_sub = bus.subscribe_deltas();
+
+        bus.publish(Event::SegmentCaptured {
+            pane_id: 1,
+            seq: 0,
+            content_len: 1,
+        });
+        bus.publish(Event::SegmentCaptured {
+            pane_id: 1,
+            seq: 1,
+            content_len: 1,
+        });
+        bus.publish(Event::SegmentCaptured {
+            pane_id: 1,
+            seq: 2,
+            content_len: 1,
+        });
+
+        let stats = bus.stats();
+        assert_eq!(stats.capacity, 2);
+        assert_eq!(stats.delta_subscribers, 1);
+        assert_eq!(stats.delta_queued, 2);
+        assert!(stats.delta_oldest_lag_ms.is_some());
     }
 
     #[test]

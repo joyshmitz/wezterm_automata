@@ -23,6 +23,10 @@
 //! - `workflows`: Durable workflow execution
 //! - `config`: Configuration management
 //! - `policy`: Safety and rate limiting
+//!
+//! # Safety
+//!
+//! This crate forbids unsafe code.
 
 #![forbid(unsafe_code)]
 #![feature(stmt_expr_attributes)]

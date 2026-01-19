@@ -78,13 +78,11 @@ impl Detection {
     /// the same rule to fire multiple times if the extracted values differ.
     #[must_use]
     pub fn dedup_key(&self) -> String {
-        let extracted_hash = if let Some(obj) = self.extracted.as_object() {
+        let extracted_hash = self.extracted.as_object().map_or_else(String::new, |obj| {
             let mut parts: Vec<String> = obj.iter().map(|(k, v)| format!("{k}:{v}")).collect();
             parts.sort();
             parts.join("|")
-        } else {
-            String::new()
-        };
+        });
         format!("{}:{}", self.rule_id, extracted_hash)
     }
 }

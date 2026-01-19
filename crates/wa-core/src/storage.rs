@@ -3123,3 +3123,739 @@ fn fts_search_no_snippets_option() {
         "Snippet should be None when disabled"
     );
 }
+
+// =========================================================================
+// wa-4vx.3.7: FTS Empty/No-Match Behavior Tests
+// =========================================================================
+
+#[test]
+fn fts_search_no_match_returns_empty() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let now_ms = 1_700_000_000_000i64;
+
+    conn.execute(
+        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, "local", now_ms, now_ms, 1],
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, 0i64, "hello world", 11, now_ms],
+    )
+    .unwrap();
+
+    // Search for term that doesn't exist
+    let results =
+        search_fts_with_snippets(&conn, "nonexistent", &SearchOptions::default()).unwrap();
+
+    assert!(results.is_empty(), "Should return empty vec for no matches");
+}
+
+#[test]
+fn fts_search_empty_db_returns_empty() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    // Search on empty database (no panes, no segments)
+    let results = search_fts_with_snippets(&conn, "anything", &SearchOptions::default()).unwrap();
+
+    assert!(
+        results.is_empty(),
+        "Should return empty vec for empty database"
+    );
+}
+
+// =========================================================================
+// wa-4vx.3.7: Workflow Step Logs Tests
+// =========================================================================
+
+#[test]
+fn can_insert_and_query_workflow_step_logs() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let now_ms = 1_700_000_000_000i64;
+
+    // Insert pane
+    conn.execute(
+        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, "local", now_ms, now_ms, 1],
+    )
+    .unwrap();
+
+    // Insert workflow execution
+    conn.execute(
+        "INSERT INTO workflow_executions (id, workflow_name, pane_id, current_step, status, started_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params!["wf-test-001", "test_workflow", 1i64, 0, "running", now_ms, now_ms],
+    )
+    .unwrap();
+
+    // Insert step logs
+    insert_step_log_sync(
+        &conn,
+        "wf-test-001",
+        0,
+        "step_one",
+        "continue",
+        Some(r#"{"output": "step 1 done"}"#),
+        now_ms,
+        now_ms + 100,
+    )
+    .unwrap();
+
+    insert_step_log_sync(
+        &conn,
+        "wf-test-001",
+        1,
+        "step_two",
+        "done",
+        Some(r#"{"output": "final"}"#),
+        now_ms + 100,
+        now_ms + 300,
+    )
+    .unwrap();
+
+    // Query step logs
+    let logs = query_step_logs(&conn, "wf-test-001").unwrap();
+
+    assert_eq!(logs.len(), 2, "Should have 2 step logs");
+
+    // Verify ordering by step_index
+    assert_eq!(logs[0].step_index, 0);
+    assert_eq!(logs[0].step_name, "step_one");
+    assert_eq!(logs[0].result_type, "continue");
+    assert_eq!(logs[0].duration_ms, 100);
+
+    assert_eq!(logs[1].step_index, 1);
+    assert_eq!(logs[1].step_name, "step_two");
+    assert_eq!(logs[1].result_type, "done");
+    assert_eq!(logs[1].duration_ms, 200);
+}
+
+#[test]
+fn query_step_logs_returns_empty_for_unknown_workflow() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let logs = query_step_logs(&conn, "nonexistent-workflow").unwrap();
+
+    assert!(
+        logs.is_empty(),
+        "Should return empty vec for unknown workflow"
+    );
+}
+
+#[test]
+fn workflow_step_log_result_data_is_optional() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let now_ms = 1_700_000_000_000i64;
+
+    conn.execute(
+        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, "local", now_ms, now_ms, 1],
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO workflow_executions (id, workflow_name, pane_id, current_step, status, started_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params!["wf-test-002", "test_workflow", 1i64, 0, "running", now_ms, now_ms],
+    )
+    .unwrap();
+
+    // Insert step log without result_data
+    insert_step_log_sync(
+        &conn,
+        "wf-test-002",
+        0,
+        "simple_step",
+        "continue",
+        None, // No result data
+        now_ms,
+        now_ms + 50,
+    )
+    .unwrap();
+
+    let logs = query_step_logs(&conn, "wf-test-002").unwrap();
+
+    assert_eq!(logs.len(), 1);
+    assert!(logs[0].result_data.is_none(), "result_data should be None");
+}
+
+#[test]
+fn workflow_step_log_record_serializes() {
+    let log = WorkflowStepLogRecord {
+        id: 1,
+        workflow_id: "wf-001".to_string(),
+        step_index: 0,
+        step_name: "init".to_string(),
+        result_type: "continue".to_string(),
+        result_data: Some(r#"{"status": "ok"}"#.to_string()),
+        started_at: 1_700_000_000_000,
+        completed_at: 1_700_000_000_100,
+        duration_ms: 100,
+    };
+
+    let json = serde_json::to_string(&log).unwrap();
+    assert!(json.contains("wf-001"));
+    assert!(json.contains("init"));
+    assert!(json.contains("duration_ms"));
+}
+
+// =========================================================================
+// wa-4vx.3.7: Async StorageHandle Tests
+// =========================================================================
+
+#[tokio::test]
+async fn storage_handle_graceful_shutdown() {
+    let temp_dir = std::env::temp_dir();
+    let db_path = temp_dir.join(format!("wa_test_shutdown_{}.db", std::process::id()));
+    let db_path_str = db_path.to_string_lossy().to_string();
+
+    // Create storage handle
+    let storage = StorageHandle::new(&db_path_str).await.unwrap();
+
+    // Upsert a pane to verify it works
+    let pane = PaneRecord {
+        pane_id: 1,
+        domain: "local".to_string(),
+        window_id: None,
+        tab_id: None,
+        title: Some("test".to_string()),
+        cwd: None,
+        tty_name: None,
+        first_seen_at: 1_700_000_000_000,
+        last_seen_at: 1_700_000_000_000,
+        observed: true,
+        ignore_reason: None,
+        last_decision_at: None,
+    };
+    storage.upsert_pane(pane).await.unwrap();
+
+    // Graceful shutdown
+    storage.shutdown().await.unwrap();
+
+    // Cleanup
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+    let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+}
+
+#[tokio::test]
+async fn storage_handle_insert_step_log_and_query() {
+    let temp_dir = std::env::temp_dir();
+    let db_path = temp_dir.join(format!("wa_test_steplog_{}.db", std::process::id()));
+    let db_path_str = db_path.to_string_lossy().to_string();
+
+    let storage = StorageHandle::new(&db_path_str).await.unwrap();
+
+    // Create pane
+    let pane = PaneRecord {
+        pane_id: 1,
+        domain: "local".to_string(),
+        window_id: None,
+        tab_id: None,
+        title: Some("test".to_string()),
+        cwd: None,
+        tty_name: None,
+        first_seen_at: 1_700_000_000_000,
+        last_seen_at: 1_700_000_000_000,
+        observed: true,
+        ignore_reason: None,
+        last_decision_at: None,
+    };
+    storage.upsert_pane(pane).await.unwrap();
+
+    // Create workflow
+    let workflow = WorkflowRecord {
+        id: "wf-async-001".to_string(),
+        workflow_name: "async_test".to_string(),
+        pane_id: 1,
+        trigger_event_id: None,
+        current_step: 0,
+        status: "running".to_string(),
+        wait_condition: None,
+        context: None,
+        result: None,
+        error: None,
+        started_at: 1_700_000_000_000,
+        updated_at: 1_700_000_000_000,
+        completed_at: None,
+    };
+    storage.upsert_workflow(workflow).await.unwrap();
+
+    // Insert step log via async API
+    storage
+        .insert_step_log(
+            "wf-async-001",
+            0,
+            "async_step",
+            "continue",
+            Some(r#"{"async": true}"#.to_string()),
+            1_700_000_000_000,
+            1_700_000_000_050,
+        )
+        .await
+        .unwrap();
+
+    // Query step logs via async API
+    let logs = storage.get_step_logs("wf-async-001").await.unwrap();
+
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].step_name, "async_step");
+    assert_eq!(logs[0].duration_ms, 50);
+
+    storage.shutdown().await.unwrap();
+
+    // Cleanup
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+    let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+}
+
+#[tokio::test]
+async fn storage_handle_writer_queue_processes_all() {
+    let temp_dir = std::env::temp_dir();
+    let db_path = temp_dir.join(format!("wa_test_queue_{}.db", std::process::id()));
+    let db_path_str = db_path.to_string_lossy().to_string();
+
+    // Create storage with small queue
+    let config = StorageConfig {
+        write_queue_size: 4,
+    };
+    let storage = StorageHandle::with_config(&db_path_str, config)
+        .await
+        .unwrap();
+
+    // Create pane first
+    let pane = PaneRecord {
+        pane_id: 1,
+        domain: "local".to_string(),
+        window_id: None,
+        tab_id: None,
+        title: Some("test".to_string()),
+        cwd: None,
+        tty_name: None,
+        first_seen_at: 1_700_000_000_000,
+        last_seen_at: 1_700_000_000_000,
+        observed: true,
+        ignore_reason: None,
+        last_decision_at: None,
+    };
+    storage.upsert_pane(pane).await.unwrap();
+
+    // Send many segment appends sequentially
+    for i in 0..10 {
+        let content = format!("segment content {i}");
+        storage.append_segment(1, &content, None).await.unwrap();
+    }
+
+    // All appends should succeed
+    let segments = storage.get_segments(1, 100).await.unwrap();
+    assert_eq!(segments.len(), 10, "All 10 segments should be stored");
+
+    storage.shutdown().await.unwrap();
+
+    // Cleanup
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+    let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+}
+
+// =============================================================================
+// Async StorageHandle Tests (wa-4vx.3.7)
+// =============================================================================
+
+#[cfg(test)]
+mod storage_handle_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Counter for unique temp DB paths
+    static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Generate a unique temp DB path
+    fn temp_db_path() -> String {
+        let counter = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir();
+        dir.join(format!("wa_test_{counter}_{}.db", std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Helper to create a test pane record
+    fn test_pane(pane_id: u64) -> PaneRecord {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        PaneRecord {
+            pane_id,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: None,
+            cwd: None,
+            tty_name: None,
+            first_seen_at: now,
+            last_seen_at: now,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_handle_basic_write_read() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        // Create a pane
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        // Append a segment
+        let segment: Segment = handle
+            .append_segment(1, "Hello, world!", None)
+            .await
+            .unwrap();
+
+        assert_eq!(segment.pane_id, 1);
+        assert_eq!(segment.seq, 0);
+        assert_eq!(segment.content, "Hello, world!");
+
+        // Append another segment
+        let segment2: Segment = handle
+            .append_segment(1, "Second segment", None)
+            .await
+            .unwrap();
+
+        assert_eq!(segment2.seq, 1);
+
+        // Query segments
+        let recent: Vec<Segment> = handle.get_segments(1, 10).await.unwrap();
+        assert_eq!(recent.len(), 2);
+        // Returned in descending seq order
+        assert_eq!(recent[0].seq, 1);
+        assert_eq!(recent[1].seq, 0);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_shutdown_flushes_pending_writes() {
+        let db_path = temp_db_path();
+
+        {
+            let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+            handle.upsert_pane(test_pane(1)).await.unwrap();
+
+            // Queue up multiple writes
+            for i in 0..10 {
+                handle
+                    .append_segment(1, &format!("Segment {i}"), None)
+                    .await
+                    .unwrap();
+            }
+
+            // Shutdown should flush all pending writes
+            handle.shutdown().await.unwrap();
+        }
+
+        // Reopen and verify all writes persisted
+        {
+            let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+            let segments: Vec<Segment> = handle.get_segments(1, 100).await.unwrap();
+
+            // All 10 segments should be present
+            assert_eq!(segments.len(), 10);
+
+            // Verify sequence numbers are correct (returned in descending order)
+            let seqs: Vec<u64> = segments.iter().map(|s| s.seq).collect();
+            assert_eq!(seqs, vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+
+            handle.shutdown().await.unwrap();
+        }
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_concurrent_reads_during_writes() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        // Write segments
+        for i in 0..5 {
+            handle
+                .append_segment(1, &format!("Content {i}"), None)
+                .await
+                .unwrap();
+        }
+
+        // Concurrent reads should work (WAL mode)
+        let read1 = handle.get_segments(1, 10);
+        let read2 = handle.get_segments(1, 10);
+        let (result1, result2) = tokio::join!(read1, read2);
+
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+        assert_eq!(result1.unwrap().len(), 5);
+        assert_eq!(result2.unwrap().len(), 5);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_workflow_step_logs() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        let workflow_id = "wf-test-123";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // Create workflow execution
+        let workflow = WorkflowRecord {
+            workflow_id: workflow_id.to_string(),
+            pane_id: 1,
+            event_id: None,
+            started_at: now,
+            current_step: 0,
+            max_steps: 3,
+            status: "running".to_string(),
+            error: None,
+            updated_at: now,
+            completed_at: None,
+        };
+
+        handle.upsert_workflow(workflow).await.unwrap();
+
+        // Insert step logs
+        handle
+            .insert_step_log(
+                workflow_id,
+                0,
+                "init",
+                "success",
+                Some(r#"{"message":"started"}"#.to_string()),
+                now,
+                now + 100,
+            )
+            .await
+            .unwrap();
+
+        handle
+            .insert_step_log(
+                workflow_id,
+                1,
+                "send_text",
+                "success",
+                Some(r#"{"chars":42}"#.to_string()),
+                now + 100,
+                now + 200,
+            )
+            .await
+            .unwrap();
+
+        handle
+            .insert_step_log(
+                workflow_id,
+                2,
+                "wait_for",
+                "success",
+                Some(r#"{"matched":true}"#.to_string()),
+                now + 200,
+                now + 500,
+            )
+            .await
+            .unwrap();
+
+        // Query step logs
+        let steps: Vec<WorkflowStepLogRecord> = handle.get_step_logs(workflow_id).await.unwrap();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].step_name, "init");
+        assert_eq!(steps[1].step_name, "send_text");
+        assert_eq!(steps[2].step_name, "wait_for");
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_gap_recording() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        // Record some segments
+        let _seg: Segment = handle.append_segment(1, "Before gap", None).await.unwrap();
+
+        // Record a gap
+        let gap: Gap = handle.record_gap(1, "connection_lost").await.unwrap();
+
+        assert_eq!(gap.pane_id, 1);
+        assert_eq!(gap.reason, "connection_lost");
+
+        // Record more segments after gap
+        let _seg2: Segment = handle.append_segment(1, "After gap", None).await.unwrap();
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_event_lifecycle() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let event = StoredEvent {
+            id: 0, // Will be assigned
+            pane_id: 1,
+            rule_id: "test.rule".to_string(),
+            detected_at: now,
+            segment_id: None,
+            extracted_data: Some(r#"{"key":"value"}"#.to_string()),
+            handled: false,
+            handled_at: None,
+            handled_by: None,
+            handling_status: None,
+        };
+
+        let event_id: i64 = handle.record_event(event).await.unwrap();
+        assert!(event_id > 0);
+
+        // Mark handled
+        handle
+            .mark_event_handled(event_id, Some("wf-123".to_string()), "completed")
+            .await
+            .unwrap();
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_with_small_queue_handles_burst() {
+        let db_path = temp_db_path();
+
+        // Use a small queue to test bounded channel behavior
+        let config = StorageConfig {
+            write_queue_size: 4,
+        };
+        let handle: StorageHandle = StorageHandle::with_config(&db_path, config).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        // Write more items than queue size - should work because we await each write
+        for i in 0..20 {
+            handle
+                .append_segment(1, &format!("Segment {i}"), None)
+                .await
+                .unwrap();
+        }
+
+        let segments: Vec<Segment> = handle.get_segments(1, 100).await.unwrap();
+        assert_eq!(segments.len(), 20);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_seq_is_monotonic_per_pane() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        // Create two panes
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+        handle.upsert_pane(test_pane(2)).await.unwrap();
+
+        // Interleave writes to both panes
+        for i in 0..5 {
+            handle
+                .append_segment(1, &format!("Pane1 seg {i}"), None)
+                .await
+                .unwrap();
+            handle
+                .append_segment(2, &format!("Pane2 seg {i}"), None)
+                .await
+                .unwrap();
+        }
+
+        // Verify each pane has monotonic seqs starting at 0
+        let pane1_segs: Vec<Segment> = handle.get_segments(1, 10).await.unwrap();
+        let pane2_segs: Vec<Segment> = handle.get_segments(2, 10).await.unwrap();
+
+        assert_eq!(pane1_segs.len(), 5);
+        assert_eq!(pane2_segs.len(), 5);
+
+        // Check monotonicity (returned in descending order)
+        let pane1_seqs: Vec<u64> = pane1_segs.iter().map(|s| s.seq).collect();
+        let pane2_seqs: Vec<u64> = pane2_segs.iter().map(|s| s.seq).collect();
+
+        assert_eq!(pane1_seqs, vec![4, 3, 2, 1, 0]);
+        assert_eq!(pane2_seqs, vec![4, 3, 2, 1, 0]);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn storage_handle_agent_sessions() {
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let session = AgentSessionRecord {
+            id: 0, // Will be assigned
+            pane_id: 1,
+            agent_type: "claude".to_string(),
+            started_at: now,
+            ended_at: None,
+            account_id: None,
+            total_tokens: Some(1000),
+            session_data: Some(r#"{"model":"opus"}"#.to_string()),
+        };
+
+        let session_id: i64 = handle.upsert_agent_session(session).await.unwrap();
+        assert!(session_id > 0);
+
+        // Query back
+        let retrieved: Option<AgentSessionRecord> =
+            handle.get_agent_session(session_id).await.unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.agent_type, "claude");
+        assert_eq!(retrieved.total_tokens, Some(1000));
+
+        // Query active sessions
+        let active: Vec<AgentSessionRecord> = handle.get_active_sessions().await.unwrap();
+        assert!(!active.is_empty());
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+}

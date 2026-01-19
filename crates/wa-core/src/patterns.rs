@@ -898,7 +898,7 @@ impl PatternEngine {
         for detection in all_detections {
             // State gating: filter by agent type if specified
             if let Some(expected_agent) = context.agent_type {
-                if !self.rule_applies_to_agent(&detection, expected_agent) {
+                if !Self::rule_applies_to_agent(&detection, expected_agent) {
                     continue;
                 }
             }

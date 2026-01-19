@@ -35,21 +35,24 @@
 
 pub mod approval;
 pub mod config;
+pub mod crash;
 pub mod dry_run;
 pub mod error;
 pub mod events;
 pub mod ingest;
+pub mod ipc;
 pub mod lock;
 pub mod logging;
 pub mod patterns;
 pub mod policy;
 pub mod runtime;
 pub mod storage;
+pub mod tailer;
 pub mod wait;
 pub mod wezterm;
 pub mod workflows;
 
-pub use error::{Error, Result};
+pub use error::{Error, Result, StorageError};
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

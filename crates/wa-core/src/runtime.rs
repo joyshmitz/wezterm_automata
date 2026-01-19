@@ -212,13 +212,17 @@ impl ObservationRuntime {
 
                         // Handle new generations (pane restarted)
                         for pane_id in &diff.new_generations {
-                            let mut cursors = cursors.write().await;
-                            cursors.insert(*pane_id, PaneCursor::new(*pane_id));
+                            {
+                                let mut cursors = cursors.write().await;
+                                cursors.insert(*pane_id, PaneCursor::new(*pane_id));
+                            }
 
-                            let mut contexts = detection_contexts.write().await;
-                            let mut ctx = DetectionContext::new();
-                            ctx.pane_id = Some(*pane_id);
-                            contexts.insert(*pane_id, ctx);
+                            {
+                                let mut contexts = detection_contexts.write().await;
+                                let mut ctx = DetectionContext::new();
+                                ctx.pane_id = Some(*pane_id);
+                                contexts.insert(*pane_id, ctx);
+                            }
 
                             debug!(pane_id = pane_id, "Restarted observing pane (new generation)");
                         }
@@ -319,7 +323,7 @@ impl ObservationRuntime {
 
                 // Persist the segment
                 let storage_guard = storage.lock().await;
-                match persist_captured_segment(&*storage_guard, &event.segment).await {
+                match persist_captured_segment(&storage_guard, &event.segment).await {
                     Ok(persisted) => {
                         debug!(
                             pane_id = pane_id,
@@ -329,14 +333,15 @@ impl ObservationRuntime {
                         );
 
                         // Run pattern detection on the content
-                        let mut contexts = detection_contexts.write().await;
-                        let ctx = contexts.entry(pane_id).or_insert_with(|| {
-                            let mut c = DetectionContext::new();
-                            c.pane_id = Some(pane_id);
-                            c
-                        });
-
-                        let detections = pattern_engine.detect_with_context(&content, ctx);
+                        let detections = {
+                            let mut contexts = detection_contexts.write().await;
+                            let ctx = contexts.entry(pane_id).or_insert_with(|| {
+                                let mut c = DetectionContext::new();
+                                c.pane_id = Some(pane_id);
+                                c
+                            });
+                            pattern_engine.detect_with_context(&content, ctx)
+                        };
 
                         if !detections.is_empty() {
                             debug!(
@@ -387,6 +392,7 @@ impl ObservationRuntime {
     ///
     /// Returns the storage handle wrapped in Arc<Mutex>. The caller is
     /// responsible for shutdown. This invalidates the runtime.
+    #[must_use]
     pub fn take_storage(self) -> Arc<tokio::sync::Mutex<StorageHandle>> {
         self.storage
     }
@@ -501,7 +507,7 @@ mod tests {
         assert_eq!(event.pane_id, 42);
         assert_eq!(event.rule_id, "test.rule");
         assert_eq!(event.event_type, "test_event");
-        assert_eq!(event.confidence, 0.95);
+        assert!((event.confidence - 0.95).abs() < f64::EPSILON);
         assert_eq!(event.segment_id, Some(123));
         assert!(event.handled_at.is_none());
     }

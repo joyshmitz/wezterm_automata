@@ -37,26 +37,25 @@ fn epoch_ms() -> i64 {
 // Fingerprinting
 // =============================================================================
 
-/// A fingerprint uniquely identifies a pane "generation" across restarts.
+/// A fingerprint uniquely identifies a pane "generation".
+///
+/// A generation represents a logical session within a pane. When domain, title,
+/// or cwd change, we consider it a new generation (possibly a new shell session,
+/// connection to different host, or major context switch).
 ///
 /// Components:
-/// - domain name
-/// - title + cwd (at first observation)
-/// - hash of initial content (first N lines)
-///
-/// When a pane's fingerprint changes significantly, it may indicate:
-/// - A new shell session in the same pane ID
-/// - Connection to a different host
-/// - Substantial context switch
+/// - domain name (e.g., "local", "SSH:hostname")
+/// - title and cwd at the start of this generation
+/// - optional hash of initial content (first ~50 lines)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PaneFingerprint {
     /// Domain name (e.g., "local", "SSH:hostname")
     pub domain: String,
-    /// Initial title when first observed
+    /// Title at the start of this generation
     pub initial_title: String,
-    /// Initial cwd when first observed
+    /// Working directory at the start of this generation
     pub initial_cwd: String,
-    /// Hash of initial content (first ~50 lines)
+    /// Hash of initial content (first ~50 lines), 0 if not captured
     pub content_hash: u64,
 }
 
@@ -429,12 +428,12 @@ impl PaneRegistry {
             })
     }
 
-    /// Check if pane metadata has changed
+    /// Check if pane metadata (window/tab assignment) has changed.
+    ///
+    /// Note: Title and cwd changes are handled separately via `is_same_generation()`
+    /// which triggers a new generation rather than a metadata change.
     fn has_metadata_changed(old: &PaneInfo, new: &PaneInfo) -> bool {
-        old.title != new.title
-            || old.cwd != new.cwd
-            || old.window_id != new.window_id
-            || old.tab_id != new.tab_id
+        old.window_id != new.window_id || old.tab_id != new.tab_id
     }
 
     /// Get all tracked pane IDs

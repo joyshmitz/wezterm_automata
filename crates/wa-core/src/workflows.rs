@@ -526,20 +526,490 @@ impl WorkflowEngine {
         self.max_concurrent
     }
 
-    /// Start a workflow execution
+    /// Start a new workflow execution and persist it to storage
+    ///
+    /// Creates a new execution record with status 'running' and step 0.
+    /// Returns the execution which can be used with `DurableWorkflowRunner`.
     pub async fn start(
         &self,
-        _workflow_name: &str,
-        _pane_id: u64,
+        storage: &crate::storage::StorageHandle,
+        workflow_name: &str,
+        pane_id: u64,
+        trigger_event_id: Option<i64>,
+        context: Option<serde_json::Value>,
     ) -> crate::Result<WorkflowExecution> {
-        // TODO: Implement workflow start
-        todo!("Implement workflow start")
+        let now = now_ms();
+        let execution_id = generate_workflow_id(workflow_name);
+
+        let record = crate::storage::WorkflowRecord {
+            id: execution_id.clone(),
+            workflow_name: workflow_name.to_string(),
+            pane_id,
+            trigger_event_id,
+            current_step: 0,
+            status: "running".to_string(),
+            wait_condition: None,
+            context,
+            result: None,
+            error: None,
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+
+        storage.upsert_workflow(record).await?;
+
+        Ok(WorkflowExecution {
+            id: execution_id,
+            workflow_name: workflow_name.to_string(),
+            pane_id,
+            current_step: 0,
+            status: ExecutionStatus::Running,
+            started_at: now,
+            updated_at: now,
+        })
     }
 
-    /// Resume a workflow execution
-    pub async fn resume(&self, _execution_id: &str) -> crate::Result<WorkflowExecution> {
-        // TODO: Implement workflow resume
-        todo!("Implement workflow resume")
+    /// Resume a workflow execution from storage
+    ///
+    /// Loads the workflow record and step logs to determine the next step.
+    /// Returns None if the workflow doesn't exist or is already completed.
+    pub async fn resume(
+        &self,
+        storage: &crate::storage::StorageHandle,
+        execution_id: &str,
+    ) -> crate::Result<Option<(WorkflowExecution, usize)>> {
+        // Load the workflow record
+        let Some(record) = storage.get_workflow(execution_id).await? else {
+            return Ok(None);
+        };
+
+        // Check if already completed
+        if record.status == "completed" || record.status == "aborted" {
+            return Ok(None);
+        }
+
+        // Load step logs to find the last completed step
+        let step_logs = storage.get_step_logs(execution_id).await?;
+        let next_step = compute_next_step(&step_logs);
+
+        let execution = WorkflowExecution {
+            id: record.id,
+            workflow_name: record.workflow_name,
+            pane_id: record.pane_id,
+            current_step: next_step,
+            status: match record.status.as_str() {
+                "running" => ExecutionStatus::Running,
+                "waiting" => ExecutionStatus::Waiting,
+                _ => ExecutionStatus::Running,
+            },
+            started_at: record.started_at,
+            updated_at: record.updated_at,
+        };
+
+        Ok(Some((execution, next_step)))
+    }
+
+    /// Find all incomplete workflows for resume on restart
+    pub async fn find_incomplete(
+        &self,
+        storage: &crate::storage::StorageHandle,
+    ) -> crate::Result<Vec<crate::storage::WorkflowRecord>> {
+        storage.find_incomplete_workflows().await
+    }
+
+    /// Update workflow status
+    pub async fn update_status(
+        &self,
+        storage: &crate::storage::StorageHandle,
+        execution_id: &str,
+        status: ExecutionStatus,
+        current_step: usize,
+        wait_condition: Option<&WaitCondition>,
+        error: Option<&str>,
+    ) -> crate::Result<()> {
+        let now = now_ms();
+        let status_str = match status {
+            ExecutionStatus::Running => "running",
+            ExecutionStatus::Waiting => "waiting",
+            ExecutionStatus::Completed => "completed",
+            ExecutionStatus::Aborted => "aborted",
+        };
+
+        // Load existing record to preserve fields
+        let Some(existing) = storage.get_workflow(execution_id).await? else {
+            return Err(crate::error::WorkflowError::NotFound(execution_id.to_string()).into());
+        };
+
+        let record = crate::storage::WorkflowRecord {
+            id: existing.id,
+            workflow_name: existing.workflow_name,
+            pane_id: existing.pane_id,
+            trigger_event_id: existing.trigger_event_id,
+            current_step,
+            status: status_str.to_string(),
+            wait_condition: wait_condition.map(|wc| serde_json::to_value(wc).unwrap_or_default()),
+            context: existing.context,
+            result: existing.result,
+            error: error.map(String::from),
+            started_at: existing.started_at,
+            updated_at: now,
+            completed_at: if status == ExecutionStatus::Completed
+                || status == ExecutionStatus::Aborted
+            {
+                Some(now)
+            } else {
+                None
+            },
+        };
+
+        storage.upsert_workflow(record).await
+    }
+
+    /// Record a step log entry
+    pub async fn log_step(
+        &self,
+        storage: &crate::storage::StorageHandle,
+        execution_id: &str,
+        step_index: usize,
+        step_name: &str,
+        result: &StepResult,
+        started_at: i64,
+    ) -> crate::Result<()> {
+        let completed_at = now_ms();
+        let result_type = match result {
+            StepResult::Continue { .. } => "continue",
+            StepResult::Done { .. } => "done",
+            StepResult::Abort { .. } => "abort",
+            StepResult::Retry { .. } => "retry",
+            StepResult::WaitFor { .. } => "wait_for",
+        };
+        let result_data = serde_json::to_string(result).ok();
+
+        storage
+            .insert_step_log(
+                execution_id,
+                step_index,
+                step_name,
+                result_type,
+                result_data,
+                started_at,
+                completed_at,
+            )
+            .await
+    }
+}
+
+/// Compute the next step index from step logs
+///
+/// Finds the highest completed step index and returns the next one.
+/// If no steps are completed, returns 0.
+fn compute_next_step(step_logs: &[crate::storage::WorkflowStepLogRecord]) -> usize {
+    if step_logs.is_empty() {
+        return 0;
+    }
+
+    // Find the highest step index with a terminal result (continue or done)
+    // Steps with retry or wait_for should be re-executed
+    let mut max_completed = None;
+    for log in step_logs {
+        if log.result_type == "continue" || log.result_type == "done" {
+            max_completed =
+                Some(max_completed.map_or(log.step_index, |m: usize| m.max(log.step_index)));
+        }
+    }
+
+    match max_completed {
+        Some(idx) => idx + 1, // Resume from next step
+        None => 0,            // No completed steps, start from beginning
+    }
+}
+
+/// Generate a unique workflow execution ID
+fn generate_workflow_id(workflow_name: &str) -> String {
+    let timestamp = now_ms();
+    let random: u32 = rand::random();
+    format!("{workflow_name}-{timestamp}-{random:08x}")
+}
+
+/// Get current timestamp in milliseconds
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+// ============================================================================
+// Per-Pane Workflow Lock (wa-nu4.1.1.2)
+// ============================================================================
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Result of attempting to acquire a pane workflow lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockAcquisitionResult {
+    /// Lock acquired successfully.
+    Acquired,
+    /// Lock is already held by another workflow.
+    AlreadyLocked {
+        /// Name of the workflow holding the lock.
+        held_by_workflow: String,
+        /// Execution ID of the workflow holding the lock.
+        held_by_execution: String,
+        /// When the lock was acquired (unix timestamp ms).
+        locked_since_ms: i64,
+    },
+}
+
+impl LockAcquisitionResult {
+    /// Check if the lock was acquired.
+    #[must_use]
+    pub fn is_acquired(&self) -> bool {
+        matches!(self, Self::Acquired)
+    }
+
+    /// Check if the lock is already held.
+    #[must_use]
+    pub fn is_already_locked(&self) -> bool {
+        matches!(self, Self::AlreadyLocked { .. })
+    }
+}
+
+/// Information about an active pane lock.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneLockInfo {
+    /// Pane ID that is locked.
+    pub pane_id: u64,
+    /// Workflow name holding the lock.
+    pub workflow_name: String,
+    /// Execution ID holding the lock.
+    pub execution_id: String,
+    /// When the lock was acquired (unix timestamp ms).
+    pub locked_at_ms: i64,
+}
+
+/// In-memory workflow lock manager for panes.
+///
+/// Ensures only one workflow runs per pane at a time. This is an internal
+/// concurrency primitive that prevents workflow collisions, separate from
+/// user-facing pane reservations.
+///
+/// # Design
+///
+/// - In-memory lock table keyed by `pane_id`
+/// - Thread-safe via internal mutex
+/// - Lock acquisition returns detailed info about existing locks
+/// - Supports RAII-based release via `PaneWorkflowLockGuard`
+///
+/// # Example
+///
+/// ```no_run
+/// use wa_core::workflows::{PaneWorkflowLockManager, LockAcquisitionResult};
+///
+/// let manager = PaneWorkflowLockManager::new();
+///
+/// // Try to acquire lock
+/// match manager.try_acquire(42, "handle_compaction", "exec-001") {
+///     LockAcquisitionResult::Acquired => {
+///         // Run workflow...
+///         manager.release(42, "exec-001");
+///     }
+///     LockAcquisitionResult::AlreadyLocked { held_by_workflow, .. } => {
+///         println!("Pane 42 is locked by {}", held_by_workflow);
+///     }
+/// }
+/// ```
+pub struct PaneWorkflowLockManager {
+    /// Active locks keyed by pane_id.
+    locks: Mutex<HashMap<u64, PaneLockInfo>>,
+}
+
+impl Default for PaneWorkflowLockManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PaneWorkflowLockManager {
+    /// Create a new lock manager.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            locks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Attempt to acquire a lock for a pane.
+    ///
+    /// Returns `Acquired` if the lock was obtained, or `AlreadyLocked` with
+    /// information about the current lock holder.
+    ///
+    /// # Arguments
+    ///
+    /// * `pane_id` - The pane to lock
+    /// * `workflow_name` - Name of the workflow requesting the lock
+    /// * `execution_id` - Unique execution ID for this workflow run
+    pub fn try_acquire(
+        &self,
+        pane_id: u64,
+        workflow_name: &str,
+        execution_id: &str,
+    ) -> LockAcquisitionResult {
+        let mut locks = self.locks.lock().unwrap();
+
+        if let Some(existing) = locks.get(&pane_id) {
+            return LockAcquisitionResult::AlreadyLocked {
+                held_by_workflow: existing.workflow_name.clone(),
+                held_by_execution: existing.execution_id.clone(),
+                locked_since_ms: existing.locked_at_ms,
+            };
+        }
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        locks.insert(
+            pane_id,
+            PaneLockInfo {
+                pane_id,
+                workflow_name: workflow_name.to_string(),
+                execution_id: execution_id.to_string(),
+                locked_at_ms: now_ms,
+            },
+        );
+
+        tracing::debug!(
+            pane_id,
+            workflow_name,
+            execution_id,
+            "Acquired pane workflow lock"
+        );
+
+        LockAcquisitionResult::Acquired
+    }
+
+    /// Release a lock for a pane.
+    ///
+    /// Only releases if the execution_id matches the current lock holder.
+    /// This prevents accidental release by unrelated code.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the lock was released, `false` if not found or mismatched.
+    pub fn release(&self, pane_id: u64, execution_id: &str) -> bool {
+        let mut locks = self.locks.lock().unwrap();
+
+        if let Some(existing) = locks.get(&pane_id) {
+            if existing.execution_id == execution_id {
+                locks.remove(&pane_id);
+                tracing::debug!(pane_id, execution_id, "Released pane workflow lock");
+                return true;
+            }
+            tracing::warn!(
+                pane_id,
+                execution_id,
+                held_by = %existing.execution_id,
+                "Attempted to release lock held by different execution"
+            );
+        }
+
+        false
+    }
+
+    /// Check if a pane is currently locked.
+    ///
+    /// Returns lock information if locked, `None` if free.
+    #[must_use]
+    pub fn is_locked(&self, pane_id: u64) -> Option<PaneLockInfo> {
+        let locks = self.locks.lock().unwrap();
+        locks.get(&pane_id).cloned()
+    }
+
+    /// Get all currently active locks.
+    ///
+    /// Useful for diagnostics and monitoring.
+    #[must_use]
+    pub fn active_locks(&self) -> Vec<PaneLockInfo> {
+        let locks = self.locks.lock().unwrap();
+        locks.values().cloned().collect()
+    }
+
+    /// Try to acquire a lock and return an RAII guard.
+    ///
+    /// The lock is automatically released when the guard is dropped.
+    ///
+    /// # Returns
+    ///
+    /// `Some(guard)` if acquired, `None` if already locked.
+    pub fn acquire_guard(
+        &self,
+        pane_id: u64,
+        workflow_name: &str,
+        execution_id: &str,
+    ) -> Option<PaneWorkflowLockGuard<'_>> {
+        match self.try_acquire(pane_id, workflow_name, execution_id) {
+            LockAcquisitionResult::Acquired => Some(PaneWorkflowLockGuard {
+                manager: self,
+                pane_id,
+                execution_id: execution_id.to_string(),
+            }),
+            LockAcquisitionResult::AlreadyLocked { .. } => None,
+        }
+    }
+
+    /// Force-release a lock regardless of execution_id.
+    ///
+    /// **Use with caution** - only for recovery scenarios.
+    pub fn force_release(&self, pane_id: u64) -> Option<PaneLockInfo> {
+        let mut locks = self.locks.lock().unwrap();
+        let removed = locks.remove(&pane_id);
+        if let Some(ref info) = removed {
+            tracing::warn!(
+                pane_id,
+                execution_id = %info.execution_id,
+                "Force-released pane workflow lock"
+            );
+        }
+        removed
+    }
+}
+
+/// RAII guard for pane workflow lock.
+///
+/// The lock is automatically released when this guard is dropped.
+pub struct PaneWorkflowLockGuard<'a> {
+    manager: &'a PaneWorkflowLockManager,
+    pane_id: u64,
+    execution_id: String,
+}
+
+impl<'a> PaneWorkflowLockGuard<'a> {
+    /// Get the pane ID this guard is locking.
+    #[must_use]
+    pub fn pane_id(&self) -> u64 {
+        self.pane_id
+    }
+
+    /// Get the execution ID that holds this lock.
+    #[must_use]
+    pub fn execution_id(&self) -> &str {
+        &self.execution_id
+    }
+
+    /// Explicitly release the lock, consuming the guard.
+    pub fn release(self) {
+        // Drop will handle the release
+    }
+}
+
+impl Drop for PaneWorkflowLockGuard<'_> {
+    fn drop(&mut self) {
+        self.manager.release(self.pane_id, &self.execution_id);
     }
 }
 
@@ -776,13 +1246,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             let now = Instant::now();
             if now >= deadline || polls >= self.options.max_polls {
                 let elapsed_ms = elapsed_ms(start);
-                tracing::info!(
-                    pane_id,
-                    rule_id,
-                    elapsed_ms,
-                    polls,
-                    "pattern_wait timeout"
-                );
+                tracing::info!(pane_id, rule_id, elapsed_ms, polls, "pattern_wait timeout");
                 return Ok(WaitConditionResult::TimedOut {
                     elapsed_ms,
                     polls,
@@ -876,12 +1340,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             let now = Instant::now();
             if now >= deadline || polls >= self.options.max_polls {
                 let elapsed_ms = elapsed_ms(start);
-                tracing::info!(
-                    pane_id,
-                    elapsed_ms,
-                    polls,
-                    "pane_idle_wait timeout"
-                );
+                tracing::info!(pane_id, elapsed_ms, polls, "pane_idle_wait timeout");
                 return Ok(WaitConditionResult::TimedOut {
                     elapsed_ms,
                     polls,
@@ -957,13 +1416,13 @@ fn heuristic_idle_check(text: &str, tail_lines: usize) -> (bool, String) {
     // Common prompt endings that suggest idle state
     // Note: These are intentionally broad and may have false positives
     const PROMPT_ENDINGS: [&str; 7] = [
-        "$ ",  // bash/sh default
-        "# ",  // root prompt
-        "> ",  // zsh/fish
-        "% ",  // tcsh/zsh
+        "$ ",   // bash/sh default
+        "# ",   // root prompt
+        "> ",   // zsh/fish
+        "% ",   // tcsh/zsh
         ">>> ", // Python REPL
         "... ", // Python continuation
-        "❯ ", // starship/custom
+        "❯ ",   // starship/custom
     ];
 
     // Check if line ends with a prompt pattern (with trailing space for cursor position)
@@ -1003,7 +1462,10 @@ fn heuristic_idle_check(text: &str, tail_lines: usize) -> (bool, String) {
         }
     }
 
-    (false, format!("no_prompt_detected(last={})", truncate_for_log(trimmed, 40)))
+    (
+        false,
+        format!("no_prompt_detected(last={})", truncate_for_log(trimmed, 40)),
+    )
 }
 
 /// Truncate string for logging, adding ellipsis if truncated.
@@ -1523,8 +1985,8 @@ mod tests {
     // WaitConditionExecutor Tests (using mock source)
     // ========================================================================
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Mock pane text source for testing
     struct MockPaneSource {
@@ -1546,7 +2008,8 @@ mod tests {
     }
 
     impl crate::wezterm::PaneTextSource for MockPaneSource {
-        type Fut<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>>;
+        type Fut<'a> =
+            std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<String>> + Send + 'a>>;
 
         fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
             let count = self.call_count.fetch_add(1, Ordering::Relaxed);
@@ -1567,18 +2030,19 @@ mod tests {
         ]);
         let engine = PatternEngine::new();
 
-        let executor = WaitConditionExecutor::new(&source, &engine).with_options(
-            WaitConditionOptions {
+        let executor =
+            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
                 tail_lines: 200,
                 poll_initial: Duration::from_millis(1),
                 poll_max: Duration::from_millis(10),
                 max_polls: 100,
                 allow_idle_heuristics: true,
-            },
-        );
+            });
 
         let condition = WaitCondition::pattern("claude_code.compaction");
-        let result = executor.execute(&condition, 1, Duration::from_secs(5)).await;
+        let result = executor
+            .execute(&condition, 1, Duration::from_secs(5))
+            .await;
 
         assert!(result.is_ok());
         let result = result.unwrap();
@@ -1591,15 +2055,14 @@ mod tests {
         let source = MockPaneSource::new(vec!["no matching pattern here".to_string()]);
         let engine = PatternEngine::new();
 
-        let executor = WaitConditionExecutor::new(&source, &engine).with_options(
-            WaitConditionOptions {
+        let executor =
+            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
                 tail_lines: 200,
                 poll_initial: Duration::from_millis(1),
                 poll_max: Duration::from_millis(5),
                 max_polls: 5,
                 allow_idle_heuristics: true,
-            },
-        );
+            });
 
         let condition = WaitCondition::pattern("claude_code.compaction");
         let result = executor
@@ -1620,18 +2083,19 @@ mod tests {
         ]);
         let engine = PatternEngine::new();
 
-        let executor = WaitConditionExecutor::new(&source, &engine).with_options(
-            WaitConditionOptions {
+        let executor =
+            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
                 tail_lines: 200,
                 poll_initial: Duration::from_millis(1),
                 poll_max: Duration::from_millis(5),
                 max_polls: 100,
                 allow_idle_heuristics: true,
-            },
-        );
+            });
 
         let condition = WaitCondition::pattern("claude_code.compaction");
-        let result = executor.execute(&condition, 1, Duration::from_secs(5)).await;
+        let result = executor
+            .execute(&condition, 1, Duration::from_secs(5))
+            .await;
 
         assert!(result.is_ok());
         let result = result.unwrap();
@@ -1660,7 +2124,9 @@ mod tests {
 
         // idle_threshold_ms = 0 means immediate satisfaction when idle
         let condition = WaitCondition::pane_idle(0);
-        let result = executor.execute(&condition, 1, Duration::from_secs(5)).await;
+        let result = executor
+            .execute(&condition, 1, Duration::from_secs(5))
+            .await;
 
         assert!(result.is_ok());
         let result = result.unwrap();
@@ -1704,18 +2170,19 @@ mod tests {
         let source = MockPaneSource::new(vec!["user@host:~$ ".to_string()]);
         let engine = PatternEngine::new();
 
-        let executor = WaitConditionExecutor::new(&source, &engine).with_options(
-            WaitConditionOptions {
+        let executor =
+            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
                 tail_lines: 200,
                 poll_initial: Duration::from_millis(1),
                 poll_max: Duration::from_millis(5),
                 max_polls: 100,
                 allow_idle_heuristics: true,
-            },
-        );
+            });
 
         let condition = WaitCondition::pane_idle(0);
-        let result = executor.execute(&condition, 1, Duration::from_secs(5)).await;
+        let result = executor
+            .execute(&condition, 1, Duration::from_secs(5))
+            .await;
 
         assert!(result.is_ok());
         let result = result.unwrap();
@@ -1747,7 +2214,9 @@ mod tests {
         // Require 50ms idle threshold
         let condition = WaitCondition::pane_idle(50);
         let start = std::time::Instant::now();
-        let result = executor.execute(&condition, 1, Duration::from_secs(5)).await;
+        let result = executor
+            .execute(&condition, 1, Duration::from_secs(5))
+            .await;
         let elapsed = start.elapsed();
 
         assert!(result.is_ok());
@@ -1764,7 +2233,9 @@ mod tests {
 
         let executor = WaitConditionExecutor::new(&source, &engine);
         let condition = WaitCondition::external("my_signal");
-        let result = executor.execute(&condition, 1, Duration::from_secs(5)).await;
+        let result = executor
+            .execute(&condition, 1, Duration::from_secs(5))
+            .await;
 
         assert!(result.is_ok());
         let result = result.unwrap();
@@ -1781,18 +2252,19 @@ mod tests {
         let source = MockPaneSource::new(vec!["no match".to_string()]);
         let engine = PatternEngine::new();
 
-        let executor = WaitConditionExecutor::new(&source, &engine).with_options(
-            WaitConditionOptions {
+        let executor =
+            WaitConditionExecutor::new(&source, &engine).with_options(WaitConditionOptions {
                 tail_lines: 200,
                 poll_initial: Duration::from_millis(1),
                 poll_max: Duration::from_millis(1),
                 max_polls: 3,
                 allow_idle_heuristics: true,
-            },
-        );
+            });
 
         let condition = WaitCondition::pattern("nonexistent.rule");
-        let result = executor.execute(&condition, 1, Duration::from_secs(60)).await;
+        let result = executor
+            .execute(&condition, 1, Duration::from_secs(60))
+            .await;
 
         assert!(result.is_ok());
         let result = result.unwrap();
@@ -1800,5 +2272,438 @@ mod tests {
         if let WaitConditionResult::TimedOut { polls, .. } = result {
             assert!(polls <= 3);
         }
+    }
+
+    // ========================================================================
+    // Workflow Persistence Tests (wa-nu4.1.1.3)
+    // ========================================================================
+
+    #[test]
+    fn compute_next_step_empty_logs_returns_zero() {
+        let logs: Vec<crate::storage::WorkflowStepLogRecord> = vec![];
+        assert_eq!(super::compute_next_step(&logs), 0);
+    }
+
+    #[test]
+    fn compute_next_step_with_continue_returns_next() {
+        let logs = vec![crate::storage::WorkflowStepLogRecord {
+            id: 1,
+            workflow_id: "test-123".to_string(),
+            step_index: 0,
+            step_name: "step_0".to_string(),
+            result_type: "continue".to_string(),
+            result_data: None,
+            started_at: 1000,
+            completed_at: 1100,
+            duration_ms: 100,
+        }];
+        assert_eq!(super::compute_next_step(&logs), 1);
+    }
+
+    #[test]
+    fn compute_next_step_with_done_returns_next() {
+        let logs = vec![crate::storage::WorkflowStepLogRecord {
+            id: 1,
+            workflow_id: "test-123".to_string(),
+            step_index: 2,
+            step_name: "step_2".to_string(),
+            result_type: "done".to_string(),
+            result_data: None,
+            started_at: 1000,
+            completed_at: 1100,
+            duration_ms: 100,
+        }];
+        assert_eq!(super::compute_next_step(&logs), 3);
+    }
+
+    #[test]
+    fn compute_next_step_with_retry_returns_same() {
+        // Retry means the step should be re-executed
+        let logs = vec![crate::storage::WorkflowStepLogRecord {
+            id: 1,
+            workflow_id: "test-123".to_string(),
+            step_index: 1,
+            step_name: "step_1".to_string(),
+            result_type: "retry".to_string(),
+            result_data: None,
+            started_at: 1000,
+            completed_at: 1100,
+            duration_ms: 100,
+        }];
+        // No completed steps, so start from 0
+        assert_eq!(super::compute_next_step(&logs), 0);
+    }
+
+    #[test]
+    fn compute_next_step_mixed_logs_finds_highest_completed() {
+        let logs = vec![
+            crate::storage::WorkflowStepLogRecord {
+                id: 1,
+                workflow_id: "test-123".to_string(),
+                step_index: 0,
+                step_name: "step_0".to_string(),
+                result_type: "continue".to_string(),
+                result_data: None,
+                started_at: 1000,
+                completed_at: 1100,
+                duration_ms: 100,
+            },
+            crate::storage::WorkflowStepLogRecord {
+                id: 2,
+                workflow_id: "test-123".to_string(),
+                step_index: 1,
+                step_name: "step_1".to_string(),
+                result_type: "continue".to_string(),
+                result_data: None,
+                started_at: 1100,
+                completed_at: 1200,
+                duration_ms: 100,
+            },
+            crate::storage::WorkflowStepLogRecord {
+                id: 3,
+                workflow_id: "test-123".to_string(),
+                step_index: 2,
+                step_name: "step_2".to_string(),
+                result_type: "retry".to_string(),
+                result_data: None,
+                started_at: 1200,
+                completed_at: 1300,
+                duration_ms: 100,
+            },
+        ];
+        // Highest completed is step_index 1, so next is 2
+        assert_eq!(super::compute_next_step(&logs), 2);
+    }
+
+    #[test]
+    fn compute_next_step_out_of_order_logs() {
+        // Logs might not be in order; function should still find max
+        let logs = vec![
+            crate::storage::WorkflowStepLogRecord {
+                id: 3,
+                workflow_id: "test-123".to_string(),
+                step_index: 2,
+                step_name: "step_2".to_string(),
+                result_type: "continue".to_string(),
+                result_data: None,
+                started_at: 1200,
+                completed_at: 1300,
+                duration_ms: 100,
+            },
+            crate::storage::WorkflowStepLogRecord {
+                id: 1,
+                workflow_id: "test-123".to_string(),
+                step_index: 0,
+                step_name: "step_0".to_string(),
+                result_type: "continue".to_string(),
+                result_data: None,
+                started_at: 1000,
+                completed_at: 1100,
+                duration_ms: 100,
+            },
+        ];
+        // Highest completed is step_index 2, so next is 3
+        assert_eq!(super::compute_next_step(&logs), 3);
+    }
+
+    #[test]
+    fn generate_workflow_id_format() {
+        let id = super::generate_workflow_id("test_workflow");
+        assert!(id.starts_with("test_workflow-"));
+        // Should have format: name-timestamp-random
+        let parts: Vec<&str> = id.split('-').collect();
+        assert!(parts.len() >= 3);
+        // Last part should be hex (8 chars)
+        let last = parts.last().unwrap();
+        assert_eq!(last.len(), 8);
+        assert!(last.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn generate_workflow_id_uniqueness() {
+        let id1 = super::generate_workflow_id("workflow");
+        let id2 = super::generate_workflow_id("workflow");
+        // Random component should make them different
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn execution_status_serialization() {
+        let statuses = [
+            ExecutionStatus::Running,
+            ExecutionStatus::Waiting,
+            ExecutionStatus::Completed,
+            ExecutionStatus::Aborted,
+        ];
+
+        for status in &statuses {
+            let json = serde_json::to_string(status).unwrap();
+            let parsed: ExecutionStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(&parsed, status);
+        }
+    }
+
+    #[test]
+    fn workflow_execution_serialization() {
+        let execution = WorkflowExecution {
+            id: "test-123-abc".to_string(),
+            workflow_name: "test_workflow".to_string(),
+            pane_id: 42,
+            current_step: 2,
+            status: ExecutionStatus::Running,
+            started_at: 1000,
+            updated_at: 1500,
+        };
+
+        let json = serde_json::to_string(&execution).unwrap();
+        let parsed: WorkflowExecution = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.id, execution.id);
+        assert_eq!(parsed.workflow_name, execution.workflow_name);
+        assert_eq!(parsed.pane_id, execution.pane_id);
+        assert_eq!(parsed.current_step, execution.current_step);
+        assert_eq!(parsed.status, execution.status);
+    }
+
+    // ========================================================================
+    // PaneWorkflowLockManager Tests (wa-nu4.1.1.2)
+    // ========================================================================
+
+    #[test]
+    fn lock_manager_acquire_and_release() {
+        let manager = PaneWorkflowLockManager::new();
+
+        // Initially unlocked
+        assert!(manager.is_locked(42).is_none());
+
+        // Acquire succeeds
+        let result = manager.try_acquire(42, "test_workflow", "exec-001");
+        assert!(result.is_acquired());
+        assert!(!result.is_already_locked());
+
+        // Now locked
+        let lock_info = manager.is_locked(42);
+        assert!(lock_info.is_some());
+        let info = lock_info.unwrap();
+        assert_eq!(info.pane_id, 42);
+        assert_eq!(info.workflow_name, "test_workflow");
+        assert_eq!(info.execution_id, "exec-001");
+        assert!(info.locked_at_ms > 0);
+
+        // Release succeeds
+        assert!(manager.release(42, "exec-001"));
+
+        // Now unlocked
+        assert!(manager.is_locked(42).is_none());
+    }
+
+    #[test]
+    fn lock_manager_double_acquire_fails() {
+        let manager = PaneWorkflowLockManager::new();
+
+        // First acquire succeeds
+        let result1 = manager.try_acquire(42, "workflow_a", "exec-001");
+        assert!(result1.is_acquired());
+
+        // Second acquire fails with details about the existing lock
+        let result2 = manager.try_acquire(42, "workflow_b", "exec-002");
+        assert!(result2.is_already_locked());
+        match result2 {
+            LockAcquisitionResult::AlreadyLocked {
+                held_by_workflow,
+                held_by_execution,
+                locked_since_ms,
+            } => {
+                assert_eq!(held_by_workflow, "workflow_a");
+                assert_eq!(held_by_execution, "exec-001");
+                assert!(locked_since_ms > 0);
+            }
+            _ => panic!("Expected AlreadyLocked"),
+        }
+
+        // Release and retry succeeds
+        manager.release(42, "exec-001");
+        let result3 = manager.try_acquire(42, "workflow_b", "exec-002");
+        assert!(result3.is_acquired());
+    }
+
+    #[test]
+    fn lock_manager_release_with_wrong_execution_id_fails() {
+        let manager = PaneWorkflowLockManager::new();
+
+        manager.try_acquire(42, "test_workflow", "exec-001");
+
+        // Release with wrong execution_id fails
+        assert!(!manager.release(42, "wrong-exec-id"));
+
+        // Lock still held
+        assert!(manager.is_locked(42).is_some());
+
+        // Correct execution_id works
+        assert!(manager.release(42, "exec-001"));
+        assert!(manager.is_locked(42).is_none());
+    }
+
+    #[test]
+    fn lock_manager_multiple_panes_independent() {
+        let manager = PaneWorkflowLockManager::new();
+
+        // Lock pane 1
+        let r1 = manager.try_acquire(1, "workflow_a", "exec-001");
+        assert!(r1.is_acquired());
+
+        // Lock pane 2 succeeds (different pane)
+        let r2 = manager.try_acquire(2, "workflow_b", "exec-002");
+        assert!(r2.is_acquired());
+
+        // Lock pane 3 succeeds
+        let r3 = manager.try_acquire(3, "workflow_c", "exec-003");
+        assert!(r3.is_acquired());
+
+        // All locked
+        assert!(manager.is_locked(1).is_some());
+        assert!(manager.is_locked(2).is_some());
+        assert!(manager.is_locked(3).is_some());
+
+        // Release pane 2 doesn't affect others
+        manager.release(2, "exec-002");
+        assert!(manager.is_locked(1).is_some());
+        assert!(manager.is_locked(2).is_none());
+        assert!(manager.is_locked(3).is_some());
+    }
+
+    #[test]
+    fn lock_manager_active_locks() {
+        let manager = PaneWorkflowLockManager::new();
+
+        // Initially empty
+        assert!(manager.active_locks().is_empty());
+
+        manager.try_acquire(1, "workflow_a", "exec-001");
+        manager.try_acquire(2, "workflow_b", "exec-002");
+
+        let active = manager.active_locks();
+        assert_eq!(active.len(), 2);
+
+        let pane_ids: std::collections::HashSet<u64> = active.iter().map(|l| l.pane_id).collect();
+        assert!(pane_ids.contains(&1));
+        assert!(pane_ids.contains(&2));
+    }
+
+    #[test]
+    fn lock_guard_releases_on_drop() {
+        let manager = PaneWorkflowLockManager::new();
+
+        // Acquire via guard
+        {
+            let guard = manager.acquire_guard(42, "test_workflow", "exec-001");
+            assert!(guard.is_some());
+            let guard = guard.unwrap();
+            assert_eq!(guard.pane_id(), 42);
+            assert_eq!(guard.execution_id(), "exec-001");
+
+            // Lock is held
+            assert!(manager.is_locked(42).is_some());
+        }
+
+        // Guard dropped, lock released
+        assert!(manager.is_locked(42).is_none());
+    }
+
+    #[test]
+    fn lock_guard_acquire_fails_when_locked() {
+        let manager = PaneWorkflowLockManager::new();
+
+        // Acquire first lock
+        let _guard1 = manager.acquire_guard(42, "workflow_a", "exec-001");
+        assert!(manager.is_locked(42).is_some());
+
+        // Second acquire fails
+        let guard2 = manager.acquire_guard(42, "workflow_b", "exec-002");
+        assert!(guard2.is_none());
+    }
+
+    #[test]
+    fn lock_manager_force_release() {
+        let manager = PaneWorkflowLockManager::new();
+
+        manager.try_acquire(42, "test_workflow", "exec-001");
+        assert!(manager.is_locked(42).is_some());
+
+        // Force release works even with unknown execution_id
+        let removed = manager.force_release(42);
+        assert!(removed.is_some());
+        let info = removed.unwrap();
+        assert_eq!(info.execution_id, "exec-001");
+
+        // Now unlocked
+        assert!(manager.is_locked(42).is_none());
+
+        // Force release on unlocked pane returns None
+        assert!(manager.force_release(42).is_none());
+    }
+
+    #[test]
+    fn lock_acquisition_result_methods() {
+        let acquired = LockAcquisitionResult::Acquired;
+        assert!(acquired.is_acquired());
+        assert!(!acquired.is_already_locked());
+
+        let locked = LockAcquisitionResult::AlreadyLocked {
+            held_by_workflow: "test".to_string(),
+            held_by_execution: "exec-001".to_string(),
+            locked_since_ms: 1234567890,
+        };
+        assert!(!locked.is_acquired());
+        assert!(locked.is_already_locked());
+    }
+
+    #[test]
+    fn lock_manager_concurrent_simulation() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let manager = Arc::new(PaneWorkflowLockManager::new());
+        let pane_id = 42;
+
+        // Simulate concurrent access with threads
+        let mut handles = vec![];
+
+        for i in 0..10 {
+            let m = Arc::clone(&manager);
+            let handle = thread::spawn(move || {
+                let exec_id = format!("exec-{i:03}");
+                m.try_acquire(pane_id, "concurrent_workflow", &exec_id)
+            });
+            handles.push(handle);
+        }
+
+        // Collect results
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Exactly one should have acquired the lock
+        let acquired_count = results.iter().filter(|r| r.is_acquired()).count();
+        let locked_count = results.iter().filter(|r| r.is_already_locked()).count();
+
+        assert_eq!(acquired_count, 1);
+        assert_eq!(locked_count, 9);
+    }
+
+    #[test]
+    fn pane_lock_info_serialization() {
+        let info = PaneLockInfo {
+            pane_id: 42,
+            workflow_name: "test_workflow".to_string(),
+            execution_id: "exec-001".to_string(),
+            locked_at_ms: 1234567890000,
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: PaneLockInfo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.pane_id, info.pane_id);
+        assert_eq!(parsed.workflow_name, info.workflow_name);
+        assert_eq!(parsed.execution_id, info.execution_id);
+        assert_eq!(parsed.locked_at_ms, info.locked_at_ms);
     }
 }

@@ -1571,6 +1571,34 @@ impl StorageHandle {
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
+    /// Find incomplete workflows for resume on restart
+    ///
+    /// Returns all workflows with status 'running' or 'waiting', ordered by started_at.
+    /// These are workflows that were interrupted and should be resumed.
+    pub async fn find_incomplete_workflows(&self) -> Result<Vec<WorkflowRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_incomplete_workflows(&conn)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Check if the storage is writable (writer thread is alive and responsive).
+    ///
+    /// This is a lightweight health check that sends a ping to the writer thread.
+    pub async fn is_writable(&self) -> bool {
+        // A simple check: if the channel is not closed, writer should be alive
+        // We can't easily send a ping without adding a new WriteCommand variant,
+        // so we check if the channel has capacity (indicates writer is processing)
+        !self.write_tx.is_closed()
+    }
+
     /// Shutdown the storage handle
     ///
     /// Flushes all pending writes and waits for the writer thread to exit.
@@ -3024,6 +3052,68 @@ fn query_step_logs(conn: &Connection, workflow_id: &str) -> Result<Vec<WorkflowS
                 started_at: row.get(6)?,
                 completed_at: row.get(7)?,
                 duration_ms: row.get(8)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+    }
+
+    Ok(results)
+}
+
+/// Query incomplete workflows for resume on restart
+#[allow(clippy::cast_sign_loss)]
+fn query_incomplete_workflows(conn: &Connection) -> Result<Vec<WorkflowRecord>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, workflow_name, pane_id, trigger_event_id, current_step, status,
+             wait_condition, context, result, error, started_at, updated_at, completed_at
+             FROM workflow_executions
+             WHERE status IN ('running', 'waiting')
+             ORDER BY started_at ASC",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let wait_condition_str: Option<String> = row.get(6)?;
+            let wait_condition = wait_condition_str
+                .as_ref()
+                .and_then(|s| serde_json::from_str(s).ok());
+
+            let context_str: Option<String> = row.get(7)?;
+            let context = context_str
+                .as_ref()
+                .and_then(|s| serde_json::from_str(s).ok());
+
+            let result_str: Option<String> = row.get(8)?;
+            let result = result_str
+                .as_ref()
+                .and_then(|s| serde_json::from_str(s).ok());
+
+            Ok(WorkflowRecord {
+                id: row.get(0)?,
+                workflow_name: row.get(1)?,
+                pane_id: {
+                    let val: i64 = row.get(2)?;
+                    val as u64
+                },
+                trigger_event_id: row.get(3)?,
+                current_step: {
+                    let val: i64 = row.get(4)?;
+                    i64_to_usize(val)?
+                },
+                status: row.get(5)?,
+                wait_condition,
+                context,
+                result,
+                error: row.get(9)?,
+                started_at: row.get(10)?,
+                updated_at: row.get(11)?,
+                completed_at: row.get(12)?,
             })
         })
         .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;

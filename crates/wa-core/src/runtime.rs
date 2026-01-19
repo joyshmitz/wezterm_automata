@@ -20,17 +20,20 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::config::PaneFilterConfig;
+use crate::crash::{HealthSnapshot, ShutdownSummary};
 use crate::error::Result;
-use crate::ingest::{persist_captured_segment, CapturedSegment, PaneCursor, PaneRegistry};
+use crate::ingest::{PaneCursor, PaneRegistry, persist_captured_segment};
 use crate::patterns::{Detection, DetectionContext, PatternEngine};
 use crate::storage::{StorageHandle, StoredEvent};
+use crate::tailer::{CaptureEvent, TailerConfig, TailerSupervisor};
 use crate::wezterm::{PaneInfo, WeztermClient};
 
 /// Configuration for the observation runtime.
@@ -38,14 +41,18 @@ use crate::wezterm::{PaneInfo, WeztermClient};
 pub struct RuntimeConfig {
     /// Polling interval for pane discovery
     pub discovery_interval: Duration,
-    /// Polling interval for content capture
+    /// Maximum polling interval for content capture (idle panes)
     pub capture_interval: Duration,
+    /// Minimum polling interval for content capture (active panes)
+    pub min_capture_interval: Duration,
     /// Delta extraction overlap window size
     pub overlap_size: usize,
     /// Pane filter configuration
     pub pane_filter: PaneFilterConfig,
     /// Channel buffer size for internal queues
     pub channel_buffer: usize,
+    /// Maximum concurrent capture operations
+    pub max_concurrent_captures: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -53,19 +60,96 @@ impl Default for RuntimeConfig {
         Self {
             discovery_interval: Duration::from_secs(5),
             capture_interval: Duration::from_millis(200),
+            min_capture_interval: Duration::from_millis(50),
             overlap_size: 4096,
             pane_filter: PaneFilterConfig::default(),
             channel_buffer: 1024,
+            max_concurrent_captures: 10,
         }
     }
 }
 
-/// Internal message for segment capture events.
+/// Runtime metrics for health snapshots and shutdown summaries.
 #[derive(Debug)]
-struct CaptureEvent {
-    segment: CapturedSegment,
-    #[allow(dead_code)]
-    pane_info: PaneInfo,
+pub struct RuntimeMetrics {
+    /// Count of segments persisted
+    segments_persisted: AtomicU64,
+    /// Count of events recorded
+    events_recorded: AtomicU64,
+    /// Timestamp when runtime started (epoch ms)
+    started_at: AtomicU64,
+    /// Last DB write timestamp (epoch ms)
+    last_db_write_at: AtomicU64,
+    /// Sum of ingest lag samples (for averaging)
+    ingest_lag_sum_ms: AtomicU64,
+    /// Count of ingest lag samples
+    ingest_lag_count: AtomicU64,
+    /// Maximum ingest lag observed
+    ingest_lag_max_ms: AtomicU64,
+}
+
+impl Default for RuntimeMetrics {
+    fn default() -> Self {
+        Self {
+            segments_persisted: AtomicU64::new(0),
+            events_recorded: AtomicU64::new(0),
+            started_at: AtomicU64::new(0),
+            last_db_write_at: AtomicU64::new(0),
+            ingest_lag_sum_ms: AtomicU64::new(0),
+            ingest_lag_count: AtomicU64::new(0),
+            ingest_lag_max_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+impl RuntimeMetrics {
+    /// Record an ingest lag sample.
+    pub fn record_ingest_lag(&self, lag_ms: u64) {
+        self.ingest_lag_sum_ms.fetch_add(lag_ms, Ordering::SeqCst);
+        self.ingest_lag_count.fetch_add(1, Ordering::SeqCst);
+
+        // Update max using compare-and-swap loop
+        let mut current_max = self.ingest_lag_max_ms.load(Ordering::SeqCst);
+        while lag_ms > current_max {
+            match self.ingest_lag_max_ms.compare_exchange_weak(
+                current_max,
+                lag_ms,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(v) => current_max = v,
+            }
+        }
+    }
+
+    /// Record a successful DB write.
+    pub fn record_db_write(&self) {
+        let now = epoch_ms() as u64;
+        self.last_db_write_at.store(now, Ordering::SeqCst);
+    }
+
+    /// Get average ingest lag in milliseconds.
+    pub fn avg_ingest_lag_ms(&self) -> f64 {
+        let sum = self.ingest_lag_sum_ms.load(Ordering::SeqCst);
+        let count = self.ingest_lag_count.load(Ordering::SeqCst);
+        if count == 0 {
+            0.0
+        } else {
+            sum as f64 / count as f64
+        }
+    }
+
+    /// Get maximum ingest lag in milliseconds.
+    pub fn max_ingest_lag_ms(&self) -> u64 {
+        self.ingest_lag_max_ms.load(Ordering::SeqCst)
+    }
+
+    /// Get last DB write timestamp (epoch ms), or None if never written.
+    pub fn last_db_write(&self) -> Option<u64> {
+        let ts = self.last_db_write_at.load(Ordering::SeqCst);
+        if ts == 0 { None } else { Some(ts) }
+    }
 }
 
 /// The observation runtime orchestrates passive monitoring.
@@ -91,8 +175,10 @@ pub struct ObservationRuntime {
     cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
     /// Per-pane detection contexts for deduplication
     detection_contexts: Arc<RwLock<HashMap<u64, DetectionContext>>>,
-    /// Shutdown signal sender
-    shutdown_tx: Option<mpsc::Sender<()>>,
+    /// Shutdown flag for signaling tasks
+    shutdown_flag: Arc<AtomicBool>,
+    /// Runtime metrics for health/shutdown
+    metrics: Arc<RuntimeMetrics>,
 }
 
 impl ObservationRuntime {
@@ -109,6 +195,10 @@ impl ObservationRuntime {
         pattern_engine: PatternEngine,
     ) -> Self {
         let registry = PaneRegistry::with_filter(config.pane_filter.clone());
+        let metrics = Arc::new(RuntimeMetrics::default());
+        metrics
+            .started_at
+            .store(epoch_ms() as u64, Ordering::SeqCst);
 
         Self {
             config,
@@ -117,7 +207,8 @@ impl ObservationRuntime {
             registry: Arc::new(RwLock::new(registry)),
             cursors: Arc::new(RwLock::new(HashMap::new())),
             detection_contexts: Arc::new(RwLock::new(HashMap::new())),
-            shutdown_tx: None,
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            metrics,
         }
     }
 
@@ -128,19 +219,16 @@ impl ObservationRuntime {
     pub async fn start(&mut self) -> Result<RuntimeHandle> {
         info!("Starting observation runtime");
 
-        let (shutdown_tx, _shutdown_rx) = mpsc::channel::<()>(1);
         let (capture_tx, capture_rx) = mpsc::channel::<CaptureEvent>(self.config.channel_buffer);
 
-        self.shutdown_tx = Some(shutdown_tx.clone());
-
         // Spawn discovery task
-        let discovery_handle = self.spawn_discovery_task(shutdown_tx.clone());
+        let discovery_handle = self.spawn_discovery_task();
 
         // Spawn capture tasks (will be dynamically managed based on discovered panes)
-        let capture_handle = self.spawn_capture_task(capture_tx, shutdown_tx.clone());
+        let capture_handle = self.spawn_capture_task(capture_tx);
 
         // Spawn persistence and detection task
-        let persistence_handle = self.spawn_persistence_task(capture_rx, shutdown_tx.clone());
+        let persistence_handle = self.spawn_persistence_task(capture_rx);
 
         info!("Observation runtime started");
 
@@ -148,16 +236,22 @@ impl ObservationRuntime {
             discovery: discovery_handle,
             capture: capture_handle,
             persistence: persistence_handle,
-            shutdown_tx,
+            shutdown_flag: Arc::clone(&self.shutdown_flag),
+            storage: Arc::clone(&self.storage),
+            metrics: Arc::clone(&self.metrics),
+            registry: Arc::clone(&self.registry),
+            cursors: Arc::clone(&self.cursors),
+            start_time: Instant::now(),
         })
     }
 
     /// Spawn the pane discovery task.
-    fn spawn_discovery_task(&self, _shutdown_tx: mpsc::Sender<()>) -> JoinHandle<()> {
+    fn spawn_discovery_task(&self) -> JoinHandle<()> {
         let registry = Arc::clone(&self.registry);
         let cursors = Arc::clone(&self.cursors);
         let detection_contexts = Arc::clone(&self.detection_contexts);
         let storage = Arc::clone(&self.storage);
+        let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let interval = self.config.discovery_interval;
 
         tokio::spawn(async move {
@@ -167,6 +261,12 @@ impl ObservationRuntime {
 
             loop {
                 ticker.tick().await;
+
+                // Check shutdown flag
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    debug!("Discovery task: shutdown signal received");
+                    break;
+                }
 
                 match wezterm.list_panes().await {
                     Ok(panes) => {
@@ -232,7 +332,10 @@ impl ObservationRuntime {
                                 contexts.insert(*pane_id, ctx);
                             }
 
-                            debug!(pane_id = pane_id, "Restarted observing pane (new generation)");
+                            debug!(
+                                pane_id = pane_id,
+                                "Restarted observing pane (new generation)"
+                            );
                         }
 
                         if !diff.new_panes.is_empty()
@@ -255,62 +358,71 @@ impl ObservationRuntime {
         })
     }
 
-    /// Spawn the content capture task.
-    fn spawn_capture_task(
-        &self,
-        capture_tx: mpsc::Sender<CaptureEvent>,
-        _shutdown_tx: mpsc::Sender<()>,
-    ) -> JoinHandle<()> {
+    /// Spawn the content capture task using TailerSupervisor with adaptive polling.
+    ///
+    /// This task manages per-pane tailers that:
+    /// - Poll fast when output is changing (min_capture_interval)
+    /// - Poll slow when idle (capture_interval)
+    /// - Respect concurrency limits (max_concurrent_captures)
+    /// - Handle backpressure from downstream
+    fn spawn_capture_task(&self, capture_tx: mpsc::Sender<CaptureEvent>) -> JoinHandle<()> {
         let registry = Arc::clone(&self.registry);
         let cursors = Arc::clone(&self.cursors);
-        let interval = self.config.capture_interval;
-        let overlap_size = self.config.overlap_size;
+        let shutdown_flag = Arc::clone(&self.shutdown_flag);
+        let discovery_interval = self.config.discovery_interval;
+
+        // Create tailer config from runtime config
+        let tailer_config = TailerConfig {
+            min_interval: self.config.min_capture_interval,
+            max_interval: self.config.capture_interval,
+            backoff_multiplier: 1.5,
+            max_concurrent: self.config.max_concurrent_captures,
+            overlap_size: self.config.overlap_size,
+            send_timeout: Duration::from_millis(100),
+        };
 
         tokio::spawn(async move {
-            // Create a fresh WezTerm client for this task
-            let wezterm = WeztermClient::new();
-            let mut ticker = tokio::time::interval(interval);
+            // Create tailer supervisor
+            let mut supervisor = TailerSupervisor::new(
+                tailer_config,
+                capture_tx,
+                cursors,
+                Arc::clone(&shutdown_flag),
+            );
+
+            // Sync tailers periodically with discovery interval
+            let mut ticker = tokio::time::interval(discovery_interval);
 
             loop {
                 ticker.tick().await;
 
-                // Get list of observed panes and their info
-                let reg = registry.read().await;
-                let observed_panes: Vec<(u64, PaneInfo)> = reg
-                    .observed_pane_ids()
-                    .into_iter()
-                    .filter_map(|id| reg.get_entry(id).map(|e| (id, e.info.clone())))
-                    .collect();
-                drop(reg);
-
-                for (pane_id, pane_info) in observed_panes {
-                    // Get pane content (no escapes)
-                    match wezterm.get_text(pane_id, false).await {
-                        Ok(content) => {
-                            // Try to extract delta
-                            let mut cursors = cursors.write().await;
-                            if let Some(cursor) = cursors.get_mut(&pane_id) {
-                                if let Some(segment) =
-                                    cursor.capture_snapshot(&content, overlap_size)
-                                {
-                                    let event = CaptureEvent {
-                                        segment,
-                                        pane_info: pane_info.clone(),
-                                    };
-
-                                    if capture_tx.send(event).await.is_err() {
-                                        error!(pane_id = pane_id, "Capture channel closed");
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            debug!(pane_id = pane_id, error = %e, "Failed to get pane text");
-                        }
-                    }
+                // Check shutdown flag
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    debug!("Capture task: shutdown signal received");
+                    break;
                 }
+
+                // Get current observed panes from registry
+                let observed_panes: HashMap<u64, PaneInfo> = {
+                    let reg = registry.read().await;
+                    reg.observed_pane_ids()
+                        .into_iter()
+                        .filter_map(|id| reg.get_entry(id).map(|e| (id, e.info.clone())))
+                        .collect()
+                };
+
+                // Sync tailers with observed panes
+                supervisor.sync_tailers(&observed_panes);
+
+                debug!(
+                    active_tailers = supervisor.active_count(),
+                    observed_panes = observed_panes.len(),
+                    "Tailer sync tick"
+                );
             }
+
+            // Graceful shutdown of all tailers
+            supervisor.shutdown().await;
         })
     }
 
@@ -318,21 +430,38 @@ impl ObservationRuntime {
     fn spawn_persistence_task(
         &self,
         mut capture_rx: mpsc::Receiver<CaptureEvent>,
-        _shutdown_tx: mpsc::Sender<()>,
     ) -> JoinHandle<()> {
         let storage = Arc::clone(&self.storage);
         let pattern_engine = Arc::clone(&self.pattern_engine);
         let detection_contexts = Arc::clone(&self.detection_contexts);
+        let shutdown_flag = Arc::clone(&self.shutdown_flag);
+        let metrics = Arc::clone(&self.metrics);
 
         tokio::spawn(async move {
+            // Process events until channel closes or shutdown
             while let Some(event) = capture_rx.recv().await {
+                // Check shutdown flag - if set, drain remaining events quickly
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    debug!("Persistence task: shutdown signal received, draining remaining events");
+                    // Continue to drain but don't block forever
+                }
                 let pane_id = event.segment.pane_id;
                 let content = event.segment.content.clone();
+                let captured_at = event.segment.captured_at;
 
                 // Persist the segment
                 let storage_guard = storage.lock().await;
                 match persist_captured_segment(&storage_guard, &event.segment).await {
                     Ok(persisted) => {
+                        // Track metrics
+                        metrics.segments_persisted.fetch_add(1, Ordering::SeqCst);
+
+                        // Record ingest lag (time from capture to persistence)
+                        let now = epoch_ms();
+                        let lag_ms = (now - captured_at).max(0) as u64;
+                        metrics.record_ingest_lag(lag_ms);
+                        metrics.record_db_write();
+
                         debug!(
                             pane_id = pane_id,
                             seq = persisted.segment.seq,
@@ -367,13 +496,18 @@ impl ObservationRuntime {
                                     Some(persisted.segment.id),
                                 );
 
-                                if let Err(e) = storage_guard.record_event(stored_event).await {
-                                    error!(
-                                        pane_id = pane_id,
-                                        rule_id = detection.rule_id,
-                                        error = %e,
-                                        "Failed to record event"
-                                    );
+                                match storage_guard.record_event(stored_event).await {
+                                    Ok(_) => {
+                                        metrics.events_recorded.fetch_add(1, Ordering::SeqCst);
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            pane_id = pane_id,
+                                            rule_id = detection.rule_id,
+                                            error = %e,
+                                            "Failed to record event"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -387,14 +521,9 @@ impl ObservationRuntime {
         })
     }
 
-    /// Request graceful shutdown.
-    ///
-    /// Note: This signals tasks to stop but does not shut down storage.
-    /// The caller should separately shut down the storage handle if needed.
-    pub async fn shutdown(&mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(()).await;
-        }
+    /// Signal tasks to begin shutdown.
+    pub fn signal_shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::SeqCst);
     }
 
     /// Take ownership of the storage handle for external shutdown.
@@ -415,8 +544,18 @@ pub struct RuntimeHandle {
     pub capture: JoinHandle<()>,
     /// Persistence task handle
     pub persistence: JoinHandle<()>,
-    /// Shutdown signal sender
-    pub shutdown_tx: mpsc::Sender<()>,
+    /// Shutdown flag for signaling tasks
+    pub shutdown_flag: Arc<AtomicBool>,
+    /// Storage handle for external access
+    pub storage: Arc<tokio::sync::Mutex<StorageHandle>>,
+    /// Runtime metrics
+    pub metrics: Arc<RuntimeMetrics>,
+    /// Pane registry
+    pub registry: Arc<RwLock<PaneRegistry>>,
+    /// Per-pane cursors
+    pub cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
+    /// Runtime start time
+    pub start_time: Instant,
 }
 
 impl RuntimeHandle {
@@ -427,10 +566,128 @@ impl RuntimeHandle {
         let _ = self.persistence.await;
     }
 
+    /// Request graceful shutdown and collect a summary.
+    ///
+    /// This method:
+    /// 1. Sets the shutdown flag to signal all tasks
+    /// 2. Waits for tasks to complete (with timeout)
+    /// 3. Flushes storage
+    /// 4. Collects and returns a shutdown summary
+    pub async fn shutdown_with_summary(self) -> ShutdownSummary {
+        let elapsed_secs = self.start_time.elapsed().as_secs();
+        let mut warnings = Vec::new();
+
+        // Signal shutdown
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+        info!("Shutdown signal sent");
+
+        // Wait for tasks with timeout
+        let timeout = Duration::from_secs(5);
+        let join_result = tokio::time::timeout(timeout, async {
+            let _ = self.discovery.await;
+            let _ = self.capture.await;
+            let _ = self.persistence.await;
+        })
+        .await;
+
+        let clean = if join_result.is_err() {
+            warnings.push("Tasks did not complete within timeout".to_string());
+            false
+        } else {
+            true
+        };
+
+        // Get final metrics
+        let segments_persisted = self.metrics.segments_persisted.load(Ordering::SeqCst);
+        let events_recorded = self.metrics.events_recorded.load(Ordering::SeqCst);
+
+        // Get last seq per pane
+        let last_seq_by_pane: Vec<(u64, i64)> = {
+            let cursors = self.cursors.read().await;
+            cursors
+                .iter()
+                .map(|(pane_id, cursor)| (*pane_id, cursor.last_seq()))
+                .collect()
+        };
+
+        // Flush storage
+        {
+            let storage_guard = self.storage.lock().await;
+            if let Err(e) = storage_guard.shutdown().await {
+                warnings.push(format!("Storage shutdown error: {e}"));
+            }
+        }
+
+        ShutdownSummary {
+            elapsed_secs,
+            final_capture_queue: 0, // Channel is consumed
+            final_write_queue: 0,
+            segments_persisted,
+            events_recorded,
+            last_seq_by_pane,
+            clean,
+            warnings,
+        }
+    }
+
     /// Request graceful shutdown.
+    ///
+    /// Sets the shutdown flag and waits for tasks to complete.
     pub async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(()).await;
+        self.shutdown_flag.store(true, Ordering::SeqCst);
         self.join().await;
+    }
+
+    /// Signal shutdown without waiting.
+    pub fn signal_shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Update the global health snapshot from current runtime state.
+    ///
+    /// Call this periodically (e.g., every 30s) to keep crash reports useful.
+    pub async fn update_health_snapshot(&self) {
+        let observed_panes = {
+            let reg = self.registry.read().await;
+            reg.observed_pane_ids().len()
+        };
+
+        let last_seq_by_pane: Vec<(u64, i64)> = {
+            let cursors = self.cursors.read().await;
+            cursors
+                .iter()
+                .map(|(pane_id, cursor)| (*pane_id, cursor.last_seq()))
+                .collect()
+        };
+
+        // Check DB writability with a lightweight health check
+        let db_writable = {
+            let storage_guard = self.storage.lock().await;
+            storage_guard.is_writable().await
+        };
+
+        let snapshot = HealthSnapshot {
+            timestamp: epoch_ms() as u64,
+            observed_panes,
+            capture_queue_depth: 0, // Not easily accessible after start
+            write_queue_depth: 0,
+            last_seq_by_pane,
+            warnings: vec![],
+            ingest_lag_avg_ms: self.metrics.avg_ingest_lag_ms(),
+            ingest_lag_max_ms: self.metrics.max_ingest_lag_ms(),
+            db_writable,
+            db_last_write_at: self.metrics.last_db_write(),
+        };
+
+        HealthSnapshot::update_global(snapshot);
+    }
+
+    /// Take ownership of the storage handle for external shutdown.
+    ///
+    /// The caller is responsible for shutdown. This invalidates the runtime.
+    #[must_use]
+    pub fn take_storage(self) -> Arc<tokio::sync::Mutex<StorageHandle>> {
+        self.storage
     }
 }
 
@@ -539,5 +796,87 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let _runtime = ObservationRuntime::new(config, storage, engine);
+    }
+
+    #[test]
+    fn runtime_metrics_records_ingest_lag() {
+        let metrics = RuntimeMetrics::default();
+
+        // Initially no samples
+        assert!((metrics.avg_ingest_lag_ms() - 0.0).abs() < f64::EPSILON);
+        assert_eq!(metrics.max_ingest_lag_ms(), 0);
+
+        // Record some samples
+        metrics.record_ingest_lag(10);
+        metrics.record_ingest_lag(20);
+        metrics.record_ingest_lag(30);
+
+        // Verify average
+        assert!((metrics.avg_ingest_lag_ms() - 20.0).abs() < f64::EPSILON);
+
+        // Verify max
+        assert_eq!(metrics.max_ingest_lag_ms(), 30);
+    }
+
+    #[test]
+    fn runtime_metrics_tracks_max_correctly_with_decreasing_values() {
+        let metrics = RuntimeMetrics::default();
+
+        // Record high value first
+        metrics.record_ingest_lag(100);
+        assert_eq!(metrics.max_ingest_lag_ms(), 100);
+
+        // Lower values shouldn't change max
+        metrics.record_ingest_lag(50);
+        metrics.record_ingest_lag(25);
+        assert_eq!(metrics.max_ingest_lag_ms(), 100);
+
+        // Higher value should update max
+        metrics.record_ingest_lag(150);
+        assert_eq!(metrics.max_ingest_lag_ms(), 150);
+    }
+
+    #[test]
+    fn runtime_metrics_last_db_write() {
+        let metrics = RuntimeMetrics::default();
+
+        // Initially no writes
+        assert!(metrics.last_db_write().is_none());
+
+        // Record a write
+        metrics.record_db_write();
+
+        // Should now have a timestamp
+        assert!(metrics.last_db_write().is_some());
+        assert!(metrics.last_db_write().unwrap() > 0);
+    }
+
+    #[test]
+    fn health_snapshot_reflects_runtime_metrics() {
+        use crate::crash::HealthSnapshot;
+
+        let metrics = RuntimeMetrics::default();
+        metrics.record_ingest_lag(10);
+        metrics.record_ingest_lag(50);
+        metrics.record_db_write();
+
+        let snapshot = HealthSnapshot {
+            timestamp: 0,
+            observed_panes: 2,
+            capture_queue_depth: 0,
+            write_queue_depth: 0,
+            last_seq_by_pane: vec![],
+            warnings: vec![],
+            ingest_lag_avg_ms: metrics.avg_ingest_lag_ms(),
+            ingest_lag_max_ms: metrics.max_ingest_lag_ms(),
+            db_writable: true,
+            db_last_write_at: metrics.last_db_write(),
+        };
+
+        // Verify metrics are correctly reflected in snapshot
+        assert!((snapshot.ingest_lag_avg_ms - 30.0).abs() < f64::EPSILON);
+        assert_eq!(snapshot.ingest_lag_max_ms, 50);
+        assert!(snapshot.db_writable);
+        assert!(snapshot.db_last_write_at.is_some());
     }
 }

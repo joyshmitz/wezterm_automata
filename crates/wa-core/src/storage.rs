@@ -1870,4 +1870,158 @@ mod tests {
         assert!(json.contains("handle_compaction"));
         assert!(json.contains("wf-001"));
     }
+
+    // =========================================================================
+    // wa-4vx.3.3: Gap Recording Tests
+    // =========================================================================
+
+    #[test]
+    fn can_record_gap_on_discontinuity() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now_ms = 1_700_000_000_000i64;
+
+        // Insert pane
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", now_ms, now_ms, 1],
+        ).unwrap();
+
+        // Insert some segments (seq 0, 1, 2)
+        for seq in 0..3 {
+            conn.execute(
+                "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![1i64, seq, format!("content {}", seq), 10, now_ms + seq * 100],
+            ).unwrap();
+        }
+
+        // Record a gap (simulating a discontinuity detected)
+        let gap = record_gap_sync(&conn, 1, "sequence_jump").unwrap();
+
+        // Verify gap was recorded
+        assert_eq!(gap.pane_id, 1);
+        assert_eq!(gap.seq_before, 2); // Last seq was 2
+        assert_eq!(gap.seq_after, 3);  // Next expected would be 3
+        assert_eq!(gap.reason, "sequence_jump");
+
+        // Query the gap from the database
+        let (id, pane_id, seq_before, seq_after, reason): (i64, i64, i64, i64, String) = conn
+            .query_row(
+                "SELECT id, pane_id, seq_before, seq_after, reason FROM output_gaps WHERE pane_id = ?1",
+                [1i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+
+        assert!(id > 0);
+        assert_eq!(pane_id, 1);
+        assert_eq!(seq_before, 2);
+        assert_eq!(seq_after, 3);
+        assert_eq!(reason, "sequence_jump");
+    }
+
+    #[test]
+    fn gap_reasons_are_stable() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now_ms = 1_700_000_000_000i64;
+
+        // Insert pane
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", now_ms, now_ms, 1],
+        ).unwrap();
+
+        // Record gaps with different reasons
+        let reasons = vec![
+            "sequence_jump",
+            "overlap_detected",
+            "cursor_truncation",
+            "session_restart",
+        ];
+
+        for reason in &reasons {
+            record_gap_sync(&conn, 1, reason).unwrap();
+        }
+
+        // Verify all gaps were recorded with stable reasons
+        let mut stmt = conn.prepare("SELECT reason FROM output_gaps WHERE pane_id = ?1 ORDER BY id").unwrap();
+        let recorded_reasons: Vec<String> = stmt
+            .query_map([1i64], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(recorded_reasons, reasons);
+    }
+
+    // =========================================================================
+    // wa-4vx.3.3: Last-N Query Tests
+    // =========================================================================
+
+    #[test]
+    fn last_n_segments_returns_deterministic_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now_ms = 1_700_000_000_000i64;
+
+        // Insert pane
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", now_ms, now_ms, 1],
+        ).unwrap();
+
+        // Insert segments out of order (seq: 5, 2, 8, 1, 3)
+        let insert_order = vec![5, 2, 8, 1, 3];
+        for seq in insert_order {
+            conn.execute(
+                "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![1i64, seq, format!("segment-{}", seq), 10, now_ms + seq * 100],
+            ).unwrap();
+        }
+
+        // Query last 3 segments
+        let segments = query_segments(&conn, 1, 3).unwrap();
+
+        // Should return in descending seq order: 8, 5, 3
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].seq, 8);
+        assert_eq!(segments[1].seq, 5);
+        assert_eq!(segments[2].seq, 3);
+
+        // Query all segments
+        let all_segments = query_segments(&conn, 1, 100).unwrap();
+        assert_eq!(all_segments.len(), 5);
+
+        // Verify strictly descending order
+        for window in all_segments.windows(2) {
+            assert!(window[0].seq > window[1].seq, "Segments should be in strictly descending seq order");
+        }
+    }
+
+    #[test]
+    fn last_n_query_is_indexed() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        // Verify the index exists using EXPLAIN QUERY PLAN
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id, pane_id, seq, content, content_len, content_hash, captured_at
+                 FROM output_segments WHERE pane_id = 1 ORDER BY seq DESC LIMIT 10",
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+
+        // The query plan should use the idx_segments_pane_seq index
+        assert!(
+            plan.contains("idx_segments_pane_seq") || plan.contains("USING INDEX"),
+            "Query should use the pane_seq index, got: {}",
+            plan
+        );
+    }
 }

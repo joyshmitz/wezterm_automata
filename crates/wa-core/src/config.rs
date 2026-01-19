@@ -289,10 +289,7 @@ impl PaneFilterRule {
             .title
             .as_ref()
             .is_none_or(|p| Self::match_title(p, title));
-        let cwd_matches = self
-            .cwd
-            .as_ref()
-            .is_none_or(|p| Self::match_glob(p, cwd));
+        let cwd_matches = self.cwd.as_ref().is_none_or(|p| Self::match_glob(p, cwd));
 
         domain_matches && title_matches && cwd_matches
     }
@@ -351,7 +348,10 @@ impl PaneFilterRule {
         if let Some(ref title) = self.title {
             if let Some(regex_pat) = title.strip_prefix("re:") {
                 if fancy_regex::Regex::new(regex_pat).is_err() {
-                    return Err(format!("Rule '{}' has invalid title regex: {}", self.id, regex_pat));
+                    return Err(format!(
+                        "Rule '{}' has invalid title regex: {}",
+                        self.id, regex_pat
+                    ));
                 }
             }
         }
@@ -652,8 +652,8 @@ pub struct ReservationConfig {
 impl Default for ReservationConfig {
     fn default() -> Self {
         Self {
-            default_ttl_secs: 300,   // 5 minutes
-            max_ttl_secs: 3600,      // 1 hour
+            default_ttl_secs: 300, // 5 minutes
+            max_ttl_secs: 3600,    // 1 hour
             conflict_behavior: "deny".to_string(),
             auto_release_on_complete: true,
         }
@@ -721,8 +721,9 @@ impl Config {
 
     /// Load configuration from a specific path
     pub fn load_from(path: &std::path::Path) -> crate::Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| crate::error::ConfigError::ReadFailed(path.display().to_string(), e.to_string()))?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            crate::error::ConfigError::ReadFailed(path.display().to_string(), e.to_string())
+        })?;
 
         Self::from_toml(&content)
     }

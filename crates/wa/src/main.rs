@@ -377,8 +377,8 @@ async fn main() -> anyhow::Result<()> {
         }) => {
             if dry_run {
                 use wa_core::dry_run::{
-                    build_send_policy_evaluation, create_send_action, create_wait_for_action,
-                    format_human, DryRunContext, TargetResolution,
+                    DryRunContext, TargetResolution, build_send_policy_evaluation,
+                    create_send_action, create_wait_for_action, format_human,
                 };
 
                 let mut ctx = DryRunContext::enabled();
@@ -428,58 +428,92 @@ async fn main() -> anyhow::Result<()> {
             println!("Get-text not yet implemented");
         }
 
-        Some(Commands::Workflow { command }) => match command {
-            WorkflowCommands::List => {
-                println!("Available workflows:");
-                println!("  - handle_compaction");
-                println!("  - handle_usage_limits");
-            }
-            WorkflowCommands::Run { name, pane, dry_run } => {
-                if dry_run {
-                    use wa_core::dry_run::{
-                        format_human, ActionType, DryRunContext, PlannedAction, PolicyCheck,
-                        PolicyEvaluation, TargetResolution,
-                    };
+        Some(Commands::Workflow { command }) => {
+            match command {
+                WorkflowCommands::List => {
+                    println!("Available workflows:");
+                    println!("  - handle_compaction");
+                    println!("  - handle_usage_limits");
+                }
+                WorkflowCommands::Run {
+                    name,
+                    pane,
+                    dry_run,
+                } => {
+                    if dry_run {
+                        use wa_core::dry_run::{
+                            ActionType, DryRunContext, PlannedAction, PolicyCheck,
+                            PolicyEvaluation, TargetResolution, format_human,
+                        };
 
-                    let mut ctx = DryRunContext::enabled();
-                    ctx.set_command(format!("wa workflow run {} --pane {}", name, pane));
+                        let mut ctx = DryRunContext::enabled();
+                        ctx.set_command(format!("wa workflow run {} --pane {}", name, pane));
 
-                    // Target resolution
-                    ctx.set_target(
-                        TargetResolution::new(pane, "local")
-                            .with_title("(pane title)")
-                            .with_agent_type("(detected agent)"),
-                    );
+                        // Target resolution
+                        ctx.set_target(
+                            TargetResolution::new(pane, "local")
+                                .with_title("(pane title)")
+                                .with_agent_type("(detected agent)"),
+                        );
 
-                    // Policy evaluation for workflow
-                    let mut eval = PolicyEvaluation::new();
-                    eval.add_check(PolicyCheck::passed("workflow_enabled", format!("Workflow '{}' is enabled", name)));
-                    eval.add_check(PolicyCheck::passed("pane_state", "Pane is in valid state"));
-                    eval.add_check(PolicyCheck::passed("policy", "Workflow execution allowed"));
-                    ctx.set_policy_evaluation(eval);
+                        // Policy evaluation for workflow
+                        let mut eval = PolicyEvaluation::new();
+                        eval.add_check(PolicyCheck::passed(
+                            "workflow_enabled",
+                            format!("Workflow '{}' is enabled", name),
+                        ));
+                        eval.add_check(PolicyCheck::passed("pane_state", "Pane is in valid state"));
+                        eval.add_check(PolicyCheck::passed("policy", "Workflow execution allowed"));
+                        ctx.set_policy_evaluation(eval);
 
-                    // Expected workflow steps (example for handle_compaction)
-                    ctx.add_action(PlannedAction::new(1, ActionType::AcquireLock, format!("Acquire workflow lock for pane {}", pane)));
-                    ctx.add_action(PlannedAction::new(2, ActionType::WaitFor, "Stabilize: wait for tail stability (no new deltas for N polls; max 2s)".to_string()));
-                    ctx.add_action(PlannedAction::new(3, ActionType::SendText, "Send re-read instruction to agent".to_string()));
-                    ctx.add_action(PlannedAction::new(4, ActionType::WaitFor, "Verify: wait for prompt boundary".to_string()));
-                    ctx.add_action(PlannedAction::new(5, ActionType::MarkEventHandled, "Mark triggering event as handled".to_string()));
-                    ctx.add_action(PlannedAction::new(6, ActionType::ReleaseLock, "Release workflow lock".to_string()));
+                        // Expected workflow steps (example for handle_compaction)
+                        ctx.add_action(PlannedAction::new(
+                            1,
+                            ActionType::AcquireLock,
+                            format!("Acquire workflow lock for pane {}", pane),
+                        ));
+                        ctx.add_action(PlannedAction::new(
+                            2,
+                            ActionType::WaitFor,
+                            "Stabilize: wait for tail stability (no new deltas for N polls; max 2s)"
+                                .to_string(),
+                        ));
+                        ctx.add_action(PlannedAction::new(
+                            3,
+                            ActionType::SendText,
+                            "Send re-read instruction to agent".to_string(),
+                        ));
+                        ctx.add_action(PlannedAction::new(
+                            4,
+                            ActionType::WaitFor,
+                            "Verify: wait for prompt boundary".to_string(),
+                        ));
+                        ctx.add_action(PlannedAction::new(
+                            5,
+                            ActionType::MarkEventHandled,
+                            "Mark triggering event as handled".to_string(),
+                        ));
+                        ctx.add_action(PlannedAction::new(
+                            6,
+                            ActionType::ReleaseLock,
+                            "Release workflow lock".to_string(),
+                        ));
 
-                    let report = ctx.take_report();
-                    println!("{}", format_human(&report));
-                } else {
-                    tracing::info!("Running workflow '{}' on pane {}", name, pane);
-                    // TODO: Implement workflow run
-                    println!("Workflow run not yet implemented");
+                        let report = ctx.take_report();
+                        println!("{}", format_human(&report));
+                    } else {
+                        tracing::info!("Running workflow '{}' on pane {}", name, pane);
+                        // TODO: Implement workflow run
+                        println!("Workflow run not yet implemented");
+                    }
+                }
+                WorkflowCommands::Status { execution_id } => {
+                    tracing::info!("Getting status for execution {}", execution_id);
+                    // TODO: Implement workflow status
+                    println!("Workflow status not yet implemented");
                 }
             }
-            WorkflowCommands::Status { execution_id } => {
-                tracing::info!("Getting status for execution {}", execution_id);
-                // TODO: Implement workflow status
-                println!("Workflow status not yet implemented");
-            }
-        },
+        }
 
         Some(Commands::Status { health }) => {
             if health {

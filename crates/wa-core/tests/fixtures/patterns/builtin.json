@@ -1,0 +1,215 @@
+[
+  {
+    "name": "codex_usage_warning_25_positive",
+    "text": "Warning: You have less than 25% of your 24h limit remaining.",
+    "expected_rule_ids": ["codex.usage.warning_25"],
+    "expected_extracted": {"remaining": "25", "limit_hours": "24"}
+  },
+  {
+    "name": "codex_usage_warning_25_negative",
+    "text": "Warning: You have less than 25% of your limit remaining.",
+    "expected_rule_ids": [],
+    "negative_for": "codex.usage.warning_25"
+  },
+  {
+    "name": "codex_usage_warning_10_positive",
+    "text": "Warning: You have less than 10% of your 8h limit remaining.",
+    "expected_rule_ids": ["codex.usage.warning_10"],
+    "expected_extracted": {"remaining": "10", "limit_hours": "8"}
+  },
+  {
+    "name": "codex_usage_warning_10_negative",
+    "text": "Warning: You have less than 10% of your limit remaining.",
+    "expected_rule_ids": [],
+    "negative_for": "codex.usage.warning_10"
+  },
+  {
+    "name": "codex_usage_warning_5_positive",
+    "text": "Warning: You have less than 5% of your 12h limit remaining.",
+    "expected_rule_ids": ["codex.usage.warning_5"],
+    "expected_extracted": {"remaining": "5", "limit_hours": "12"}
+  },
+  {
+    "name": "codex_usage_warning_5_negative",
+    "text": "Warning: You have less than 5% of your limit remaining.",
+    "expected_rule_ids": [],
+    "negative_for": "codex.usage.warning_5"
+  },
+  {
+    "name": "codex_usage_reached_positive",
+    "text": "You've hit your usage limit for the 3h window. Please try again at 2:30 PM.",
+    "expected_rule_ids": ["codex.usage.reached"],
+    "expected_extracted": {"reset_time": "2:30 PM"}
+  },
+  {
+    "name": "codex_usage_reached_negative",
+    "text": "You've hit your usage limit. Please try again later.",
+    "expected_rule_ids": [],
+    "negative_for": "codex.usage.reached"
+  },
+  {
+    "name": "codex_token_usage_positive",
+    "text": "Token usage: total=125,432 input=50,000 (+ 20,000 cached) output=55,432",
+    "expected_rule_ids": ["codex.session.token_usage"],
+    "expected_extracted": {"total": "125,432", "input": "50,000", "cached": "20,000", "output": "55,432"}
+  },
+  {
+    "name": "codex_token_usage_negative",
+    "text": "Token usage: total=abc input=def output=ghi",
+    "expected_rule_ids": [],
+    "negative_for": "codex.session.token_usage"
+  },
+  {
+    "name": "codex_resume_hint_positive",
+    "text": "To resume this session, run: codex resume a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "expected_rule_ids": ["codex.session.resume_hint"],
+    "expected_extracted": {"session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"}
+  },
+  {
+    "name": "codex_resume_hint_negative",
+    "text": "To resume this session, run: codex resume not-a-uuid",
+    "expected_rule_ids": [],
+    "negative_for": "codex.session.resume_hint"
+  },
+  {
+    "name": "codex_device_code_positive",
+    "text": "Enter this one-time code at https://auth.openai.com: ABCD-12345",
+    "expected_rule_ids": ["codex.auth.device_code_prompt"],
+    "expected_extracted": {"code": "ABCD-12345"}
+  },
+  {
+    "name": "codex_device_code_negative",
+    "text": "Enter this one-time code: abcd-12345",
+    "expected_rule_ids": [],
+    "negative_for": "codex.auth.device_code_prompt"
+  },
+  {
+    "name": "claude_compaction_positive",
+    "text": "Conversation compacted 150,000 tokens to 25,000 tokens",
+    "expected_rule_ids": ["claude_code.compaction"],
+    "expected_extracted": {"tokens_before": "150,000", "tokens_after": "25,000"}
+  },
+  {
+    "name": "claude_compaction_negative",
+    "text": "Conversation compacted tokens to tokens",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.compaction"
+  },
+  {
+    "name": "claude_banner_positive",
+    "text": "Claude Code v1.2.3 starting session with model: claude-opus-4-5-20251101",
+    "expected_rule_ids": ["claude_code.banner"],
+    "expected_extracted": {"version": "1.2.3", "model": "claude-opus-4-5-20251101"}
+  },
+  {
+    "name": "claude_banner_negative",
+    "text": "Claude Code vX.Y starting session",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.banner"
+  },
+  {
+    "name": "claude_usage_warning_positive",
+    "text": "usage limit warning: 12% remaining",
+    "expected_rule_ids": ["claude_code.usage.warning"],
+    "expected_extracted": {"remaining": "12"}
+  },
+  {
+    "name": "claude_usage_warning_negative",
+    "text": "usage limit warning: almost none left",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.usage.warning"
+  },
+  {
+    "name": "claude_usage_reached_positive",
+    "text": "rate limit reached, try again in 2 minutes",
+    "expected_rule_ids": ["claude_code.usage.reached"],
+    "expected_extracted": {"reset_time": "2 minutes"}
+  },
+  {
+    "name": "claude_usage_reached_negative",
+    "text": "rate limit reached, please wait",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.usage.reached"
+  },
+  {
+    "name": "claude_cost_summary_positive",
+    "text": "Session complete. Total cost: $1.25",
+    "expected_rule_ids": ["claude_code.session.cost_summary"],
+    "expected_extracted": {"cost": "1.25"}
+  },
+  {
+    "name": "claude_cost_summary_negative",
+    "text": "Session complete. Total cost: 1.25",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.session.cost_summary"
+  },
+  {
+    "name": "claude_api_key_error_positive",
+    "text": "Error: invalid api key - please check your ANTHROPIC_API_KEY",
+    "expected_rule_ids": ["claude_code.auth.api_key_error"]
+  },
+  {
+    "name": "claude_api_key_error_negative",
+    "text": "Error: invalid key - please check your API_TOKEN",
+    "expected_rule_ids": [],
+    "negative_for": "claude_code.auth.api_key_error"
+  },
+  {
+    "name": "gemini_usage_reached_positive",
+    "text": "Usage limit reached for all Pro models. Please wait before continuing.",
+    "expected_rule_ids": ["gemini.usage.reached"]
+  },
+  {
+    "name": "gemini_usage_reached_negative",
+    "text": "Usage limit reached for free models. Please wait before continuing.",
+    "expected_rule_ids": [],
+    "negative_for": "gemini.usage.reached"
+  },
+  {
+    "name": "gemini_session_summary_positive",
+    "text": "Interaction Summary: Session ID: abc-def-123 Tool Calls: 12",
+    "expected_rule_ids": ["gemini.session.summary"],
+    "expected_extracted": {"session_id": "abc-def-123", "tool_calls": "12"}
+  },
+  {
+    "name": "gemini_session_summary_negative",
+    "text": "Interaction Summary: Session ID: abc-def-123",
+    "expected_rule_ids": [],
+    "negative_for": "gemini.session.summary"
+  },
+  {
+    "name": "gemini_model_used_positive",
+    "text": "Responding with gemini-1.5-pro",
+    "expected_rule_ids": ["gemini.model.used"],
+    "expected_extracted": {"model": "gemini-1.5-pro"}
+  },
+  {
+    "name": "gemini_model_used_negative",
+    "text": "Responding with model gemini-1.5-pro",
+    "expected_rule_ids": [],
+    "negative_for": "gemini.model.used"
+  },
+  {
+    "name": "wezterm_mux_connection_lost_positive",
+    "text": "mux server connection lost: disconnected",
+    "expected_rule_ids": ["wezterm.mux.connection_lost"]
+  },
+  {
+    "name": "wezterm_mux_connection_lost_negative",
+    "text": "mux connection stable and healthy",
+    "expected_rule_ids": [],
+    "negative_for": "wezterm.mux.connection_lost"
+  },
+  {
+    "name": "wezterm_pane_exited_positive",
+    "text": "pane exited with status 1",
+    "expected_rule_ids": ["wezterm.pane.exited"],
+    "expected_extracted": {"exit_code": "1"}
+  },
+  {
+    "name": "wezterm_pane_exited_negative",
+    "text": "pane exited",
+    "expected_rule_ids": [],
+    "negative_for": "wezterm.pane.exited"
+  }
+]

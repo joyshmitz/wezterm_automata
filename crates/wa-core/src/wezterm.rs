@@ -465,14 +465,14 @@ impl WeztermClient {
         // Add domain if specified
         let domain_arg;
         if let Some(domain) = domain_name {
-            domain_arg = format!("--domain-name={}", domain);
+            domain_arg = format!("--domain-name={domain}");
             args.push(&domain_arg);
         }
 
         // Add cwd if specified
         let cwd_arg;
         if let Some(dir) = cwd {
-            cwd_arg = format!("--cwd={}", dir);
+            cwd_arg = format!("--cwd={dir}");
             args.push(&cwd_arg);
         }
 
@@ -512,7 +512,7 @@ impl WeztermClient {
         // Add cwd if specified
         let cwd_arg;
         if let Some(dir) = cwd {
-            cwd_arg = format!("--cwd={}", dir);
+            cwd_arg = format!("--cwd={dir}");
             args.push(&cwd_arg);
         }
 
@@ -520,7 +520,7 @@ impl WeztermClient {
         let percent_arg;
         if let Some(pct) = percent {
             let clamped = pct.clamp(10, 90);
-            percent_arg = format!("--percent={}", clamped);
+            percent_arg = format!("--percent={clamped}");
             args.push(&percent_arg);
         }
 

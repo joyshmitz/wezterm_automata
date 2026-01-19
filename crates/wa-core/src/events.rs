@@ -402,13 +402,10 @@ impl EventBus {
         sender: &broadcast::Sender<Event>,
         times: &Mutex<VecDeque<Instant>>,
     ) -> usize {
-        match sender.send(event) {
-            Ok(count) => {
-                Self::record_timestamp(times, self.capacity);
-                count
-            }
-            Err(_) => 0,
-        }
+        sender.send(event).map_or(0, |count| {
+            Self::record_timestamp(times, self.capacity);
+            count
+        })
     }
 
     fn record_timestamp(times: &Mutex<VecDeque<Instant>>, capacity: usize) {
@@ -421,8 +418,7 @@ impl EventBus {
     }
 
     fn oldest_lag_ms(times: &Mutex<VecDeque<Instant>>) -> Option<u64> {
-        let guard = times.lock().ok()?;
-        let oldest = guard.front()?;
+        let oldest = times.lock().ok()?.front().copied()?;
         let elapsed_ms = oldest.elapsed().as_millis();
         u64::try_from(elapsed_ms).ok()
     }
@@ -617,7 +613,7 @@ mod tests {
         let bus = EventBus::new(10);
         let mut delta_sub = bus.subscribe_deltas();
 
-        bus.publish(Event::SegmentCaptured {
+        let _ = bus.publish(Event::SegmentCaptured {
             pane_id: 5,
             seq: 1,
             content_len: 10,
@@ -626,7 +622,7 @@ mod tests {
         let event = delta_sub.recv().await.unwrap();
         assert!(matches!(event, Event::SegmentCaptured { pane_id: 5, .. }));
 
-        bus.publish(Event::PaneDiscovered {
+        let _ = bus.publish(Event::PaneDiscovered {
             pane_id: 5,
             domain: "local".to_string(),
             title: "shell".to_string(),
@@ -650,7 +646,7 @@ mod tests {
             matched_text: "anchor".to_string(),
         };
 
-        bus.publish(Event::PatternDetected {
+        let _ = bus.publish(Event::PatternDetected {
             pane_id: 1,
             detection,
         });
@@ -736,17 +732,17 @@ mod tests {
         let bus = EventBus::new(2);
         let _delta_sub = bus.subscribe_deltas();
 
-        bus.publish(Event::SegmentCaptured {
+        let _ = bus.publish(Event::SegmentCaptured {
             pane_id: 1,
             seq: 0,
             content_len: 1,
         });
-        bus.publish(Event::SegmentCaptured {
+        let _ = bus.publish(Event::SegmentCaptured {
             pane_id: 1,
             seq: 1,
             content_len: 1,
         });
-        bus.publish(Event::SegmentCaptured {
+        let _ = bus.publish(Event::SegmentCaptured {
             pane_id: 1,
             seq: 2,
             content_len: 1,

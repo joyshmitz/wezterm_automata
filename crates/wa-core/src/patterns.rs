@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use aho_corasick::{AhoCorasick, MatchKind};
+use aho_corasick::AhoCorasick;
 use fancy_regex::Regex;
 use memchr::memchr;
 use serde::{Deserialize, Serialize};
@@ -272,12 +272,8 @@ fn build_engine_index(rules: &[RuleDef]) -> Result<EngineIndex> {
     let anchor_matcher = if anchor_list.is_empty() {
         None
     } else {
-        // Use MatchKind::All to report all matches, including overlapping ones.
-        // This ensures that both "limit reached" and "Usage limit reached for all Pro models"
-        // are reported when they both appear in the text.
         Some(
             AhoCorasick::builder()
-                .match_kind(MatchKind::All)
                 .build(anchor_list.iter().map(String::as_str))
                 .map_err(|e| {
                     PatternError::InvalidRule(format!("failed to build anchor matcher: {e}"))
@@ -333,7 +329,7 @@ fn builtin_codex_pack() -> PatternPack {
                 event_type: "usage.warning".to_string(),
                 severity: Severity::Info,
                 anchors: vec!["less than 25%".to_string()],
-                regex: Some(r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit".to_string()),
+                regex: Some(r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit remaining".to_string()),
                 description: "Codex usage below 25% remaining".to_string(),
                 remediation: None,
                 workflow: None,
@@ -344,7 +340,7 @@ fn builtin_codex_pack() -> PatternPack {
                 event_type: "usage.warning".to_string(),
                 severity: Severity::Warning,
                 anchors: vec!["less than 10%".to_string()],
-                regex: Some(r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit".to_string()),
+                regex: Some(r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit remaining".to_string()),
                 description: "Codex usage below 10% remaining".to_string(),
                 remediation: Some("Consider pausing work soon".to_string()),
                 workflow: None,
@@ -355,7 +351,7 @@ fn builtin_codex_pack() -> PatternPack {
                 event_type: "usage.warning".to_string(),
                 severity: Severity::Warning,
                 anchors: vec!["less than 5%".to_string()],
-                regex: Some(r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit".to_string()),
+                regex: Some(r"(?P<remaining>\d+)% of your (?P<limit_hours>\d+)h limit remaining".to_string()),
                 description: "Codex usage below 5% remaining - critical threshold".to_string(),
                 remediation: Some("Save work and prepare for limit".to_string()),
                 workflow: Some("handle_usage_warning".to_string()),
@@ -481,7 +477,7 @@ fn builtin_claude_code_pack() -> PatternPack {
                     "limit reached".to_string(),
                     "quota exceeded".to_string(),
                 ],
-                regex: Some(r"(?:retry|reset|try again).*?(?P<reset_time>[\d:]+\s*(?:AM|PM|UTC)?|\d+\s*(?:seconds?|minutes?|hours?))".to_string()),
+                regex: Some(r"(?:retry|reset|try again).*?(?P<reset_time>\d+\s*(?:seconds?|minutes?|hours?)|[\d:]+\s*(?:AM|PM|UTC))".to_string()),
                 description: "Claude Code usage limit reached".to_string(),
                 remediation: Some("Wait for limit reset or switch session".to_string()),
                 workflow: Some("handle_usage_limits".to_string()),
@@ -693,11 +689,13 @@ impl PatternEngine {
 
         #[cfg(test)]
         {
-            let match_count = matcher.find_iter(text).count();
+            let match_count = matcher.find_overlapping_iter(text).count();
             eprintln!("detect: Aho-Corasick found {} matches in text", match_count);
         }
 
-        for matched in matcher.find_iter(text) {
+        // Use find_overlapping_iter to detect all anchors, including ones that overlap
+        // (e.g., "limit reached" and "Usage limit reached for all Pro models")
+        for matched in matcher.find_overlapping_iter(text) {
             #[cfg(test)]
             eprintln!("detect: matched pattern {} at {:?}", matched.pattern().as_usize(), matched.span());
 
@@ -1341,11 +1339,11 @@ mod tests {
         eprintln!("Target anchor present in anchor_list: {}", engine.anchor_list.contains(&target_anchor.to_string()));
         eprintln!("Target anchor present in anchor_to_rules: {:?}", engine.anchor_to_rules.get(target_anchor));
 
-        // Debug: test the Aho-Corasick matcher directly
+        // Debug: test the Aho-Corasick matcher directly (with overlapping iteration)
         if let Some(matcher) = engine.anchor_matcher.as_ref() {
             eprintln!("Matcher patterns count: {}", matcher.patterns_len());
-            let matches: Vec<_> = matcher.find_iter(text).collect();
-            eprintln!("Aho-Corasick matches: {matches:?}");
+            let matches: Vec<_> = matcher.find_overlapping_iter(text).collect();
+            eprintln!("Aho-Corasick matches (overlapping): {matches:?}");
             for m in &matches {
                 eprintln!("  Match pattern {} at {}..{}: {:?}",
                     m.pattern().as_usize(),

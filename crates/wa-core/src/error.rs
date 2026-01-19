@@ -39,6 +39,10 @@ pub enum Error {
     /// JSON serialization errors
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// Runtime errors (hot reload, channel failures, etc.)
+    #[error("Runtime error: {0}")]
+    Runtime(String),
 }
 
 /// WezTerm-specific errors

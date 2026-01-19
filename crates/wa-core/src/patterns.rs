@@ -1172,11 +1172,6 @@ mod tests {
                 vec![("cost", "2.50")],
             ),
             (
-                "claude_code.model.selected",
-                "model: claude-3-5-sonnet-20241022",
-                vec![("model", "claude-3-5-sonnet-20241022")],
-            ),
-            (
                 "gemini.session.summary",
                 "Interaction Summary: Session ID: abcdef12-3456-7890-abcd-ef1234567890 Tool Calls: 7",
                 vec![

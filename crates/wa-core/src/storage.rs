@@ -3492,10 +3492,7 @@ mod storage_handle_tests {
 
     /// Helper to create a test pane record
     fn test_pane(pane_id: u64) -> PaneRecord {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let now = now_ms();
         PaneRecord {
             pane_id,
             domain: "local".to_string(),
@@ -3625,10 +3622,7 @@ mod storage_handle_tests {
         handle.upsert_pane(test_pane(1)).await.unwrap();
 
         let workflow_id = "wf-test-123";
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let now = now_ms();
 
         // Create workflow execution
         let workflow = WorkflowRecord {
@@ -3728,10 +3722,7 @@ mod storage_handle_tests {
         let db_path = temp_db_path();
         let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let now = now_ms();
 
         // Create pane first (foreign key constraint)
         handle.upsert_pane(test_pane(1)).await.unwrap();
@@ -3837,10 +3828,7 @@ mod storage_handle_tests {
         let db_path = temp_db_path();
         let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let now = now_ms();
 
         // Create pane first (foreign key constraint)
         let pane = PaneRecord {

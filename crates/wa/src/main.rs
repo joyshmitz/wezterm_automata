@@ -4,6 +4,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::LazyLock;
+
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -251,19 +253,23 @@ impl<T> RobotResponse<T> {
     }
 }
 
+fn redact_for_output(text: &str) -> String {
+    static REDACTOR: LazyLock<wa_core::policy::Redactor> =
+        LazyLock::new(wa_core::policy::Redactor::new);
+    REDACTOR.redact(text)
+}
+
 fn build_send_dry_run_report(
+    command_ctx: &wa_core::dry_run::CommandContext,
     pane_id: u64,
     text: &str,
     no_paste: bool,
-    command: &str,
 ) -> wa_core::dry_run::DryRunReport {
     use wa_core::dry_run::{
-        DryRunContext, TargetResolution, build_send_policy_evaluation, create_send_action,
-        create_wait_for_action,
+        TargetResolution, build_send_policy_evaluation, create_send_action, create_wait_for_action,
     };
 
-    let mut ctx = DryRunContext::enabled();
-    ctx.set_command(command);
+    let mut ctx = command_ctx.dry_run_context();
 
     // Target resolution (simulated for now)
     ctx.set_target(
@@ -293,16 +299,15 @@ fn build_send_dry_run_report(
 }
 
 fn build_workflow_dry_run_report(
+    command_ctx: &wa_core::dry_run::CommandContext,
     name: &str,
     pane: u64,
-    command: &str,
 ) -> wa_core::dry_run::DryRunReport {
     use wa_core::dry_run::{
-        ActionType, DryRunContext, PlannedAction, PolicyCheck, PolicyEvaluation, TargetResolution,
+        ActionType, PlannedAction, PolicyCheck, PolicyEvaluation, TargetResolution,
     };
 
-    let mut ctx = DryRunContext::enabled();
-    ctx.set_command(command);
+    let mut ctx = command_ctx.dry_run_context();
 
     // Target resolution
     ctx.set_target(
@@ -416,18 +421,23 @@ async fn main() -> anyhow::Result<()> {
                     text,
                     dry_run,
                 } => {
-                    if dry_run {
-                        let report = build_send_dry_run_report(
-                            pane_id,
-                            &text,
-                            false,
-                            &format!("wa robot send {pane_id} \"{text}\" --dry-run"),
-                        );
+                    let redacted_text = redact_for_output(&text);
+                    let command = if dry_run {
+                        format!("wa robot send {pane_id} \"{redacted_text}\" --dry-run")
+                    } else {
+                        format!("wa robot send {pane_id} \"{redacted_text}\"")
+                    };
+                    let command_ctx = wa_core::dry_run::CommandContext::new(command, dry_run);
+
+                    if command_ctx.is_dry_run() {
+                        let report = build_send_dry_run_report(&command_ctx, pane_id, &text, false);
                         let response = RobotResponse::success(report, elapsed_ms(start));
                         println!("{}", serde_json::to_string_pretty(&response)?);
                     } else {
                         let response: RobotResponse<()> = RobotResponse::error(
-                            format!("send to pane {pane_id} not yet implemented (text: {text})"),
+                            format!(
+                                "send to pane {pane_id} not yet implemented (text: {redacted_text})"
+                            ),
                             None,
                             elapsed_ms(start),
                         );
@@ -498,20 +508,23 @@ async fn main() -> anyhow::Result<()> {
             no_paste,
             dry_run,
         }) => {
-            if dry_run {
-                let report = build_send_dry_run_report(
-                    pane_id,
-                    &text,
-                    no_paste,
-                    &format!("wa send --pane {pane_id} \"{text}\""),
-                );
+            let redacted_text = redact_for_output(&text);
+            let command = if dry_run {
+                format!("wa send --pane {pane_id} \"{redacted_text}\" --dry-run")
+            } else {
+                format!("wa send --pane {pane_id} \"{redacted_text}\"")
+            };
+            let command_ctx = wa_core::dry_run::CommandContext::new(command, dry_run);
+
+            if command_ctx.is_dry_run() {
+                let report = build_send_dry_run_report(&command_ctx, pane_id, &text, no_paste);
                 println!("{}", wa_core::dry_run::format_human(&report));
             } else {
                 tracing::info!(
                     "Sending to pane {} (no_paste={}): {}",
                     pane_id,
                     no_paste,
-                    text
+                    redacted_text
                 );
                 // TODO: Implement send
                 println!("Send not yet implemented");
@@ -536,12 +549,15 @@ async fn main() -> anyhow::Result<()> {
                     pane,
                     dry_run,
                 } => {
-                    if dry_run {
-                        let report = build_workflow_dry_run_report(
-                            &name,
-                            pane,
-                            &format!("wa workflow run {name} --pane {pane}"),
-                        );
+                    let command = if dry_run {
+                        format!("wa workflow run {name} --pane {pane} --dry-run")
+                    } else {
+                        format!("wa workflow run {name} --pane {pane}")
+                    };
+                    let command_ctx = wa_core::dry_run::CommandContext::new(command, dry_run);
+
+                    if command_ctx.is_dry_run() {
+                        let report = build_workflow_dry_run_report(&command_ctx, &name, pane);
                         println!("{}", wa_core::dry_run::format_human(&report));
                     } else {
                         tracing::info!("Running workflow '{}' on pane {}", name, pane);

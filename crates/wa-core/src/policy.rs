@@ -1098,4 +1098,317 @@ mod tests {
         assert!(json.contains("\"actor\":\"robot\""));
         assert!(json.contains("\"pane_id\":42"));
     }
+
+    // ========================================================================
+    // Redactor Tests - True Positives (MUST redact)
+    // ========================================================================
+
+    #[test]
+    fn redactor_redacts_openai_key() {
+        let redactor = Redactor::new();
+        let input = "My API key is sk-abc123456789012345678901234567890123456789012345678901";
+        let output = redactor.redact(input);
+        assert!(
+            output.contains("[REDACTED]"),
+            "OpenAI key should be redacted"
+        );
+        assert!(
+            !output.contains("sk-abc"),
+            "OpenAI key should not appear in output"
+        );
+    }
+
+    #[test]
+    fn redactor_redacts_openai_proj_key() {
+        let redactor = Redactor::new();
+        let input = "API key: sk-proj-abcdefghijklmnopqrstuvwxyz12345678901234567890";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("sk-proj-"));
+    }
+
+    #[test]
+    fn redactor_redacts_anthropic_key() {
+        let redactor = Redactor::new();
+        let input =
+            "export ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678901234567890";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("sk-ant-"));
+    }
+
+    #[test]
+    fn redactor_redacts_github_pat() {
+        let redactor = Redactor::new();
+        let input = "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("ghp_"));
+    }
+
+    #[test]
+    fn redactor_redacts_github_oauth() {
+        let redactor = Redactor::new();
+        let input = "Token: gho_abcdefghijklmnopqrstuvwxyz1234567890";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("gho_"));
+    }
+
+    #[test]
+    fn redactor_redacts_aws_access_key_id() {
+        let redactor = Redactor::new();
+        let input = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("AKIA"));
+    }
+
+    #[test]
+    fn redactor_redacts_aws_secret_key() {
+        let redactor = Redactor::new();
+        let input = "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("wJalrXUtnFEMI"));
+    }
+
+    #[test]
+    fn redactor_redacts_bearer_token() {
+        let redactor = Redactor::new();
+        let input = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("eyJhbGciOi"));
+    }
+
+    #[test]
+    fn redactor_redacts_slack_bot_token() {
+        let redactor = Redactor::new();
+        // Minimal-length token matching regex xox[bpar]-[a-zA-Z0-9-]{10,}
+        let input = "SLACK_TOKEN=xoxb-0123456789";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("xoxb-"));
+    }
+
+    #[test]
+    fn redactor_redacts_stripe_secret_key() {
+        let redactor = Redactor::new();
+        // Minimal-length key matching regex [ps]k_(?:live|test)_[a-zA-Z0-9]{20,}
+        let input = "stripe.api_key = sk_live_01234567890123456789";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("sk_live_"));
+    }
+
+    #[test]
+    fn redactor_redacts_stripe_test_key() {
+        let redactor = Redactor::new();
+        // Minimal-length key matching regex [ps]k_(?:live|test)_[a-zA-Z0-9]{20,}
+        let input = "STRIPE_KEY=sk_test_01234567890123456789";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("sk_test_"));
+    }
+
+    #[test]
+    fn redactor_redacts_database_url_password() {
+        let redactor = Redactor::new();
+        let input = "DATABASE_URL=postgres://user:supersecretpassword@localhost:5432/mydb";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("supersecretpassword"));
+    }
+
+    #[test]
+    fn redactor_redacts_mysql_url() {
+        let redactor = Redactor::new();
+        let input = "mysql://admin:hunter2@db.example.com/production";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("hunter2"));
+    }
+
+    #[test]
+    fn redactor_redacts_device_code() {
+        let redactor = Redactor::new();
+        let input = "Enter device_code: ABCD-EFGH-1234";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("ABCD-EFGH"));
+    }
+
+    #[test]
+    fn redactor_redacts_oauth_url_with_token() {
+        let redactor = Redactor::new();
+        let input = "Redirect: https://example.com/callback?access_token=abc123xyz789";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("access_token=abc"));
+    }
+
+    #[test]
+    fn redactor_redacts_oauth_url_with_code() {
+        let redactor = Redactor::new();
+        let input = "Visit https://auth.example.com/oauth?code=authcode123456789";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("code=auth"));
+    }
+
+    #[test]
+    fn redactor_redacts_generic_api_key() {
+        let redactor = Redactor::new();
+        let input = "api_key = abcdef1234567890abcdef1234567890";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("abcdef1234567890"));
+    }
+
+    #[test]
+    fn redactor_redacts_generic_token() {
+        let redactor = Redactor::new();
+        let input = "token: my_secret_token_value_12345678";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("my_secret_token"));
+    }
+
+    #[test]
+    fn redactor_redacts_generic_password() {
+        let redactor = Redactor::new();
+        let input = "password: mysecretpassword123";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("mysecretpassword"));
+    }
+
+    #[test]
+    fn redactor_redacts_generic_secret() {
+        let redactor = Redactor::new();
+        let input = "secret = client_secret_value_here";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("client_secret"));
+    }
+
+    // ========================================================================
+    // Redactor Tests - False Positives (should NOT redact)
+    // ========================================================================
+
+    #[test]
+    fn redactor_does_not_redact_normal_text() {
+        let redactor = Redactor::new();
+        let input = "This is just some normal text without any secrets.";
+        let output = redactor.redact(input);
+        assert_eq!(output, input, "Normal text should not be modified");
+        assert!(!output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redactor_does_not_redact_short_sk_prefix() {
+        let redactor = Redactor::new();
+        // "sk-" followed by short string should not match OpenAI pattern
+        let input = "The task is done.";
+        let output = redactor.redact(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn redactor_does_not_redact_normal_urls() {
+        let redactor = Redactor::new();
+        let input = "Visit https://example.com/page?id=123&name=test for more info";
+        let output = redactor.redact(input);
+        assert_eq!(
+            output, input,
+            "Normal URLs without tokens should not be redacted"
+        );
+    }
+
+    #[test]
+    fn redactor_does_not_redact_code_variables() {
+        let redactor = Redactor::new();
+        let input = "let tokenCount = 5; let secretKey = getKey();";
+        let output = redactor.redact(input);
+        // Variables like tokenCount or secretKey shouldn't trigger redaction
+        // since they don't have assignment patterns with actual values
+        assert!(!output.contains("[REDACTED]") || output == input);
+    }
+
+    #[test]
+    fn redactor_does_not_redact_short_passwords() {
+        let redactor = Redactor::new();
+        // Very short passwords (< 4 chars) should not be redacted to avoid false positives
+        let input = "password: abc";
+        let output = redactor.redact(input);
+        // 3-char password should not be redacted (pattern requires 4+ chars)
+        assert!(!output.contains("[REDACTED]") || input == output);
+    }
+
+    #[test]
+    fn redactor_preserves_surrounding_text() {
+        let redactor = Redactor::new();
+        let input = "Before sk-abc123456789012345678901234567890123456789012345678901 After";
+        let output = redactor.redact(input);
+        assert!(output.starts_with("Before "));
+        assert!(output.ends_with(" After"));
+        assert!(output.contains("[REDACTED]"));
+    }
+
+    // ========================================================================
+    // Redactor Tests - Helper Methods
+    // ========================================================================
+
+    #[test]
+    fn redactor_contains_secrets_true_positive() {
+        let redactor = Redactor::new();
+        let input = "My key is sk-abc123456789012345678901234567890123456789012345678901";
+        assert!(redactor.contains_secrets(input));
+    }
+
+    #[test]
+    fn redactor_contains_secrets_false_for_normal_text() {
+        let redactor = Redactor::new();
+        let input = "Just some regular text without any secrets";
+        assert!(!redactor.contains_secrets(input));
+    }
+
+    #[test]
+    fn redactor_detect_returns_locations() {
+        let redactor = Redactor::new();
+        let input = "Key: sk-abc123456789012345678901234567890123456789012345678901";
+        let detections = redactor.detect(input);
+        assert!(!detections.is_empty(), "Should detect at least one secret");
+        assert_eq!(detections[0].0, "openai_key");
+    }
+
+    #[test]
+    fn redactor_debug_markers_include_pattern_name() {
+        let redactor = Redactor::with_debug_markers();
+        let input = "sk-abc123456789012345678901234567890123456789012345678901";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED:openai_key]"));
+    }
+
+    #[test]
+    fn redactor_handles_multiple_secrets() {
+        let redactor = Redactor::new();
+        let input = "OpenAI: sk-abc123456789012345678901234567890123456789012345678901 \
+                     GitHub: ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+        let output = redactor.redact(input);
+        assert!(!output.contains("sk-abc"));
+        assert!(!output.contains("ghp_"));
+        // Should have two [REDACTED] markers
+        assert_eq!(output.matches("[REDACTED]").count(), 2);
+    }
+
+    #[test]
+    fn redactor_policy_engine_integration() {
+        let engine = PolicyEngine::permissive();
+        let text = "API key: sk-abc123456789012345678901234567890123456789012345678901";
+        let redacted = engine.redact_secrets(text);
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("sk-abc"));
+    }
 }

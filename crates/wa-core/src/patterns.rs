@@ -1873,4 +1873,266 @@ mod tests {
             );
         }
     }
+
+    // ========== State Gating & Deduplication Tests ==========
+
+    #[test]
+    fn state_gating_filters_by_agent_type() {
+        let engine = PatternEngine::new();
+
+        // Codex usage limit text - use actual anchor from rule
+        let codex_text = "You've hit your usage limit, try again at 3pm";
+
+        // With Codex context - should detect
+        let mut codex_ctx = DetectionContext::with_agent_type(AgentType::Codex);
+        let detections = engine.detect_with_context(codex_text, &mut codex_ctx);
+        assert!(
+            detections
+                .iter()
+                .any(|d| d.rule_id == "codex.usage.reached"),
+            "Should detect codex.usage.reached with Codex context"
+        );
+
+        // With Claude context - should NOT detect codex rules
+        let mut claude_ctx = DetectionContext::with_agent_type(AgentType::ClaudeCode);
+        let detections = engine.detect_with_context(codex_text, &mut claude_ctx);
+        assert!(
+            !detections
+                .iter()
+                .any(|d| d.rule_id == "codex.usage.reached"),
+            "Should NOT detect codex.usage.reached with Claude context"
+        );
+    }
+
+    #[test]
+    fn state_gating_allows_wezterm_rules_for_all_agents() {
+        let engine = PatternEngine::new();
+
+        // WezTerm mux connection lost - use actual anchor from rule
+        let wezterm_text = "mux server connection lost - please reconnect";
+
+        // Should fire regardless of agent type
+        for agent in [
+            AgentType::Codex,
+            AgentType::ClaudeCode,
+            AgentType::Gemini,
+            AgentType::Unknown,
+        ] {
+            let mut ctx = DetectionContext::with_agent_type(agent);
+            let detections = engine.detect_with_context(wezterm_text, &mut ctx);
+            assert!(
+                detections
+                    .iter()
+                    .any(|d| d.rule_id == "wezterm.mux.connection_lost"),
+                "WezTerm rules should fire for {agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn state_gating_unknown_agent_allows_all() {
+        let engine = PatternEngine::new();
+
+        // With Unknown agent type, all rules should pass through
+        let codex_text = "You've hit your usage limit, try again at 3pm";
+        let mut ctx = DetectionContext::with_agent_type(AgentType::Unknown);
+        let detections = engine.detect_with_context(codex_text, &mut ctx);
+        assert!(
+            detections
+                .iter()
+                .any(|d| d.rule_id == "codex.usage.reached"),
+            "Unknown agent should allow all rules"
+        );
+    }
+
+    #[test]
+    fn dedup_prevents_repeated_detections() {
+        let engine = PatternEngine::new();
+        let text = "You've hit your usage limit, try again at 3pm";
+
+        let mut ctx = DetectionContext::new();
+
+        // First detection should succeed
+        let first = engine.detect_with_context(text, &mut ctx);
+        assert!(!first.is_empty(), "First detection should find matches");
+
+        // Second detection with same text should be empty (deduped)
+        let second = engine.detect_with_context(text, &mut ctx);
+        assert!(
+            second.is_empty(),
+            "Repeated detection should be deduped, but got {second:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_allows_different_extracted_values() {
+        let engine = PatternEngine::new();
+
+        let mut ctx = DetectionContext::new();
+
+        // First detection with one token count (matches codex.session.token_usage regex)
+        let text1 = "Token usage: total=94212 input=2115 (+ 1000 cached) output=1000";
+        let first = engine.detect_with_context(text1, &mut ctx);
+        assert!(!first.is_empty(), "First detection should succeed");
+
+        // Second detection with different token count should NOT be deduped
+        let text2 = "Token usage: total=100000 input=3000 (+ 2000 cached) output=5000";
+        let second = engine.detect_with_context(text2, &mut ctx);
+        assert!(
+            !second.is_empty(),
+            "Different extracted values should not be deduped"
+        );
+    }
+
+    #[test]
+    fn dedup_clear_seen_resets() {
+        let engine = PatternEngine::new();
+        let text = "You've hit your usage limit, try again at 3pm";
+
+        let mut ctx = DetectionContext::new();
+
+        // First detection
+        let first = engine.detect_with_context(text, &mut ctx);
+        assert!(!first.is_empty());
+
+        // Clear seen state
+        ctx.clear_seen();
+        assert_eq!(ctx.seen_count(), 0);
+
+        // Should detect again after clear
+        let after_clear = engine.detect_with_context(text, &mut ctx);
+        assert!(!after_clear.is_empty(), "Should detect after clearing seen");
+    }
+
+    #[test]
+    fn detection_dedup_key_includes_extracted() {
+        let d1 = Detection {
+            rule_id: "test.rule".into(),
+            agent_type: AgentType::Codex,
+            event_type: "usage".into(),
+            severity: Severity::Info,
+            confidence: 0.9,
+            extracted: serde_json::json!({"tokens": "1000"}),
+            matched_text: "test".into(),
+        };
+
+        let d2 = Detection {
+            rule_id: "test.rule".into(),
+            agent_type: AgentType::Codex,
+            event_type: "usage".into(),
+            severity: Severity::Info,
+            confidence: 0.9,
+            extracted: serde_json::json!({"tokens": "2000"}),
+            matched_text: "test".into(),
+        };
+
+        assert_ne!(
+            d1.dedup_key(),
+            d2.dedup_key(),
+            "Different extracted values should produce different dedup keys"
+        );
+
+        // Same rule with same extracted should match
+        let d3 = Detection {
+            rule_id: "test.rule".into(),
+            agent_type: AgentType::Codex,
+            event_type: "usage".into(),
+            severity: Severity::Info,
+            confidence: 0.9,
+            extracted: serde_json::json!({"tokens": "1000"}),
+            matched_text: "different text".into(),
+        };
+
+        assert_eq!(
+            d1.dedup_key(),
+            d3.dedup_key(),
+            "Same rule+extracted should produce same dedup key"
+        );
+    }
+
+    #[test]
+    fn context_with_pane_works() {
+        let ctx = DetectionContext::with_pane(42, Some(AgentType::ClaudeCode));
+        assert_eq!(ctx.pane_id, Some(42));
+        assert_eq!(ctx.agent_type, Some(AgentType::ClaudeCode));
+        assert_eq!(ctx.seen_count(), 0);
+    }
+
+    #[test]
+    fn rule_applies_to_agent_logic() {
+        // Create a mock detection for Codex
+        let codex_detection = Detection {
+            rule_id: "codex.usage_reached".into(),
+            agent_type: AgentType::Codex,
+            event_type: "usage".into(),
+            severity: Severity::Warning,
+            confidence: 0.9,
+            extracted: serde_json::Value::Null,
+            matched_text: "test".into(),
+        };
+
+        // Codex rule should apply to Codex agent
+        assert!(PatternEngine::rule_applies_to_agent(
+            &codex_detection,
+            AgentType::Codex
+        ));
+
+        // Codex rule should NOT apply to Claude agent
+        assert!(!PatternEngine::rule_applies_to_agent(
+            &codex_detection,
+            AgentType::ClaudeCode
+        ));
+
+        // Codex rule should apply to Unknown agent (fallback)
+        assert!(PatternEngine::rule_applies_to_agent(
+            &codex_detection,
+            AgentType::Unknown
+        ));
+
+        // WezTerm rules should apply to all agents
+        let wezterm_detection = Detection {
+            rule_id: "wezterm.pane_exited".into(),
+            agent_type: AgentType::Wezterm,
+            event_type: "lifecycle".into(),
+            severity: Severity::Info,
+            confidence: 0.9,
+            extracted: serde_json::Value::Null,
+            matched_text: "test".into(),
+        };
+
+        assert!(PatternEngine::rule_applies_to_agent(
+            &wezterm_detection,
+            AgentType::Codex
+        ));
+        assert!(PatternEngine::rule_applies_to_agent(
+            &wezterm_detection,
+            AgentType::ClaudeCode
+        ));
+        assert!(PatternEngine::rule_applies_to_agent(
+            &wezterm_detection,
+            AgentType::Gemini
+        ));
+    }
+
+    #[test]
+    fn state_gating_prevents_false_positives_in_non_agent_panes() {
+        let engine = PatternEngine::new();
+
+        // Text that might appear in a non-agent pane (e.g., log file output)
+        // but contains Codex-specific keywords
+        let log_text = "Usage limit reached for all Pro models";
+
+        // With Gemini context (wrong agent) - should NOT detect Codex rules
+        let mut ctx = DetectionContext::with_pane(1, Some(AgentType::Gemini));
+        let detections = engine.detect_with_context(log_text, &mut ctx);
+
+        // Should not contain Codex-specific detections
+        for d in &detections {
+            assert!(
+                d.agent_type != AgentType::Codex,
+                "Codex rule {} should not fire in Gemini pane",
+                d.rule_id
+            );
+        }
+    }
 }

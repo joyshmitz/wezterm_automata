@@ -14,6 +14,40 @@ use crate::policy::PolicyDecision;
 // Core Types
 // ============================================================================
 
+/// Context for command execution that carries dry-run intent.
+#[derive(Debug, Clone)]
+pub struct CommandContext {
+    /// Whether dry-run mode is enabled
+    pub dry_run: bool,
+    /// Command string for reporting
+    pub command: String,
+}
+
+impl CommandContext {
+    /// Create a new command context
+    #[must_use]
+    pub fn new(command: impl Into<String>, dry_run: bool) -> Self {
+        Self {
+            dry_run,
+            command: command.into(),
+        }
+    }
+
+    /// Check if this is a dry-run execution
+    #[must_use]
+    pub fn is_dry_run(&self) -> bool {
+        self.dry_run
+    }
+
+    /// Build a dry-run context seeded with this command
+    #[must_use]
+    pub fn dry_run_context(&self) -> DryRunContext {
+        let mut ctx = DryRunContext::from_flag(self.dry_run);
+        ctx.set_command(self.command.clone());
+        ctx
+    }
+}
+
 /// Context for dry-run mode execution.
 ///
 /// Carries the dry_run flag and collects information for the report.
@@ -600,6 +634,14 @@ mod tests {
 
         let from_flag_false = DryRunContext::from_flag(false);
         assert!(!from_flag_false.is_dry_run());
+    }
+
+    #[test]
+    fn command_context_builds_dry_run_context() {
+        let ctx = CommandContext::new("wa send --pane 1 \"hi\" --dry-run", true);
+        let dry_ctx = ctx.dry_run_context();
+        assert!(dry_ctx.is_dry_run());
+        assert_eq!(dry_ctx.report.command, "wa send --pane 1 \"hi\" --dry-run");
     }
 
     #[test]

@@ -923,7 +923,7 @@ impl PatternEngine {
     /// - The detection is a WezTerm rule (infrastructure rules apply to all)
     /// - The expected agent is Unknown (conservative fallback)
     #[must_use]
-    fn rule_applies_to_agent(&self, detection: &Detection, expected_agent: AgentType) -> bool {
+    fn rule_applies_to_agent(detection: &Detection, expected_agent: AgentType) -> bool {
         // WezTerm rules are infrastructure and apply to all agent types
         if detection.agent_type == AgentType::Wezterm {
             return true;

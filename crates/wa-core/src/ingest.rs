@@ -276,6 +276,19 @@ impl PaneCursor {
         }
     }
 
+    /// Get the last assigned sequence number.
+    ///
+    /// Returns -1 if no segments have been captured yet, otherwise
+    /// returns `next_seq - 1`.
+    #[must_use]
+    pub fn last_seq(&self) -> i64 {
+        if self.next_seq == 0 {
+            -1
+        } else {
+            (self.next_seq - 1) as i64
+        }
+    }
+
     /// Process a new pane snapshot and return a captured segment if something changed.
     ///
     /// This assigns a monotonically increasing per-pane sequence number (`seq`).
@@ -342,6 +355,7 @@ impl PaneCursor {
                 seq,
                 content,
                 kind: CapturedSegmentKind::Gap { reason },
+                captured_at: epoch_ms(),
             });
         }
 
@@ -356,6 +370,7 @@ impl PaneCursor {
                     seq,
                     content,
                     kind: CapturedSegmentKind::Delta,
+                    captured_at: epoch_ms(),
                 })
             }
             DeltaResult::Gap { reason, content } => {
@@ -367,6 +382,7 @@ impl PaneCursor {
                     seq,
                     content,
                     kind: CapturedSegmentKind::Gap { reason },
+                    captured_at: epoch_ms(),
                 })
             }
         }
@@ -383,6 +399,11 @@ impl PaneCursor {
     pub fn resync_seq(&mut self, storage_seq: u64) {
         self.next_seq = storage_seq.saturating_add(1);
         self.in_gap = true;
+    }
+
+    /// Alias for `capture_snapshot` for backward compatibility.
+    pub fn capture(&mut self, content: &str, overlap_size: usize) -> Option<CapturedSegment> {
+        self.capture_snapshot(content, overlap_size)
     }
 }
 
@@ -666,6 +687,8 @@ pub struct CapturedSegment {
     pub content: String,
     /// Segment kind
     pub kind: CapturedSegmentKind,
+    /// Timestamp when the capture was taken (epoch ms)
+    pub captured_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -791,6 +814,219 @@ pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> Delt
         reason: "overlap_not_found".to_string(),
         content: current.to_string(),
     }
+}
+
+// =============================================================================
+// Output Cache (Memory-Efficient Deduplication)
+// =============================================================================
+
+/// Configuration for the output cache.
+#[derive(Debug, Clone)]
+pub struct OutputCacheConfig {
+    /// Maximum number of content hashes to store in the global LRU
+    pub global_lru_capacity: usize,
+    /// Maximum age for per-pane state before pruning (milliseconds)
+    pub per_pane_max_age_ms: u64,
+}
+
+impl Default for OutputCacheConfig {
+    fn default() -> Self {
+        Self {
+            global_lru_capacity: 1024,
+            per_pane_max_age_ms: 5 * 60 * 1000, // 5 minutes
+        }
+    }
+}
+
+/// Per-pane cache state for tracking content changes.
+#[derive(Debug, Clone)]
+struct PaneCacheState {
+    /// Hash of the last seen content
+    content_hash: u64,
+    /// Content length (secondary discriminator)
+    content_len: usize,
+    /// Last update timestamp (epoch ms)
+    last_updated: i64,
+}
+
+/// Memory-efficient output cache for skipping redundant processing.
+///
+/// Uses two complementary mechanisms:
+/// 1. Global LRU of content hashes - deduplicates across panes
+/// 2. Per-pane rolling hash state - fast per-pane deduplication
+#[derive(Debug)]
+pub struct OutputCache {
+    config: OutputCacheConfig,
+    global_hashes: HashMap<u64, i64>,
+    lru_order: Vec<u64>,
+    pane_states: HashMap<u64, PaneCacheState>,
+    hits: u64,
+    misses: u64,
+}
+
+impl OutputCache {
+    /// Create a new output cache with the given configuration.
+    #[must_use]
+    pub fn new(config: OutputCacheConfig) -> Self {
+        Self {
+            config,
+            global_hashes: HashMap::new(),
+            lru_order: Vec::new(),
+            pane_states: HashMap::new(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Create a new output cache with default configuration.
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        Self::new(OutputCacheConfig::default())
+    }
+
+    /// Check if content is new (not previously seen).
+    ///
+    /// Returns `true` if the content should be processed (new or changed).
+    /// Returns `false` if the content can be skipped (unchanged).
+    pub fn is_new(&mut self, pane_id: u64, content: &str) -> bool {
+        let now = epoch_ms();
+        let hash = hash_text(content);
+        let len = content.len();
+
+        // Check per-pane state first (fast path)
+        if let Some(state) = self.pane_states.get(&pane_id) {
+            if state.content_hash == hash && state.content_len == len {
+                self.hits += 1;
+                self.pane_states.get_mut(&pane_id).unwrap().last_updated = now;
+                return false;
+            }
+        }
+
+        // Check global LRU (cross-pane deduplication)
+        if self.global_hashes.contains_key(&hash) {
+            self.update_pane_state(pane_id, hash, len, now);
+            self.update_global_lru(hash, now);
+            self.hits += 1;
+            return false;
+        }
+
+        // New content
+        self.update_pane_state(pane_id, hash, len, now);
+        self.update_global_lru(hash, now);
+        self.misses += 1;
+        true
+    }
+
+    fn update_pane_state(&mut self, pane_id: u64, hash: u64, len: usize, now: i64) {
+        self.pane_states.insert(
+            pane_id,
+            PaneCacheState {
+                content_hash: hash,
+                content_len: len,
+                last_updated: now,
+            },
+        );
+    }
+
+    fn update_global_lru(&mut self, hash: u64, now: i64) {
+        if self.global_hashes.contains_key(&hash) {
+            self.global_hashes.insert(hash, now);
+            return;
+        }
+
+        while self.lru_order.len() >= self.config.global_lru_capacity {
+            if let Some(oldest_hash) = self.lru_order.first().copied() {
+                self.lru_order.remove(0);
+                self.global_hashes.remove(&oldest_hash);
+            }
+        }
+
+        self.global_hashes.insert(hash, now);
+        self.lru_order.push(hash);
+    }
+
+    /// Prune stale per-pane entries older than max_age.
+    pub fn prune(&mut self, max_age_ms: u64) {
+        let now = epoch_ms();
+        let cutoff = now - max_age_ms as i64;
+
+        self.pane_states.retain(|_, state| state.last_updated > cutoff);
+
+        let hashes_to_remove: Vec<u64> = self
+            .global_hashes
+            .iter()
+            .filter(|(_, ts)| **ts < cutoff)
+            .map(|(hash, _)| *hash)
+            .collect();
+
+        for hash in hashes_to_remove {
+            self.global_hashes.remove(&hash);
+            self.lru_order.retain(|h| *h != hash);
+        }
+    }
+
+    /// Prune stale entries using the configured max_age.
+    pub fn prune_stale(&mut self) {
+        self.prune(self.config.per_pane_max_age_ms);
+    }
+
+    /// Get the current cache hit rate (0.0 - 1.0).
+    #[must_use]
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+
+    /// Get cache statistics.
+    #[must_use]
+    pub fn stats(&self) -> OutputCacheStats {
+        OutputCacheStats {
+            hits: self.hits,
+            misses: self.misses,
+            hit_rate: self.hit_rate(),
+            global_entries: self.global_hashes.len(),
+            pane_entries: self.pane_states.len(),
+        }
+    }
+
+    /// Reset statistics counters.
+    pub fn reset_stats(&mut self) {
+        self.hits = 0;
+        self.misses = 0;
+    }
+
+    /// Remove a specific pane from the cache.
+    pub fn remove_pane(&mut self, pane_id: u64) {
+        self.pane_states.remove(&pane_id);
+    }
+
+    /// Clear all cache entries.
+    pub fn clear(&mut self) {
+        self.global_hashes.clear();
+        self.lru_order.clear();
+        self.pane_states.clear();
+        self.hits = 0;
+        self.misses = 0;
+    }
+}
+
+/// Statistics from the output cache.
+#[derive(Debug, Clone)]
+pub struct OutputCacheStats {
+    /// Number of cache hits
+    pub hits: u64,
+    /// Number of cache misses
+    pub misses: u64,
+    /// Hit rate (0.0 - 1.0)
+    pub hit_rate: f64,
+    /// Number of entries in global LRU
+    pub global_entries: usize,
+    /// Number of per-pane entries
+    pub pane_entries: usize,
 }
 
 // =============================================================================
@@ -2033,5 +2269,248 @@ mod tests {
         // Exit alt screen
         cursor.capture_snapshot("\x1b[?1049hcontent update\x1b[?1049l$ prompt", 1024);
         assert!(!cursor.in_alt_screen);
+    }
+
+    // =========================================================================
+    // OutputCache Tests
+    // =========================================================================
+
+    #[test]
+    fn output_cache_repeated_content_returns_false() {
+        let mut cache = OutputCache::with_defaults();
+
+        // First time seeing content: is_new returns true
+        assert!(cache.is_new(1, "hello world\n"));
+
+        // Same content again: is_new returns false
+        assert!(!cache.is_new(1, "hello world\n"));
+
+        // Same content third time: still false
+        assert!(!cache.is_new(1, "hello world\n"));
+    }
+
+    #[test]
+    fn output_cache_different_content_returns_true() {
+        let mut cache = OutputCache::with_defaults();
+
+        assert!(cache.is_new(1, "content A\n"));
+        assert!(cache.is_new(1, "content B\n"));
+        assert!(cache.is_new(1, "content C\n"));
+
+        // Each unique content should be new
+        let stats = cache.stats();
+        assert_eq!(stats.misses, 3);
+        assert_eq!(stats.hits, 0);
+    }
+
+    #[test]
+    fn output_cache_per_pane_deduplication() {
+        let mut cache = OutputCache::with_defaults();
+
+        // Pane 1 sees content
+        assert!(cache.is_new(1, "$ ls\nfile1\nfile2\n"));
+        assert!(!cache.is_new(1, "$ ls\nfile1\nfile2\n"));
+
+        // Pane 2 sees same content - should be false (global LRU dedup)
+        assert!(!cache.is_new(2, "$ ls\nfile1\nfile2\n"));
+
+        // Pane 1 sees new content
+        assert!(cache.is_new(1, "$ ls\nfile1\nfile2\nfile3\n"));
+
+        // Pane 2 still has old state, but global hash exists
+        assert!(!cache.is_new(2, "$ ls\nfile1\nfile2\n"));
+    }
+
+    #[test]
+    fn output_cache_global_lru_deduplicates_across_panes() {
+        let mut cache = OutputCache::with_defaults();
+
+        let shared_content = "common output across panes\n";
+
+        // Pane 1 sees content first
+        assert!(cache.is_new(1, shared_content));
+
+        // Panes 2, 3, 4 see same content - global LRU should detect
+        assert!(!cache.is_new(2, shared_content));
+        assert!(!cache.is_new(3, shared_content));
+        assert!(!cache.is_new(4, shared_content));
+
+        let stats = cache.stats();
+        assert_eq!(stats.misses, 1); // Only first was a miss
+        assert_eq!(stats.hits, 3);   // Three hits from global LRU
+    }
+
+    #[test]
+    fn output_cache_lru_eviction() {
+        // Create cache with small LRU capacity
+        let config = OutputCacheConfig {
+            global_lru_capacity: 3,
+            per_pane_max_age_ms: 60_000,
+        };
+        let mut cache = OutputCache::new(config);
+
+        // Fill LRU with 3 distinct hashes
+        assert!(cache.is_new(1, "content A\n"));
+        assert!(cache.is_new(1, "content B\n"));
+        assert!(cache.is_new(1, "content C\n"));
+
+        // Cache should have 3 global entries
+        assert_eq!(cache.stats().global_entries, 3);
+
+        // Add 4th - should evict oldest (content A)
+        assert!(cache.is_new(1, "content D\n"));
+        assert_eq!(cache.stats().global_entries, 3);
+
+        // Content A should be treated as new again (evicted from global)
+        assert!(cache.is_new(2, "content A\n"));
+    }
+
+    #[test]
+    fn output_cache_prune_stale_panes() {
+        let config = OutputCacheConfig {
+            global_lru_capacity: 1024,
+            per_pane_max_age_ms: 100, // 100ms max age
+        };
+        let mut cache = OutputCache::new(config);
+
+        // Add entries for multiple panes
+        assert!(cache.is_new(1, "pane 1 content\n"));
+        assert!(cache.is_new(2, "pane 2 content\n"));
+        assert!(cache.is_new(3, "pane 3 content\n"));
+
+        assert_eq!(cache.stats().pane_entries, 3);
+
+        // Sleep briefly to make entries stale
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // Prune should remove stale entries
+        cache.prune_stale();
+
+        assert_eq!(cache.stats().pane_entries, 0);
+    }
+
+    #[test]
+    fn output_cache_prune_with_custom_max_age() {
+        let mut cache = OutputCache::with_defaults();
+
+        assert!(cache.is_new(1, "content\n"));
+        assert_eq!(cache.stats().pane_entries, 1);
+
+        // Prune with 0 max_age should remove everything
+        cache.prune(0);
+        assert_eq!(cache.stats().pane_entries, 0);
+    }
+
+    #[test]
+    fn output_cache_remove_pane() {
+        let mut cache = OutputCache::with_defaults();
+
+        assert!(cache.is_new(1, "content\n"));
+        assert!(cache.is_new(2, "other content\n"));
+        assert_eq!(cache.stats().pane_entries, 2);
+
+        cache.remove_pane(1);
+        assert_eq!(cache.stats().pane_entries, 1);
+
+        // Pane 1 content should be new again (per-pane state removed)
+        // But global LRU still has it, so it's a hit
+        assert!(!cache.is_new(1, "content\n"));
+    }
+
+    #[test]
+    fn output_cache_clear() {
+        let mut cache = OutputCache::with_defaults();
+
+        assert!(cache.is_new(1, "content A\n"));
+        assert!(cache.is_new(2, "content B\n"));
+        assert!(cache.is_new(3, "content C\n"));
+
+        let stats = cache.stats();
+        assert!(stats.global_entries > 0);
+        assert!(stats.pane_entries > 0);
+
+        cache.clear();
+
+        let stats = cache.stats();
+        assert_eq!(stats.global_entries, 0);
+        assert_eq!(stats.pane_entries, 0);
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+    }
+
+    #[test]
+    fn output_cache_hit_rate_calculation() {
+        let mut cache = OutputCache::with_defaults();
+
+        // No hits/misses yet - hit rate is 0
+        assert_eq!(cache.hit_rate(), 0.0);
+
+        // 1 miss
+        assert!(cache.is_new(1, "content\n"));
+        assert_eq!(cache.hit_rate(), 0.0);
+
+        // 1 hit, 1 miss = 50%
+        assert!(!cache.is_new(1, "content\n"));
+        assert!((cache.hit_rate() - 0.5).abs() < 0.01);
+
+        // 2 hits, 1 miss = 66.67%
+        assert!(!cache.is_new(1, "content\n"));
+        assert!((cache.hit_rate() - 0.666).abs() < 0.01);
+    }
+
+    #[test]
+    fn output_cache_stats_reset() {
+        let mut cache = OutputCache::with_defaults();
+
+        assert!(cache.is_new(1, "content\n"));
+        assert!(!cache.is_new(1, "content\n"));
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+
+        cache.reset_stats();
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+        // Global/pane entries should still exist
+        assert!(stats.global_entries > 0);
+        assert!(stats.pane_entries > 0);
+    }
+
+    #[test]
+    fn output_cache_empty_content() {
+        let mut cache = OutputCache::with_defaults();
+
+        // Empty content should work
+        assert!(cache.is_new(1, ""));
+        assert!(!cache.is_new(1, ""));
+
+        // Different pane with empty content - global dedup
+        assert!(!cache.is_new(2, ""));
+    }
+
+    #[test]
+    fn output_cache_hash_collision_resistance() {
+        let mut cache = OutputCache::with_defaults();
+
+        // Test with content that might have hash collisions in weak hashers
+        // Good hashers (xxhash, cityhash, etc.) should handle these fine
+        let contents = [
+            "a".repeat(1000),
+            "b".repeat(1000),
+            "ab".repeat(500),
+            "ba".repeat(500),
+        ];
+
+        for (i, content) in contents.iter().enumerate() {
+            assert!(cache.is_new(1, content), "content {i} should be new");
+        }
+
+        // All should be cached now
+        for (i, content) in contents.iter().enumerate() {
+            assert!(!cache.is_new(1, content), "content {i} should be cached");
+        }
     }
 }

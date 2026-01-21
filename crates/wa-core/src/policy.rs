@@ -3724,4 +3724,523 @@ mod tests {
         assert!(json.contains("\"status\":\"allowed\""));
         assert!(json.contains("\"pane_id\":42"));
     }
+
+    // ========================================================================
+    // Policy Rules Tests (wa-4vx.8.4)
+    // ========================================================================
+
+    #[test]
+    fn policy_rules_empty_config_matches_nothing() {
+        let config = PolicyRulesConfig::default();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_none());
+        assert!(result.decision.is_none());
+    }
+
+    #[test]
+    fn policy_rules_disabled_config_matches_nothing() {
+        let config = PolicyRulesConfig {
+            enabled: false,
+            rules: vec![PolicyRule {
+                id: "test".to_string(),
+                description: None,
+                priority: 100,
+                match_on: PolicyRuleMatch::default(), // catch-all
+                decision: PolicyRuleDecision::Deny,
+                message: Some("should not match".to_string()),
+            }],
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_none());
+    }
+
+    #[test]
+    fn policy_rules_catch_all_matches_everything() {
+        let config = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: "catch-all".to_string(),
+                description: Some("Match all actions".to_string()),
+                priority: 100,
+                match_on: PolicyRuleMatch::default(),
+                decision: PolicyRuleDecision::RequireApproval,
+                message: Some("All actions require approval".to_string()),
+            }],
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_some());
+        assert_eq!(result.decision, Some(PolicyRuleDecision::RequireApproval));
+    }
+
+    #[test]
+    fn policy_rules_match_action_kind() {
+        let config = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: "deny-close".to_string(),
+                description: None,
+                priority: 100,
+                match_on: PolicyRuleMatch {
+                    actions: vec!["close".to_string()],
+                    ..Default::default()
+                },
+                decision: PolicyRuleDecision::Deny,
+                message: Some("Close actions are denied".to_string()),
+            }],
+        };
+
+        // Should match close action
+        let input = PolicyInput::new(ActionKind::Close, ActorKind::Robot);
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_some());
+        assert_eq!(result.decision, Some(PolicyRuleDecision::Deny));
+
+        // Should not match send_text action
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_none());
+    }
+
+    #[test]
+    fn policy_rules_match_actor_kind() {
+        let config = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: "mcp-approval".to_string(),
+                description: None,
+                priority: 100,
+                match_on: PolicyRuleMatch {
+                    actors: vec!["mcp".to_string()],
+                    ..Default::default()
+                },
+                decision: PolicyRuleDecision::RequireApproval,
+                message: Some("MCP actors need approval".to_string()),
+            }],
+        };
+
+        // Should match MCP actor
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Mcp);
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_some());
+        assert_eq!(result.decision, Some(PolicyRuleDecision::RequireApproval));
+
+        // Should not match Robot actor
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_none());
+    }
+
+    #[test]
+    fn policy_rules_match_pane_id() {
+        let config = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: "allow-pane-42".to_string(),
+                description: None,
+                priority: 100,
+                match_on: PolicyRuleMatch {
+                    pane_ids: vec![42],
+                    ..Default::default()
+                },
+                decision: PolicyRuleDecision::Allow,
+                message: Some("Pane 42 is trusted".to_string()),
+            }],
+        };
+
+        // Should match pane 42
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(42);
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_some());
+        assert_eq!(result.decision, Some(PolicyRuleDecision::Allow));
+
+        // Should not match pane 1
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(1);
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_none());
+    }
+
+    #[test]
+    fn policy_rules_match_pane_title_glob() {
+        let config = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: "deny-vim".to_string(),
+                description: None,
+                priority: 100,
+                match_on: PolicyRuleMatch {
+                    pane_titles: vec!["*vim*".to_string(), "*nvim*".to_string()],
+                    ..Default::default()
+                },
+                decision: PolicyRuleDecision::Deny,
+                message: Some("Don't send to vim".to_string()),
+            }],
+        };
+
+        // Should match vim title
+        let input =
+            PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane_title("nvim file.rs");
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_some());
+        assert_eq!(result.decision, Some(PolicyRuleDecision::Deny));
+
+        // Should not match bash title
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane_title("bash");
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_none());
+    }
+
+    #[test]
+    fn policy_rules_match_pane_cwd_glob() {
+        let config = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: "allow-home".to_string(),
+                description: None,
+                priority: 100,
+                match_on: PolicyRuleMatch {
+                    pane_cwds: vec!["/home/*".to_string()],
+                    ..Default::default()
+                },
+                decision: PolicyRuleDecision::Allow,
+                message: Some("Home dirs are safe".to_string()),
+            }],
+        };
+
+        // Should match home directory
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane_cwd("/home/user");
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_some());
+
+        // Should not match /tmp
+        let input =
+            PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane_cwd("/tmp/work");
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_none());
+    }
+
+    #[test]
+    fn policy_rules_match_command_regex() {
+        let config = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: "deny-rm".to_string(),
+                description: None,
+                priority: 100,
+                match_on: PolicyRuleMatch {
+                    command_patterns: vec![r"^rm\s+".to_string()],
+                    ..Default::default()
+                },
+                decision: PolicyRuleDecision::Deny,
+                message: Some("rm commands denied".to_string()),
+            }],
+        };
+
+        // Should match rm command
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_command_text("rm -rf /tmp/old");
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_some());
+        assert_eq!(result.decision, Some(PolicyRuleDecision::Deny));
+
+        // Should not match ls command
+        let input =
+            PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_command_text("ls -la");
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_none());
+    }
+
+    #[test]
+    fn policy_rules_match_agent_type() {
+        let config = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: "trust-claude".to_string(),
+                description: None,
+                priority: 100,
+                match_on: PolicyRuleMatch {
+                    agent_types: vec!["claude".to_string()],
+                    ..Default::default()
+                },
+                decision: PolicyRuleDecision::Allow,
+                message: Some("Claude agents are trusted".to_string()),
+            }],
+        };
+
+        // Should match claude agent (case insensitive)
+        let input =
+            PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_agent_type("Claude");
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_some());
+
+        // Should not match cursor agent
+        let input =
+            PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_agent_type("cursor");
+        let result = evaluate_policy_rules(&config, &input);
+        assert!(result.matching_rule.is_none());
+    }
+
+    #[test]
+    fn policy_rules_precedence_priority_wins() {
+        let config = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![
+                PolicyRule {
+                    id: "low-priority-allow".to_string(),
+                    description: None,
+                    priority: 200,
+                    match_on: PolicyRuleMatch::default(),
+                    decision: PolicyRuleDecision::Allow,
+                    message: None,
+                },
+                PolicyRule {
+                    id: "high-priority-deny".to_string(),
+                    description: None,
+                    priority: 50,
+                    match_on: PolicyRuleMatch::default(),
+                    decision: PolicyRuleDecision::Deny,
+                    message: None,
+                },
+            ],
+        };
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let result = evaluate_policy_rules(&config, &input);
+        assert_eq!(result.matching_rule.as_ref().unwrap().id, "high-priority-deny");
+        assert_eq!(result.decision, Some(PolicyRuleDecision::Deny));
+    }
+
+    #[test]
+    fn policy_rules_precedence_deny_beats_allow_same_priority() {
+        let config = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![
+                PolicyRule {
+                    id: "allow-rule".to_string(),
+                    description: None,
+                    priority: 100,
+                    match_on: PolicyRuleMatch::default(),
+                    decision: PolicyRuleDecision::Allow,
+                    message: None,
+                },
+                PolicyRule {
+                    id: "deny-rule".to_string(),
+                    description: None,
+                    priority: 100,
+                    match_on: PolicyRuleMatch::default(),
+                    decision: PolicyRuleDecision::Deny,
+                    message: None,
+                },
+            ],
+        };
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        let result = evaluate_policy_rules(&config, &input);
+        // Deny should win over Allow at same priority
+        assert_eq!(result.matching_rule.as_ref().unwrap().id, "deny-rule");
+        assert_eq!(result.decision, Some(PolicyRuleDecision::Deny));
+    }
+
+    #[test]
+    fn policy_rules_precedence_specificity_tiebreaker() {
+        let config = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![
+                PolicyRule {
+                    id: "general-deny".to_string(),
+                    description: None,
+                    priority: 100,
+                    match_on: PolicyRuleMatch {
+                        actions: vec!["send_text".to_string()],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::Deny,
+                    message: None,
+                },
+                PolicyRule {
+                    id: "specific-deny".to_string(),
+                    description: None,
+                    priority: 100,
+                    match_on: PolicyRuleMatch {
+                        actions: vec!["send_text".to_string()],
+                        pane_ids: vec![42],
+                        ..Default::default()
+                    },
+                    decision: PolicyRuleDecision::Deny,
+                    message: None,
+                },
+            ],
+        };
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(42);
+        let result = evaluate_policy_rules(&config, &input);
+        // More specific rule should win
+        assert_eq!(result.matching_rule.as_ref().unwrap().id, "specific-deny");
+    }
+
+    #[test]
+    fn policy_rules_integrated_into_authorize_deny() {
+        let rules = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: "deny-robot-close".to_string(),
+                description: None,
+                priority: 100,
+                match_on: PolicyRuleMatch {
+                    actions: vec!["close".to_string()],
+                    actors: vec!["robot".to_string()],
+                    ..Default::default()
+                },
+                decision: PolicyRuleDecision::Deny,
+                message: Some("Robots cannot close panes".to_string()),
+            }],
+        };
+
+        let mut engine = PolicyEngine::permissive().with_policy_rules(rules);
+        let input = PolicyInput::new(ActionKind::Close, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt());
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+        assert_eq!(decision.rule_id(), Some("config.rule.deny-robot-close"));
+    }
+
+    #[test]
+    fn policy_rules_integrated_into_authorize_allow() {
+        let rules = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: "allow-trusted-pane".to_string(),
+                description: None,
+                priority: 100,
+                match_on: PolicyRuleMatch {
+                    pane_ids: vec![999],
+                    ..Default::default()
+                },
+                decision: PolicyRuleDecision::Allow,
+                message: Some("Pane 999 is trusted".to_string()),
+            }],
+        };
+
+        let mut engine = PolicyEngine::strict().with_policy_rules(rules);
+        // This would normally require approval due to destructive action
+        let input = PolicyInput::new(ActionKind::Close, ActorKind::Robot)
+            .with_pane(999)
+            .with_capabilities(PaneCapabilities::prompt());
+
+        let decision = engine.authorize(&input);
+        // Allow rule should short-circuit the destructive action check
+        assert!(decision.is_allowed());
+        assert_eq!(decision.rule_id(), Some("config.rule.allow-trusted-pane"));
+    }
+
+    #[test]
+    fn policy_rules_integrated_into_authorize_require_approval() {
+        let rules = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: "approval-for-mcp".to_string(),
+                description: None,
+                priority: 100,
+                match_on: PolicyRuleMatch {
+                    actors: vec!["mcp".to_string()],
+                    ..Default::default()
+                },
+                decision: PolicyRuleDecision::RequireApproval,
+                message: Some("MCP actions need approval".to_string()),
+            }],
+        };
+
+        let mut engine = PolicyEngine::permissive().with_policy_rules(rules);
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Mcp)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt());
+
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval());
+        assert_eq!(decision.rule_id(), Some("config.rule.approval-for-mcp"));
+    }
+
+    #[test]
+    fn policy_rules_builtin_gates_take_precedence() {
+        // Even with an allow rule, builtin safety gates should still work
+        let rules = PolicyRulesConfig {
+            enabled: true,
+            rules: vec![PolicyRule {
+                id: "allow-everything".to_string(),
+                description: None,
+                priority: 1, // Very high priority
+                match_on: PolicyRuleMatch::default(),
+                decision: PolicyRuleDecision::Allow,
+                message: None,
+            }],
+        };
+
+        // Rate limit should still trigger even with allow-everything rule
+        // (rate limit is checked before custom rules)
+        let mut engine = PolicyEngine::new(1, 100, false).with_policy_rules(rules);
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt());
+
+        // First call allowed
+        assert!(engine.authorize(&input).is_allowed());
+        // Second call should hit rate limit, which is evaluated before custom rules
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval());
+        assert_eq!(decision.rule_id(), Some("policy.rate_limit"));
+    }
+
+    #[test]
+    fn policy_rule_match_specificity() {
+        // Test specificity scoring
+        let empty = PolicyRuleMatch::default();
+        assert_eq!(empty.specificity(), 0);
+        assert!(empty.is_catch_all());
+
+        let action_only = PolicyRuleMatch {
+            actions: vec!["send_text".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(action_only.specificity(), 1);
+        assert!(!action_only.is_catch_all());
+
+        let pane_id_match = PolicyRuleMatch {
+            pane_ids: vec![42],
+            ..Default::default()
+        };
+        assert_eq!(pane_id_match.specificity(), 2); // ID match is worth 2
+
+        let multi_criteria = PolicyRuleMatch {
+            actions: vec!["send_text".to_string()],
+            actors: vec!["robot".to_string()],
+            pane_ids: vec![42],
+            command_patterns: vec!["rm.*".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(multi_criteria.specificity(), 6); // 1 + 1 + 2 + 2
+    }
+
+    #[test]
+    fn policy_rule_decision_priority() {
+        assert_eq!(PolicyRuleDecision::Deny.priority(), 0);
+        assert_eq!(PolicyRuleDecision::RequireApproval.priority(), 1);
+        assert_eq!(PolicyRuleDecision::Allow.priority(), 2);
+    }
+
+    #[test]
+    fn glob_match_patterns() {
+        // Test the glob matching helper
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*.rs", "file.rs"));
+        assert!(!glob_match("*.rs", "file.go"));
+        assert!(glob_match("/home/*", "/home/user"));
+        assert!(glob_match("*vim*", "neovim"));
+        assert!(glob_match("test?", "test1"));
+        assert!(!glob_match("test?", "test12"));
+    }
 }

@@ -429,4 +429,116 @@ mod tests {
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
     }
+
+    #[tokio::test]
+    async fn expired_token_cannot_be_consumed() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_approval_expiry_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let storage = StorageHandle::new(&db_path_str).await.unwrap();
+        let pane = PaneRecord {
+            pane_id: 1,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("test".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane(pane).await.unwrap();
+
+        // Create store with 0 second expiry (tokens expire immediately)
+        let config = ApprovalConfig {
+            token_expiry_secs: 0,
+            ..ApprovalConfig::default()
+        };
+        let store = ApprovalStore::new(&storage, config, "ws");
+        let input = base_input();
+
+        // Issue a token (will have expires_at = now)
+        let request = store.issue(&input, None).await.unwrap();
+
+        // Wait a tiny bit to ensure time has passed
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Try to consume - should fail because token has expired
+        let consumed = store
+            .consume(&request.allow_once_code, &input)
+            .await
+            .unwrap();
+        assert!(
+            consumed.is_none(),
+            "Expired token should not be consumable"
+        );
+
+        storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    }
+
+    #[tokio::test]
+    async fn different_action_fingerprint_prevents_consumption() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!(
+            "wa_test_approval_fingerprint_{}.db",
+            std::process::id()
+        ));
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let storage = StorageHandle::new(&db_path_str).await.unwrap();
+        let pane = PaneRecord {
+            pane_id: 1,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("test".to_string()),
+            cwd: None,
+            tty_name: None,
+            first_seen_at: 1_700_000_000_000,
+            last_seen_at: 1_700_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane(pane).await.unwrap();
+
+        let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+        let input = base_input();
+        let request = store.issue(&input, None).await.unwrap();
+
+        // Try to consume with same pane but different text summary (different fingerprint)
+        let different_text = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_domain("local")
+            .with_text_summary("echo different") // Different text
+            .with_capabilities(PaneCapabilities::prompt());
+
+        let consumed = store
+            .consume(&request.allow_once_code, &different_text)
+            .await
+            .unwrap();
+        assert!(
+            consumed.is_none(),
+            "Token should only work with matching fingerprint"
+        );
+
+        // Original input should still work
+        let consumed = store
+            .consume(&request.allow_once_code, &input)
+            .await
+            .unwrap();
+        assert!(consumed.is_some(), "Token should work with matching input");
+
+        storage.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    }
 }

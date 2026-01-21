@@ -649,7 +649,7 @@ impl PolicyDecision {
     #[must_use]
     pub fn context(&self) -> Option<&DecisionContext> {
         match self {
-            Self::Allow { context }
+            Self::Allow { context, .. }
             | Self::Deny { context, .. }
             | Self::RequireApproval { context, .. } => context.as_ref(),
         }
@@ -1933,6 +1933,73 @@ impl PolicyEngine {
             );
         }
 
+        // Check alt-screen state for send actions (always checked for safety)
+        if matches!(input.action, ActionKind::SendText | ActionKind::SendControl) {
+            // Deny if in alt-screen mode (vim, less, htop, etc.)
+            if input.capabilities.alt_screen == Some(true) {
+                context.record_rule(
+                    "policy.alt_screen",
+                    true,
+                    Some("deny"),
+                    Some("alt screen active".to_string()),
+                );
+                context.set_determining_rule("policy.alt_screen");
+                return PolicyDecision::deny_with_rule(
+                    "Cannot send text while in alt-screen mode (vim, less, etc.)",
+                    "policy.alt_screen",
+                )
+                .with_context(context);
+            }
+            // Require approval if alt-screen state is unknown (conservative)
+            if input.capabilities.alt_screen.is_none() && !input.actor.is_trusted() {
+                context.record_rule(
+                    "policy.alt_screen_unknown",
+                    true,
+                    Some("require_approval"),
+                    Some("alt screen state unknown".to_string()),
+                );
+                context.set_determining_rule("policy.alt_screen_unknown");
+                return PolicyDecision::require_approval_with_rule(
+                    "Alt-screen state unknown - approval required before sending",
+                    "policy.alt_screen_unknown",
+                )
+                .with_context(context);
+            }
+        }
+        context.record_rule(
+            "policy.alt_screen",
+            false,
+            None,
+            Some("alt screen not active".to_string()),
+        );
+
+        // Check for recent capture gaps (safety check for send actions)
+        if matches!(input.action, ActionKind::SendText | ActionKind::SendControl)
+            && input.capabilities.has_recent_gap
+        {
+            // Recent gap means we might have missed output - require approval
+            if !input.actor.is_trusted() {
+                context.record_rule(
+                    "policy.recent_gap",
+                    true,
+                    Some("require_approval"),
+                    Some("recent capture gap detected".to_string()),
+                );
+                context.set_determining_rule("policy.recent_gap");
+                return PolicyDecision::require_approval_with_rule(
+                    "Recent capture gap detected - approval required before sending",
+                    "policy.recent_gap",
+                )
+                .with_context(context);
+            }
+        }
+        context.record_rule(
+            "policy.recent_gap",
+            false,
+            None,
+            Some("no recent gap".to_string()),
+        );
+
         // Check prompt state for send actions
         if matches!(input.action, ActionKind::SendText | ActionKind::SendControl)
             && self.require_prompt_active
@@ -2964,6 +3031,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn policy_decision_deny_cannot_have_approval_attached() {
+        // Critical safety test: Deny decisions must not be overridable by approval
+        let deny = PolicyDecision::deny_with_rule("forbidden action", "test.deny");
+
+        let fake_approval = ApprovalRequest {
+            allow_once_code: "ABCD1234".to_string(),
+            allow_once_full_hash: "sha256:fake".to_string(),
+            expires_at: 999_999_999_999,
+            summary: "trying to bypass".to_string(),
+            command: "wa approve ABCD1234".to_string(),
+        };
+
+        // Attempt to attach approval to a Deny decision
+        let after_approval = deny.with_approval(fake_approval);
+
+        // Must still be denied - approval cannot override
+        assert!(after_approval.is_denied());
+        assert!(!after_approval.requires_approval());
+        assert!(!after_approval.is_allowed());
+        assert_eq!(after_approval.rule_id(), Some("test.deny"));
+    }
+
+    #[test]
+    fn policy_decision_allow_cannot_have_approval_attached() {
+        // Approval is only meaningful for RequireApproval decisions
+        let allow = PolicyDecision::allow();
+
+        let fake_approval = ApprovalRequest {
+            allow_once_code: "ABCD1234".to_string(),
+            allow_once_full_hash: "sha256:fake".to_string(),
+            expires_at: 999_999_999_999,
+            summary: "unnecessary approval".to_string(),
+            command: "wa approve ABCD1234".to_string(),
+        };
+
+        let after_approval = allow.with_approval(fake_approval);
+
+        // Should still be Allow, unchanged
+        assert!(after_approval.is_allowed());
+        assert!(!after_approval.requires_approval());
+    }
+
+    #[test]
+    fn policy_decision_require_approval_can_have_approval_attached() {
+        let require = PolicyDecision::require_approval_with_rule("needs approval", "test.require");
+
+        let approval = ApprovalRequest {
+            allow_once_code: "ABCD1234".to_string(),
+            allow_once_full_hash: "sha256:test".to_string(),
+            expires_at: 999_999_999_999,
+            summary: "legitimate approval".to_string(),
+            command: "wa approve ABCD1234".to_string(),
+        };
+
+        let after_approval = require.with_approval(approval);
+
+        // Should still require approval but now has the approval payload
+        assert!(after_approval.requires_approval());
+        assert!(!after_approval.is_allowed());
+        assert!(!after_approval.is_denied());
+    }
+
     // ========================================================================
     // InjectionResult Audit Record Tests (wa-4vx.8.7)
     // ========================================================================
@@ -3109,6 +3239,107 @@ mod tests {
         let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
             .with_pane(1)
             .with_capabilities(PaneCapabilities::unknown());
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn authorize_denies_send_in_alt_screen() {
+        let mut engine = PolicyEngine::permissive();
+        let caps = PaneCapabilities::alt_screen();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(caps);
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+        assert_eq!(decision.rule_id(), Some("policy.alt_screen"));
+    }
+
+    #[test]
+    fn authorize_denies_send_in_alt_screen_even_for_human() {
+        // Alt-screen is a hard safety gate - even humans can't override
+        let mut engine = PolicyEngine::permissive();
+        let caps = PaneCapabilities::alt_screen();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
+            .with_pane(1)
+            .with_capabilities(caps);
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_denied());
+        assert_eq!(decision.rule_id(), Some("policy.alt_screen"));
+    }
+
+    #[test]
+    fn authorize_requires_approval_for_unknown_alt_screen() {
+        let mut engine = PolicyEngine::permissive();
+        let mut caps = PaneCapabilities::prompt();
+        caps.alt_screen = None; // Unknown
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(caps);
+
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval());
+        assert_eq!(decision.rule_id(), Some("policy.alt_screen_unknown"));
+    }
+
+    #[test]
+    fn authorize_allows_human_with_unknown_alt_screen() {
+        let mut engine = PolicyEngine::permissive();
+        let mut caps = PaneCapabilities::prompt();
+        caps.alt_screen = None; // Unknown
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
+            .with_pane(1)
+            .with_capabilities(caps);
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn authorize_requires_approval_with_recent_gap() {
+        let mut engine = PolicyEngine::permissive();
+        let mut caps = PaneCapabilities::prompt();
+        caps.has_recent_gap = true;
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(caps);
+
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval());
+        assert_eq!(decision.rule_id(), Some("policy.recent_gap"));
+    }
+
+    #[test]
+    fn authorize_allows_human_with_recent_gap() {
+        // Humans are trusted - they can proceed despite gaps
+        let mut engine = PolicyEngine::permissive();
+        let mut caps = PaneCapabilities::prompt();
+        caps.has_recent_gap = true;
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
+            .with_pane(1)
+            .with_capabilities(caps);
+
+        let decision = engine.authorize(&input);
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn authorize_read_actions_ignore_alt_screen_and_gap() {
+        // Read operations should be allowed regardless of pane state
+        let mut engine = PolicyEngine::permissive();
+        let mut caps = PaneCapabilities::alt_screen();
+        caps.has_recent_gap = true;
+
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(caps);
+
         let decision = engine.authorize(&input);
         assert!(decision.is_allowed());
     }

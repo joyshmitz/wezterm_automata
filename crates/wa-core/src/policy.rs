@@ -462,6 +462,9 @@ pub struct ApprovalRequest {
 pub enum PolicyDecision {
     /// Action is allowed
     Allow {
+        /// Optional stable rule ID that triggered the allow (for audit)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rule_id: Option<String>,
         /// Decision context
         #[serde(skip_serializing_if = "Option::is_none")]
         context: Option<DecisionContext>,
@@ -497,7 +500,19 @@ impl PolicyDecision {
     /// Create an Allow decision
     #[must_use]
     pub const fn allow() -> Self {
-        Self::Allow { context: None }
+        Self::Allow {
+            rule_id: None,
+            context: None,
+        }
+    }
+
+    /// Create an Allow decision with a rule ID (for audit trail)
+    #[must_use]
+    pub fn allow_with_rule(rule_id: impl Into<String>) -> Self {
+        Self::Allow {
+            rule_id: Some(rule_id.into()),
+            context: None,
+        }
     }
 
     /// Create a Deny decision with a reason
@@ -576,10 +591,9 @@ impl PolicyDecision {
     #[must_use]
     pub fn rule_id(&self) -> Option<&str> {
         match self {
-            Self::Deny { rule_id, .. } | Self::RequireApproval { rule_id, .. } => {
-                rule_id.as_deref()
-            }
-            Self::Allow { .. } => None,
+            Self::Allow { rule_id, .. }
+            | Self::Deny { rule_id, .. }
+            | Self::RequireApproval { rule_id, .. } => rule_id.as_deref(),
         }
     }
 
@@ -606,7 +620,8 @@ impl PolicyDecision {
     #[must_use]
     pub fn with_context(self, context: DecisionContext) -> Self {
         match self {
-            Self::Allow { .. } => Self::Allow {
+            Self::Allow { rule_id, .. } => Self::Allow {
+                rule_id,
                 context: Some(context),
             },
             Self::Deny {
@@ -2096,7 +2111,7 @@ impl PolicyEngine {
                     // Allow rules short-circuit to allow (skipping default checks)
                     context.record_rule(&rule_id, true, Some("allow"), Some(reason.clone()));
                     context.set_determining_rule(&rule_id);
-                    return PolicyDecision::allow().with_context(context);
+                    return PolicyDecision::allow_with_rule(rule_id).with_context(context);
                 }
             }
         }

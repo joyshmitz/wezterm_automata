@@ -43,6 +43,7 @@ pub mod ingest;
 pub mod ipc;
 pub mod lock;
 pub mod logging;
+pub mod output;
 pub mod patterns;
 pub mod policy;
 pub mod runtime;

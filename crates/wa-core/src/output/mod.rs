@@ -1,0 +1,40 @@
+//! Output layer for CLI commands
+//!
+//! This module provides consistent output formatting across all CLI commands,
+//! with support for multiple output modes (auto/rich, plain, json).
+//!
+//! # Architecture
+//!
+//! ```text
+//! Command Handler → Data → Renderer → String
+//!                          ↓
+//!               OutputFormat (auto/plain/json)
+//! ```
+//!
+//! # Output Modes
+//!
+//! - `auto`: Rich formatting if TTY, plain if not (default)
+//! - `plain`: No ANSI codes, stable for piping
+//! - `json`: Machine-readable JSON output
+//!
+//! # Usage
+//!
+//! ```ignore
+//! use wa_core::output::{OutputFormat, Renderer, PaneRenderer};
+//!
+//! let format = OutputFormat::detect();
+//! let renderer = PaneRenderer::new(format);
+//! println!("{}", renderer.render(&panes));
+//! ```
+
+mod format;
+mod renderers;
+mod table;
+
+pub use format::{OutputFormat, detect_format};
+pub use renderers::{
+    Render, RenderContext,
+    PaneTableRenderer, EventListRenderer, SearchResultRenderer,
+    WorkflowResultRenderer,
+};
+pub use table::{Table, Column, Alignment};

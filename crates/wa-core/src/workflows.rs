@@ -687,7 +687,6 @@ impl WorkflowEngine {
             pane_id: record.pane_id,
             current_step: next_step,
             status: match record.status.as_str() {
-                "running" => ExecutionStatus::Running,
                 "waiting" => ExecutionStatus::Waiting,
                 _ => ExecutionStatus::Running,
             },
@@ -766,7 +765,7 @@ impl WorkflowEngine {
     ) -> crate::Result<()> {
         let completed_at = now_ms();
         let result_type = match result {
-            StepResult::Continue { .. } => "continue",
+            StepResult::Continue => "continue",
             StepResult::Done { .. } => "done",
             StepResult::Abort { .. } => "abort",
             StepResult::Retry { .. } => "retry",
@@ -807,10 +806,7 @@ fn compute_next_step(step_logs: &[crate::storage::WorkflowStepLogRecord]) -> usi
         }
     }
 
-    match max_completed {
-        Some(idx) => idx + 1, // Resume from next step
-        None => 0,            // No completed steps, start from beginning
-    }
+    max_completed.map_or(0, |idx| idx + 1)
 }
 
 /// Generate a unique workflow execution ID
@@ -824,7 +820,7 @@ fn generate_workflow_id(workflow_name: &str) -> String {
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -958,7 +954,7 @@ impl PaneWorkflowLockManager {
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
             .unwrap_or(0);
 
         locks.insert(
@@ -970,6 +966,7 @@ impl PaneWorkflowLockManager {
                 locked_at_ms: now_ms,
             },
         );
+        drop(locks);
 
         tracing::debug!(
             pane_id,
@@ -995,15 +992,19 @@ impl PaneWorkflowLockManager {
         if let Some(existing) = locks.get(&pane_id) {
             if existing.execution_id == execution_id {
                 locks.remove(&pane_id);
+                drop(locks);
                 tracing::debug!(pane_id, execution_id, "Released pane workflow lock");
                 return true;
             }
+            let held_by = existing.execution_id.clone();
+            drop(locks);
             tracing::warn!(
                 pane_id,
                 execution_id,
-                held_by = %existing.execution_id,
+                held_by = %held_by,
                 "Attempted to release lock held by different execution"
             );
+            return false;
         }
 
         false
@@ -1054,8 +1055,7 @@ impl PaneWorkflowLockManager {
     ///
     /// **Use with caution** - only for recovery scenarios.
     pub fn force_release(&self, pane_id: u64) -> Option<PaneLockInfo> {
-        let mut locks = self.locks.lock().unwrap();
-        let removed = locks.remove(&pane_id);
+        let removed = self.locks.lock().unwrap().remove(&pane_id);
         if let Some(ref info) = removed {
             tracing::warn!(
                 pane_id,
@@ -1076,7 +1076,7 @@ pub struct PaneWorkflowLockGuard<'a> {
     execution_id: String,
 }
 
-impl<'a> PaneWorkflowLockGuard<'a> {
+impl PaneWorkflowLockGuard<'_> {
     /// Get the pane ID this guard is locking.
     #[must_use]
     pub fn pane_id(&self) -> u64 {
@@ -1818,13 +1818,10 @@ impl WorkflowRunner {
         event_id: Option<i64>,
     ) -> WorkflowStartResult {
         // Find matching workflow
-        let workflow = match self.find_matching_workflow(detection) {
-            Some(w) => w,
-            None => {
-                return WorkflowStartResult::NoMatchingWorkflow {
-                    rule_id: detection.rule_id.clone(),
-                };
-            }
+        let Some(workflow) = self.find_matching_workflow(detection) else {
+            return WorkflowStartResult::NoMatchingWorkflow {
+                rule_id: detection.rule_id.clone(),
+            };
         };
 
         let workflow_name = workflow.name().to_string();
@@ -4435,7 +4432,7 @@ mod tests {
 
         let runner = WorkflowRunner::new(
             engine,
-            lock_manager.clone(),
+            lock_manager,
             storage.clone(),
             injector,
             WorkflowRunnerConfig::default(),

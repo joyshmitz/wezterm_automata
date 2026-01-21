@@ -422,13 +422,15 @@ pub fn list_templates_by_category(prefix: &str) -> Vec<&'static ExplanationTempl
 ///
 /// let rendered = render_explanation(tmpl, &ctx);
 /// ```
+#[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn render_explanation(
     template: &ExplanationTemplate,
     context: &HashMap<String, String>,
 ) -> String {
     let mut output = template.detailed.to_string();
     for (key, value) in context {
-        output = output.replace(&format!("{{{}}}", key), value);
+        output = output.replace(&format!("{{{key}}}"), value);
     }
     output
 }
@@ -446,6 +448,8 @@ pub fn render_explanation(
 /// # Returns
 ///
 /// A formatted multi-line string suitable for terminal output.
+#[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn format_explanation(
     template: &ExplanationTemplate,
     context: Option<&HashMap<String, String>>,
@@ -461,10 +465,10 @@ pub fn format_explanation(
     lines.push(String::new());
 
     // Detailed (with optional interpolation)
-    let detailed = match context {
-        Some(ctx) => render_explanation(template, ctx),
-        None => template.detailed.to_string(),
-    };
+    let detailed = context.map_or_else(
+        || template.detailed.to_string(),
+        |ctx| render_explanation(template, ctx),
+    );
     lines.push(detailed);
     lines.push(String::new());
 
@@ -472,7 +476,7 @@ pub fn format_explanation(
     if !template.suggestions.is_empty() {
         lines.push("### Suggestions".to_string());
         for suggestion in template.suggestions {
-            lines.push(format!("- {}", suggestion));
+            lines.push(format!("- {suggestion}"));
         }
         lines.push(String::new());
     }
@@ -584,15 +588,13 @@ mod tests {
         for id in list_template_ids() {
             assert!(
                 id.contains('.'),
-                "Template ID '{}' should have category.name format",
-                id
+                "Template ID '{id}' should have category.name format"
             );
             let parts: Vec<_> = id.split('.').collect();
             assert_eq!(
                 parts.len(),
                 2,
-                "Template ID '{}' should have exactly one dot",
-                id
+                "Template ID '{id}' should have exactly one dot"
             );
             assert!(
                 ["deny", "workflow", "event"].contains(&parts[0]),
@@ -606,7 +608,7 @@ mod tests {
     #[test]
     fn suggestions_are_actionable() {
         for (_id, template) in EXPLANATION_TEMPLATES.iter() {
-            for suggestion in template.suggestions.iter() {
+            for suggestion in template.suggestions {
                 // Suggestions should start with a verb or "Use"
                 let first_word = suggestion.split_whitespace().next().unwrap_or("");
                 let valid_starts = [
@@ -628,8 +630,7 @@ mod tests {
                 ];
                 assert!(
                     valid_starts.iter().any(|s| first_word.starts_with(s)),
-                    "Suggestion '{}' should start with actionable verb",
-                    suggestion
+                    "Suggestion '{suggestion}' should start with actionable verb"
                 );
             }
         }
@@ -638,12 +639,11 @@ mod tests {
     #[test]
     fn see_also_references_valid_commands() {
         for (_id, template) in EXPLANATION_TEMPLATES.iter() {
-            for reference in template.see_also.iter() {
+            for reference in template.see_also {
                 // Should be a wa command or external tool
                 assert!(
                     reference.starts_with("wa ") || reference == &"caut",
-                    "See-also '{}' should be a wa command or known tool",
-                    reference
+                    "See-also '{reference}' should be a wa command or known tool"
                 );
             }
         }

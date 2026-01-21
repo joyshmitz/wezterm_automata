@@ -2401,7 +2401,7 @@ title = "vim"
         config2.storage.db_path = "/forbidden/path".to_string();
 
         let result = config1.diff_for_hot_reload(&config2);
-        let output = format!("{}", result);
+        let output = format!("{result}");
 
         assert!(output.contains("Forbidden changes"));
         assert!(output.contains("storage.db_path"));

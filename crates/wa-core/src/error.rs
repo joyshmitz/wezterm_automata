@@ -90,10 +90,10 @@ impl Remediation {
         if !self.commands.is_empty() {
             let _ = writeln!(output, "  Commands:");
             for cmd in &self.commands {
-                let label = match &cmd.platform {
-                    Some(platform) => format!("{} ({platform})", cmd.label),
-                    None => cmd.label.clone(),
-                };
+                let label = cmd.platform.as_ref().map_or_else(
+                    || cmd.label.clone(),
+                    |platform| format!("{} ({platform})", cmd.label),
+                );
                 let _ = writeln!(output, "    - {label}: {}", cmd.command);
             }
         }
@@ -508,7 +508,7 @@ mod tests {
             Error::Config(ConfigError::SerializeFailed("serialize".to_string())),
             Error::Config(ConfigError::ValidationError("invalid".to_string())),
             Error::Policy("denied".to_string()),
-            Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "io")),
+            Error::Io(std::io::Error::other("io")),
             Error::Json(json_err),
             Error::Runtime("runtime".to_string()),
         ];

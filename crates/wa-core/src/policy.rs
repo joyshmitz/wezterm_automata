@@ -756,7 +756,7 @@ impl PolicyInput {
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -881,12 +881,15 @@ fn rate_limit_snapshot_from_hit(hit: &RateLimitHit) -> RateLimitSnapshot {
         RateLimitScope::Global => "global".to_string(),
     };
 
+    let retry_after_secs =
+        u64::try_from(hit.retry_after.as_millis().div_ceil(1000)).unwrap_or(u64::MAX);
+
     RateLimitSnapshot {
         scope,
         action: hit.action.as_str().to_string(),
         limit: hit.limit,
         current: hit.current,
-        retry_after_secs: hit.retry_after.as_millis().div_ceil(1000) as u64,
+        retry_after_secs,
     }
 }
 
@@ -1989,7 +1992,7 @@ impl InjectionResult {
     ) -> crate::storage::AuditActionRecord {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
             .unwrap_or(0);
 
         match self {

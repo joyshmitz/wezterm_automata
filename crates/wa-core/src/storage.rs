@@ -2812,8 +2812,9 @@ fn query_unhandled_event_counts(conn: &Connection) -> Result<std::collections::H
         .query_map([], |row| {
             let pane_id: i64 = row.get(0)?;
             let count: i64 = row.get(1)?;
-            #[allow(clippy::cast_sign_loss)]
-            Ok((pane_id as u64, count as u32))
+            let pane_id = u64::try_from(pane_id).unwrap_or(0);
+            let count = u32::try_from(count).unwrap_or(u32::MAX);
+            Ok((pane_id, count))
         })
         .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
 
@@ -2908,7 +2909,7 @@ fn query_events(conn: &Connection, query: &EventQuery) -> Result<Vec<StoredEvent
         .prepare(&sql)
         .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
 
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(AsRef::as_ref).collect();
 
     let rows = stmt
         .query_map(param_refs.as_slice(), |row| {
@@ -5850,7 +5851,7 @@ mod proptest_tests {
     // Strategy for generating valid segment content (non-empty ASCII strings)
     fn segment_content_strategy() -> impl Strategy<Value = String> {
         // Generate strings of 1-100 printable ASCII characters
-        "[a-zA-Z0-9 .,!?]{1,100}".prop_map(|s| s.to_string())
+        "[a-zA-Z0-9 .,!?]{1,100}"
     }
 
     // Strategy for generating write operations (pane_id, content)
@@ -5971,10 +5972,8 @@ mod proptest_tests {
         /// scoped to a different pane.
         #[test]
         fn prop_fts_respects_pane_scope(
-            (content1, content2) in (
-                "[a-zA-Z]{5,15}".prop_map(|s| s.to_string()),
-                "[a-zA-Z]{5,15}".prop_map(|s| s.to_string())
-            ).prop_filter("contents must differ", |(a, b)| a != b)
+            (content1, content2) in ("[a-zA-Z]{5,15}", "[a-zA-Z]{5,15}")
+                .prop_filter("contents must differ", |(a, b)| a != b)
         ) {
             let rt = Runtime::new().expect("create runtime");
             let db_path = temp_db_path();

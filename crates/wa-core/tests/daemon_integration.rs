@@ -56,6 +56,10 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn offset_ms(offset: u64) -> i64 {
+    i64::try_from(offset).unwrap_or(i64::MAX)
+}
+
 /// Create a synthetic delta segment.
 fn synthetic_delta(pane_id: u64, seq: u64, content: &str, captured_at: i64) -> CapturedSegment {
     CapturedSegment {
@@ -168,7 +172,7 @@ async fn seq_monotonicity_across_persists() {
 
     // Persist multiple segments
     for i in 0..5u64 {
-        let segment = synthetic_delta(1, i, &format!("segment {i}\n"), ts + (i as i64));
+        let segment = synthetic_delta(1, i, &format!("segment {i}\n"), ts + offset_ms(i));
         let result = persist_captured_segment(&storage, &segment)
             .await
             .expect("persist segment");
@@ -579,7 +583,8 @@ async fn full_pipeline_mixed_content() {
     ];
 
     for (seq, content, should_match) in captures {
-        let segment = synthetic_delta(1, seq, content, ts + seq as i64 * 100);
+        let seq_offset = offset_ms(seq);
+        let segment = synthetic_delta(1, seq, content, ts + seq_offset.saturating_mul(100));
         let result = persist_captured_segment(&storage, &segment)
             .await
             .expect("persist segment");
@@ -595,7 +600,7 @@ async fn full_pipeline_mixed_content() {
 
         for detection in &detections {
             let event =
-                detection_to_stored_event(1, detection, Some(result.segment.id), ts + seq as i64);
+                detection_to_stored_event(1, detection, Some(result.segment.id), ts + seq_offset);
             storage.record_event(event).await.expect("record event");
             total_events += 1;
         }
@@ -676,13 +681,13 @@ async fn large_content_batch() {
 
     // Persist 100 segments
     for i in 0..100u64 {
-        let content = format!("segment {} with some content\n", i);
-        let segment = synthetic_delta(1, i, &content, ts + (i as i64));
+        let content = format!("segment {i} with some content\n");
+        let segment = synthetic_delta(1, i, &content, ts + offset_ms(i));
         let result = persist_captured_segment(&storage, &segment)
             .await
             .expect("persist segment");
 
-        assert_eq!(result.segment.seq, i as u64);
+        assert_eq!(result.segment.seq, i);
     }
 
     // Verify all segments (returned in descending seq order)

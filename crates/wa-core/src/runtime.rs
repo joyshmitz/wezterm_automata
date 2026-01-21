@@ -125,11 +125,12 @@ impl RuntimeMetrics {
 
     /// Record a successful DB write.
     pub fn record_db_write(&self) {
-        let now = epoch_ms() as u64;
-        self.last_db_write_at.store(now, Ordering::SeqCst);
+        self.last_db_write_at
+            .store(epoch_ms_u64(), Ordering::SeqCst);
     }
 
     /// Get average ingest lag in milliseconds.
+    #[allow(clippy::cast_precision_loss)]
     pub fn avg_ingest_lag_ms(&self) -> f64 {
         let sum = self.ingest_lag_sum_ms.load(Ordering::SeqCst);
         let count = self.ingest_lag_count.load(Ordering::SeqCst);
@@ -200,15 +201,13 @@ impl ObservationRuntime {
     ) -> Self {
         let registry = PaneRegistry::with_filter(config.pane_filter.clone());
         let metrics = Arc::new(RuntimeMetrics::default());
-        metrics
-            .started_at
-            .store(epoch_ms() as u64, Ordering::SeqCst);
+        metrics.started_at.store(epoch_ms_u64(), Ordering::SeqCst);
 
         // Initialize hot-reload config channel with current values
         let hot_config = HotReloadableConfig {
             log_level: "info".to_string(), // Default, will be overridden
-            poll_interval_ms: config.capture_interval.as_millis() as u64,
-            min_poll_interval_ms: config.min_capture_interval.as_millis() as u64,
+            poll_interval_ms: duration_ms_u64(config.capture_interval),
+            min_poll_interval_ms: duration_ms_u64(config.min_capture_interval),
             retention_days: 30,
             retention_max_mb: 0,
             checkpoint_interval_secs: 60,
@@ -297,8 +296,8 @@ impl ObservationRuntime {
                     let new_interval = Duration::from_millis(new_config.poll_interval_ms);
                     if new_interval != current_interval {
                         info!(
-                            old_ms = current_interval.as_millis() as u64,
-                            new_ms = new_interval.as_millis() as u64,
+                            old_ms = duration_ms_u64(current_interval),
+                            new_ms = duration_ms_u64(new_interval),
                             "Discovery interval updated via hot reload"
                         );
                         current_interval = new_interval;
@@ -495,7 +494,7 @@ impl ObservationRuntime {
 
                         // Record ingest lag (time from capture to persistence)
                         let now = epoch_ms();
-                        let lag_ms = (now - captured_at).max(0) as u64;
+                        let lag_ms = u64::try_from((now - captured_at).max(0)).unwrap_or(0);
                         metrics.record_ingest_lag(lag_ms);
                         metrics.record_db_write();
 
@@ -507,7 +506,6 @@ impl ObservationRuntime {
                         );
 
                         // Run pattern detection on the content
-                        #[allow(clippy::significant_drop_tightening)]
                         let detections = {
                             let mut contexts = detection_contexts.write().await;
                             let ctx = contexts.entry(pane_id).or_insert_with(|| {
@@ -515,7 +513,9 @@ impl ObservationRuntime {
                                 c.pane_id = Some(pane_id);
                                 c
                             });
-                            pattern_engine.detect_with_context(&content, ctx)
+                            let detections = pattern_engine.detect_with_context(&content, ctx);
+                            drop(contexts);
+                            detections
                         };
 
                         if !detections.is_empty() {
@@ -706,7 +706,7 @@ impl RuntimeHandle {
         };
 
         let snapshot = HealthSnapshot {
-            timestamp: epoch_ms() as u64,
+            timestamp: epoch_ms_u64(),
             observed_panes,
             capture_queue_depth: 0, // Not easily accessible after start
             write_queue_depth: 0,
@@ -742,7 +742,7 @@ impl RuntimeHandle {
     pub fn apply_config_update(&self, new_config: HotReloadableConfig) -> Result<()> {
         self.config_tx
             .send(new_config)
-            .map_err(|e| crate::Error::Runtime(format!("Failed to send config update: {}", e)))
+            .map_err(|e| crate::Error::Runtime(format!("Failed to send config update: {e}")))
     }
 
     /// Get the current hot-reloadable config.
@@ -759,6 +759,14 @@ fn epoch_ms() -> i64 {
         .ok()
         .and_then(|d| i64::try_from(d.as_millis()).ok())
         .unwrap_or(0)
+}
+
+fn epoch_ms_u64() -> u64 {
+    u64::try_from(epoch_ms()).unwrap_or(0)
+}
+
+fn duration_ms_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Convert a Detection to a StoredEvent for persistence.

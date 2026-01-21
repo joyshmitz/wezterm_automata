@@ -235,17 +235,21 @@ async fn handle_request(request: IpcRequest, event_bus: &EventBus) -> IpcRespons
                 Err(e) => IpcResponse::error(e.to_string()),
             }
         }
-        IpcRequest::Ping => IpcResponse::ok_with_data(serde_json::json!({
-            "pong": true,
-            "uptime_ms": event_bus.uptime().as_millis() as u64,
-        })),
+        IpcRequest::Ping => {
+            let uptime_ms = u64::try_from(event_bus.uptime().as_millis()).unwrap_or(u64::MAX);
+            IpcResponse::ok_with_data(serde_json::json!({
+                "pong": true,
+                "uptime_ms": uptime_ms,
+            }))
+        }
         IpcRequest::Status => {
             let stats = event_bus.stats();
             let total_queued = stats.delta_queued + stats.detection_queued + stats.signal_queued;
             let total_subscribers =
                 stats.delta_subscribers + stats.detection_subscribers + stats.signal_subscribers;
+            let uptime_ms = u64::try_from(event_bus.uptime().as_millis()).unwrap_or(u64::MAX);
             IpcResponse::ok_with_data(serde_json::json!({
-                "uptime_ms": event_bus.uptime().as_millis() as u64,
+                "uptime_ms": uptime_ms,
                 "events_queued": total_queued,
                 "subscriber_count": total_subscribers,
             }))

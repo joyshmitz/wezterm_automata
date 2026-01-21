@@ -1,4 +1,6 @@
 //! Renderers for CLI output
+
+#![allow(clippy::format_push_string, clippy::uninlined_format_args)]
 //!
 //! Each renderer takes typed data and produces formatted output.
 //! Renderers are separate from data acquisition - they only handle display.
@@ -85,8 +87,8 @@ impl PaneTableRenderer {
             return style.dim("No panes observed\n");
         }
 
-        let observed: Vec<_> = panes.iter().filter(|p| p.observed).collect();
-        let ignored: Vec<_> = panes.iter().filter(|p| !p.observed).collect();
+        let observed_count = panes.iter().filter(|p| p.observed).count();
+        let ignored_count = panes.len().saturating_sub(observed_count);
 
         let mut output = String::new();
 
@@ -95,8 +97,7 @@ impl PaneTableRenderer {
             "{}\n",
             style.bold(&format!(
                 "Panes ({} observed, {} ignored):",
-                observed.len(),
-                ignored.len()
+                observed_count, ignored_count
             ))
         ));
 
@@ -492,6 +493,7 @@ impl WorkflowResultRenderer {
 // =============================================================================
 
 /// Summary statistics for display
+#[allow(dead_code)]
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Summary {
     /// Total panes
@@ -509,10 +511,12 @@ pub struct Summary {
 }
 
 /// Renderer for status summary
+#[allow(dead_code)]
 pub struct SummaryRenderer;
 
 impl SummaryRenderer {
     /// Render a status summary
+    #[allow(dead_code)]
     #[must_use]
     pub fn render(summary: &Summary, ctx: &RenderContext) -> String {
         if ctx.format.is_json() {
@@ -550,10 +554,10 @@ impl SummaryRenderer {
 pub fn format_timestamp(epoch_ms: i64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
 
-    let secs = epoch_ms / 1000;
-    let nanos = ((epoch_ms % 1000) * 1_000_000) as u32;
+    let secs = u64::try_from(epoch_ms / 1000).unwrap_or(0);
+    let nanos = u32::try_from(epoch_ms.rem_euclid(1000) * 1_000_000).unwrap_or(0);
 
-    let duration = Duration::new(secs as u64, nanos);
+    let duration = Duration::new(secs, nanos);
     let datetime = UNIX_EPOCH + duration;
 
     // Format as ISO 8601 (simplified)
@@ -600,7 +604,6 @@ fn days_in_year(year: u64) -> u64 {
 fn days_in_month(year: u64, month: u64) -> u64 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
         2 => {
             if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
                 29

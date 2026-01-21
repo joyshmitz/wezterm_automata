@@ -9,6 +9,13 @@ use std::time::SystemTime;
 use tempfile::TempDir;
 use wa_core::storage::{PaneRecord, SearchOptions, StorageHandle};
 
+mod bench_common;
+
+const BUDGETS: &[bench_common::BenchBudget] = &[bench_common::BenchBudget {
+    name: "fts_query_common",
+    budget: "p50 < 10ms, p99 < 50ms (DB ~100k captures)",
+}];
+
 /// Create a temp database path.
 fn temp_db() -> (TempDir, String) {
     let dir = TempDir::new().expect("create temp dir");
@@ -20,7 +27,7 @@ fn temp_db() -> (TempDir, String) {
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -48,49 +55,53 @@ fn generate_segment_content(i: usize) -> String {
     // Mix of different content types to simulate real usage
     match i % 10 {
         0 => format!(
-            "$ cargo build\n   Compiling crate-{} v0.1.0\n    Finished dev target(s) in 2.34s\n",
-            i
+            "$ cargo build\n   Compiling crate-{i} v0.1.0\n    Finished dev target(s) in 2.34s\n"
         ),
         1 => format!(
-            "$ git status\nOn branch feature-{}\nChanges staged for commit:\n  modified: src/lib.rs\n",
-            i
+            "$ git status\nOn branch feature-{i}\nChanges staged for commit:\n  modified: src/lib.rs\n"
         ),
-        2 => format!(
-            "$ ls -la\ndrwxr-xr-x  5 user  staff   160 Jan {} 10:00 src\n-rw-r--r--  1 user  staff  1234 file{}.txt\n",
-            i % 28 + 1,
-            i
-        ),
+        2 => {
+            let day = i % 28 + 1;
+            format!(
+                "$ ls -la\ndrwxr-xr-x  5 user  staff   160 Jan {day} 10:00 src\n-rw-r--r--  1 user  staff  1234 file{i}.txt\n"
+            )
+        }
         3 => format!(
-            "error[E0308]: mismatched types\n --> src/main.rs:{}:5\n  |\n{} |     return value;\n  |            ^^^^^ expected `i32`, found `String`\n",
-            i, i
+            "error[E0308]: mismatched types\n --> src/main.rs:{i}:5\n  |\n{i} |     return value;\n  |            ^^^^^ expected `i32`, found `String`\n"
         ),
-        4 => format!(
-            "test test_{} ... ok\ntest test_{} ... ok\ntest result: ok. 2 passed; 0 failed\n",
-            i,
-            i + 1
-        ),
-        5 => format!(
-            "Warning: less than 25% of your 20h limit remaining. {}% remaining.\n",
-            25 - (i % 20)
-        ),
-        6 => format!(
-            "Auto-compact: Conversation compacted {} tokens to {} tokens.\n",
-            100000 + i * 1000,
-            50000 + i * 100
-        ),
-        7 => format!("$ npm install\nadded {} packages in {}s\n", i * 10, i % 60),
-        8 => format!(
-            "Python 3.11.{}\n>>> print('Hello from segment {}')\nHello from segment {}\n",
-            i % 10,
-            i,
-            i
-        ),
-        _ => format!(
-            "Processing batch {}...\nItems processed: {}\nStatus: complete\nElapsed: {}ms\n",
-            i,
-            i * 100,
-            i * 7 % 1000
-        ),
+        4 => {
+            let next = i + 1;
+            format!(
+                "test test_{i} ... ok\ntest test_{next} ... ok\ntest result: ok. 2 passed; 0 failed\n"
+            )
+        }
+        5 => {
+            let remaining = 25 - (i % 20);
+            format!("Warning: less than 25% of your 20h limit remaining. {remaining}% remaining.\n")
+        }
+        6 => {
+            let before = 100_000 + i * 1_000;
+            let after = 50_000 + i * 100;
+            format!("Auto-compact: Conversation compacted {before} tokens to {after} tokens.\n")
+        }
+        7 => {
+            let packages = i * 10;
+            let secs = i % 60;
+            format!("$ npm install\nadded {packages} packages in {secs}s\n")
+        }
+        8 => {
+            let patch = i % 10;
+            format!(
+                "Python 3.11.{patch}\n>>> print('Hello from segment {i}')\nHello from segment {i}\n"
+            )
+        }
+        _ => {
+            let processed = i * 100;
+            let elapsed = i * 7 % 1_000;
+            format!(
+                "Processing batch {i}...\nItems processed: {processed}\nStatus: complete\nElapsed: {elapsed}ms\n"
+            )
+        }
     }
 }
 
@@ -143,7 +154,7 @@ fn bench_fts_small_db(c: &mut Criterion) {
     // Budget: p50 < 10ms, p99 < 50ms
     group.bench_function("simple_term", |b| {
         b.to_async(&rt)
-            .iter(|| async { storage.search_with_options("cargo", opts(10)).await })
+            .iter(|| async { storage.search_with_options("cargo", opts(10)).await });
     });
 
     group.bench_function("phrase_search", |b| {
@@ -151,12 +162,12 @@ fn bench_fts_small_db(c: &mut Criterion) {
             storage
                 .search_with_options("\"mismatched types\"", opts(10))
                 .await
-        })
+        });
     });
 
     group.bench_function("prefix_search", |b| {
         b.to_async(&rt)
-            .iter(|| async { storage.search_with_options("compil*", opts(10)).await })
+            .iter(|| async { storage.search_with_options("compil*", opts(10)).await });
     });
 
     group.bench_function("boolean_search", |b| {
@@ -164,7 +175,7 @@ fn bench_fts_small_db(c: &mut Criterion) {
             storage
                 .search_with_options("error AND types", opts(10))
                 .await
-        })
+        });
     });
 
     group.bench_function("no_match", |b| {
@@ -172,7 +183,7 @@ fn bench_fts_small_db(c: &mut Criterion) {
             storage
                 .search_with_options("nonexistent_term_xyz", opts(10))
                 .await
-        })
+        });
     });
 
     rt.block_on(storage.shutdown()).expect("shutdown");
@@ -195,7 +206,7 @@ fn bench_fts_medium_db(c: &mut Criterion) {
 
     group.bench_function("simple_term", |b| {
         b.to_async(&rt)
-            .iter(|| async { storage.search_with_options("cargo", opts(10)).await })
+            .iter(|| async { storage.search_with_options("cargo", opts(10)).await });
     });
 
     group.bench_function("phrase_search", |b| {
@@ -203,12 +214,12 @@ fn bench_fts_medium_db(c: &mut Criterion) {
             storage
                 .search_with_options("\"test result\"", opts(10))
                 .await
-        })
+        });
     });
 
     group.bench_function("common_term_high_results", |b| {
         b.to_async(&rt)
-            .iter(|| async { storage.search_with_options("Processing", opts(100)).await })
+            .iter(|| async { storage.search_with_options("Processing", opts(100)).await });
     });
 
     rt.block_on(storage.shutdown()).expect("shutdown");
@@ -232,7 +243,7 @@ fn bench_fts_large_db(c: &mut Criterion) {
     // These should still meet budget: p50 < 10ms, p99 < 50ms
     group.bench_function("simple_term", |b| {
         b.to_async(&rt)
-            .iter(|| async { storage.search_with_options("cargo", opts(10)).await })
+            .iter(|| async { storage.search_with_options("cargo", opts(10)).await });
     });
 
     group.bench_function("phrase_search", |b| {
@@ -240,12 +251,12 @@ fn bench_fts_large_db(c: &mut Criterion) {
             storage
                 .search_with_options("\"expected i32\"", opts(10))
                 .await
-        })
+        });
     });
 
     group.bench_function("common_term_limited", |b| {
         b.to_async(&rt)
-            .iter(|| async { storage.search_with_options("test", opts(10)).await })
+            .iter(|| async { storage.search_with_options("test", opts(10)).await });
     });
 
     group.bench_function("rare_term", |b| {
@@ -253,7 +264,7 @@ fn bench_fts_large_db(c: &mut Criterion) {
             storage
                 .search_with_options("\"Auto-compact\"", opts(10))
                 .await
-        })
+        });
     });
 
     rt.block_on(storage.shutdown()).expect("shutdown");
@@ -277,7 +288,7 @@ fn bench_fts_result_limits(c: &mut Criterion) {
     for limit in [1, 10, 50, 100, 500] {
         group.bench_with_input(BenchmarkId::new("limit", limit), &limit, |b, &limit| {
             b.to_async(&rt)
-                .iter(|| async { storage.search_with_options("status", opts(limit)).await })
+                .iter(|| async { storage.search_with_options("status", opts(limit)).await });
         });
     }
 
@@ -285,11 +296,17 @@ fn bench_fts_result_limits(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_config() -> Criterion {
+    bench_common::emit_bench_metadata("fts_query", BUDGETS);
+    Criterion::default().configure_from_args()
+}
+
 criterion_group!(
-    benches,
-    bench_fts_small_db,
-    bench_fts_medium_db,
-    bench_fts_large_db,
-    bench_fts_result_limits,
+    name = benches;
+    config = bench_config();
+    targets = bench_fts_small_db,
+        bench_fts_medium_db,
+        bench_fts_large_db,
+        bench_fts_result_limits
 );
 criterion_main!(benches);

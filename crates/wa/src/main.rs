@@ -517,7 +517,7 @@ impl PaneState {
         let reason = self
             .ignore_reason
             .as_ref()
-            .map(|r| format!(" ({})", r))
+            .map(|r| format!(" ({r})"))
             .unwrap_or_default();
         let title = self.title.as_deref().unwrap_or("(untitled)");
         let cwd = self.cwd.as_deref().unwrap_or("(unknown)");
@@ -1097,8 +1097,8 @@ fn emit_permission_warnings(warnings: &[wa_core::config::PermissionWarning]) {
         tracing::warn!(
             label = warning.label,
             path = %warning.path.display(),
-            actual_mode = format!("{:o}", warning.actual_mode),
-            expected_mode = format!("{:o}", warning.expected_mode),
+            actual_mode = format!("{actual_mode:o}", actual_mode = warning.actual_mode),
+            expected_mode = format!("{expected_mode:o}", expected_mode = warning.expected_mode),
             "Permissions too open"
         );
     }
@@ -1134,6 +1134,7 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 }
 
 /// Run the observation watcher daemon.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn run_watcher(
     layout: &wa_core::config::WorkspaceLayout,
     config: &wa_core::config::Config,
@@ -1182,10 +1183,8 @@ async fn run_watcher(
             }
             Err(wa_core::lock::LockError::AlreadyRunning { pid, started_at }) => {
                 anyhow::bail!(
-                    "Another watcher is already running (pid: {}, started: {}). \
-                     Use --dangerous-disable-lock to override (NOT RECOMMENDED).",
-                    pid,
-                    started_at
+                    "Another watcher is already running (pid: {pid}, started: {started_at}). \
+                     Use --dangerous-disable-lock to override (NOT RECOMMENDED)."
                 );
             }
             Err(wa_core::lock::LockError::AlreadyRunningNoMeta) => {
@@ -1195,7 +1194,7 @@ async fn run_watcher(
                 );
             }
             Err(e) => {
-                anyhow::bail!("Failed to acquire watcher lock: {}", e);
+                anyhow::bail!("Failed to acquire watcher lock: {e}");
             }
         }
     };
@@ -1326,7 +1325,7 @@ async fn run_watcher(
 async fn main() {
     let robot_mode = std::env::args().nth(1).is_some_and(|arg| arg == "robot");
     if let Err(err) = run(robot_mode).await {
-        handle_fatal_error(err, robot_mode);
+        handle_fatal_error(&err, robot_mode);
         std::process::exit(1);
     }
 }
@@ -1459,7 +1458,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string_pretty(&response)?);
                 }
                 other => {
-                    let _ctx = match build_robot_context(&config, &workspace_root) {
+                    let ctx = match build_robot_context(&config, &workspace_root) {
                         Ok(ctx) => ctx,
                         Err(err) => {
                             let response = RobotResponse::<()>::error_with_code(
@@ -1675,8 +1674,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let response = RobotResponse::<RobotWaitForData>::error_with_code(
                                         "WA-ROBOT-TIMEOUT",
                                         format!(
-                                            "Timeout waiting for pattern '{}' after {}ms ({} polls)",
-                                            pattern, elapsed, polls
+                                            "Timeout waiting for pattern '{pattern}' after {elapsed}ms ({polls} polls)"
                                         ),
                                         Some("Increase --timeout-secs or check if the pattern is correct".to_string()),
                                         elapsed_ms(start),
@@ -1861,12 +1859,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         .into_iter()
                                         .map(|e| {
                                             // Derive pack_id from rule_id (e.g., "codex.usage.reached" -> "builtin:codex")
-                                            let pack_id = e
-                                                .rule_id
-                                                .split('.')
-                                                .next()
-                                                .map(|agent| format!("builtin:{agent}"))
-                                                .unwrap_or_else(|| "builtin:unknown".to_string());
+                                            let pack_id = e.rule_id.split('.').next().map_or_else(
+                                                || "builtin:unknown".to_string(),
+                                                |agent| format!("builtin:{agent}"),
+                                            );
                                             RobotEventItem {
                                                 id: e.id,
                                                 pane_id: e.pane_id,
@@ -1955,7 +1951,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             }
 
                             // Set up workflow infrastructure
-                            let db_path = &_ctx.effective.paths.db_path;
+                            let db_path = &ctx.effective.paths.db_path;
                             let storage = match StorageHandle::new(db_path).await {
                                 Ok(s) => Arc::new(s),
                                 Err(e) => {
@@ -2001,128 +1997,116 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let workflow = runner.find_workflow_by_name(&name);
                             let _ = force; // Will be used when implementing "already handled" bypass
 
-                            match workflow {
-                                Some(wf) => {
-                                    // Generate execution ID
-                                    let execution_id = format!(
-                                        "robot-{}-{}",
-                                        name,
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_millis()
-                                    );
+                            if let Some(wf) = workflow {
+                                // Generate execution ID
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis();
+                                let execution_id = format!("robot-{name}-{now_ms}");
 
-                                    // Run the workflow
-                                    let result =
-                                        runner.run_workflow(pane_id, wf, &execution_id, 0).await;
+                                // Run the workflow
+                                let result =
+                                    runner.run_workflow(pane_id, wf, &execution_id, 0).await;
 
-                                    let (status, message, result_value, steps_executed, step_index) =
-                                        match result {
-                                            WorkflowExecutionResult::Completed {
-                                                result,
-                                                steps_executed,
-                                                ..
-                                            } => (
-                                                "completed",
-                                                None,
-                                                Some(result),
-                                                Some(steps_executed),
-                                                None,
-                                            ),
-                                            WorkflowExecutionResult::Aborted {
-                                                reason,
-                                                step_index,
-                                                ..
-                                            } => (
-                                                "aborted",
-                                                Some(reason),
-                                                None,
-                                                None,
-                                                Some(step_index),
-                                            ),
-                                            WorkflowExecutionResult::PolicyDenied {
-                                                reason,
-                                                step_index,
-                                                ..
-                                            } => (
-                                                "policy_denied",
-                                                Some(reason),
-                                                None,
-                                                None,
-                                                Some(step_index),
-                                            ),
-                                            WorkflowExecutionResult::Error { error, .. } => (
-                                                "error",
-                                                Some(error),
-                                                None,
-                                                None,
-                                                None, // Error variant doesn't track step_index
-                                            ),
-                                        };
-
-                                    let workflow_elapsed = elapsed_ms(start);
-                                    let data = RobotWorkflowData {
-                                        workflow_name: name.clone(),
-                                        pane_id,
-                                        execution_id: Some(execution_id),
-                                        status: status.to_string(),
-                                        message,
-                                        result: result_value,
-                                        steps_executed,
-                                        step_index,
-                                        elapsed_ms: Some(workflow_elapsed),
-                                    };
-
-                                    let response = if status == "completed" {
-                                        RobotResponse::success(data, workflow_elapsed)
-                                    } else if status == "policy_denied" {
-                                        RobotResponse::<RobotWorkflowData>::error_with_code(
-                                            "robot.policy_denied",
-                                            format!("Workflow '{}' denied by policy", name),
-                                            Some(
-                                                "Check safety configuration or use --dry-run."
-                                                    .to_string(),
-                                            ),
-                                            workflow_elapsed,
-                                        )
-                                    } else {
-                                        RobotResponse::<RobotWorkflowData>::error_with_code(
-                                            &format!("robot.workflow_{}", status),
-                                            format!(
-                                                "Workflow '{}' {}",
-                                                name,
-                                                data.message.as_deref().unwrap_or("failed")
-                                            ),
+                                let (status, message, result_value, steps_executed, step_index) =
+                                    match result {
+                                        WorkflowExecutionResult::Completed {
+                                            result,
+                                            steps_executed,
+                                            ..
+                                        } => (
+                                            "completed",
                                             None,
-                                            workflow_elapsed,
-                                        )
+                                            Some(result),
+                                            Some(steps_executed),
+                                            None,
+                                        ),
+                                        WorkflowExecutionResult::Aborted {
+                                            reason,
+                                            step_index,
+                                            ..
+                                        } => {
+                                            ("aborted", Some(reason), None, None, Some(step_index))
+                                        }
+                                        WorkflowExecutionResult::PolicyDenied {
+                                            reason,
+                                            step_index,
+                                            ..
+                                        } => (
+                                            "policy_denied",
+                                            Some(reason),
+                                            None,
+                                            None,
+                                            Some(step_index),
+                                        ),
+                                        WorkflowExecutionResult::Error { error, .. } => (
+                                            "error",
+                                            Some(error),
+                                            None,
+                                            None,
+                                            None, // Error variant doesn't track step_index
+                                        ),
                                     };
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
-                                }
-                                None => {
-                                    // No workflow registered with this name
-                                    // Note: In standalone robot mode, no workflows are registered.
-                                    // The daemon (wa watch --auto-handle) would have workflows
-                                    // registered for event-driven execution.
-                                    let response =
-                                        RobotResponse::<RobotWorkflowData>::error_with_code(
-                                            "robot.workflow_not_found",
-                                            format!("Workflow '{}' not found", name),
-                                            Some(
-                                                "No workflows registered in standalone mode. \
-                                                 Use 'wa watch --auto-handle' for event-driven workflows."
-                                                    .to_string(),
-                                            ),
-                                            elapsed_ms(start),
-                                        );
-                                    tracing::debug!(
-                                        workflow = %name,
-                                        pane_id,
-                                        "Workflow not found"
+
+                                let workflow_elapsed = elapsed_ms(start);
+                                let data = RobotWorkflowData {
+                                    workflow_name: name.clone(),
+                                    pane_id,
+                                    execution_id: Some(execution_id),
+                                    status: status.to_string(),
+                                    message,
+                                    result: result_value,
+                                    steps_executed,
+                                    step_index,
+                                    elapsed_ms: Some(workflow_elapsed),
+                                };
+
+                                let response = if status == "completed" {
+                                    RobotResponse::success(data, workflow_elapsed)
+                                } else if status == "policy_denied" {
+                                    RobotResponse::<RobotWorkflowData>::error_with_code(
+                                        "robot.policy_denied",
+                                        format!("Workflow '{name}' denied by policy"),
+                                        Some(
+                                            "Check safety configuration or use --dry-run."
+                                                .to_string(),
+                                        ),
+                                        workflow_elapsed,
+                                    )
+                                } else {
+                                    let status_message =
+                                        data.message.as_deref().unwrap_or("failed");
+                                    RobotResponse::<RobotWorkflowData>::error_with_code(
+                                        &format!("robot.workflow_{status}"),
+                                        format!("Workflow '{name}' {status_message}"),
+                                        None,
+                                        workflow_elapsed,
+                                    )
+                                };
+                                println!("{}", serde_json::to_string_pretty(&response)?);
+                            } else {
+                                // No workflow registered with this name
+                                // Note: In standalone robot mode, no workflows are registered.
+                                // The daemon (wa watch --auto-handle) would have workflows
+                                // registered for event-driven execution.
+                                let response =
+                                    RobotResponse::<RobotWorkflowData>::error_with_code(
+                                        "robot.workflow_not_found",
+                                        format!("Workflow '{name}' not found"),
+                                        Some(
+                                            "No workflows registered in standalone mode. \
+                                             Use 'wa watch --auto-handle' for event-driven workflows."
+                                                .to_string(),
+                                        ),
+                                        elapsed_ms(start),
                                     );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
-                                }
+                                tracing::debug!(
+                                    workflow = %name,
+                                    pane_id,
+                                    "Workflow not found"
+                                );
+                                println!("{}", serde_json::to_string_pretty(&response)?);
                             }
 
                             // Clean shutdown of storage
@@ -2262,13 +2246,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             } else {
                 let observed_count = states.iter().filter(|s| s.observed).count();
                 let ignored_count = states.len() - observed_count;
+                println!("Panes ({observed_count} observed, {ignored_count} ignored):");
                 println!(
-                    "Panes ({} observed, {} ignored):",
-                    observed_count, ignored_count
-                );
-                println!(
-                    "  {:>4}  {:>10}  {:<20}  {:<40}  {}",
-                    "ID", "STATUS", "TITLE", "CWD", "DOMAIN"
+                    "  {:>4}  {:>10}  {:<20}  {:<40}  DOMAIN",
+                    "ID", "STATUS", "TITLE", "CWD"
                 );
                 println!("  {}", "-".repeat(100));
                 for state in &states {
@@ -2592,7 +2573,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_fatal_error(err: anyhow::Error, robot_mode: bool) {
+fn handle_fatal_error(err: &anyhow::Error, robot_mode: bool) {
     if robot_mode {
         eprintln!("Error: {err}");
         return;

@@ -7,7 +7,15 @@
 //! - Should scale reasonably with content size up to typical pane buffers (~100KB)
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::fmt::Write;
 use wa_core::ingest::extract_delta;
+
+mod bench_common;
+
+const BUDGETS: &[bench_common::BenchBudget] = &[bench_common::BenchBudget {
+    name: "delta_extraction",
+    budget: "microseconds per extract (target: not milliseconds)",
+}];
 
 /// Default overlap window size from RuntimeConfig.
 const DEFAULT_OVERLAP_SIZE: usize = 4096;
@@ -16,12 +24,13 @@ const DEFAULT_OVERLAP_SIZE: usize = 4096;
 fn generate_content(lines: usize) -> String {
     let mut content = String::with_capacity(lines * 80);
     for i in 0..lines {
-        content.push_str(&format!(
-            "[{}] Processing item {} - status: OK - elapsed: {}ms\n",
+        let _ = writeln!(
+            &mut content,
+            "[{}] Processing item {} - status: OK - elapsed: {}ms",
             i % 1000,
             i,
             (i * 7) % 100
-        ));
+        );
     }
     content
 }
@@ -56,7 +65,7 @@ fn bench_no_change(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes(content.len() as u64));
         group.bench_with_input(BenchmarkId::new("lines", lines), &content, |b, content| {
-            b.iter(|| extract_delta(content, content, DEFAULT_OVERLAP_SIZE))
+            b.iter(|| extract_delta(content, content, DEFAULT_OVERLAP_SIZE));
         });
     }
 
@@ -134,7 +143,7 @@ fn bench_first_capture(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes(curr.len() as u64));
         group.bench_with_input(BenchmarkId::new("lines", lines), &curr, |b, curr| {
-            b.iter(|| extract_delta("", curr, DEFAULT_OVERLAP_SIZE))
+            b.iter(|| extract_delta("", curr, DEFAULT_OVERLAP_SIZE));
         });
     }
 
@@ -161,14 +170,20 @@ fn bench_large_content(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_config() -> Criterion {
+    bench_common::emit_bench_metadata("delta_extraction", BUDGETS);
+    Criterion::default().configure_from_args()
+}
+
 criterion_group!(
-    benches,
-    bench_append_only,
-    bench_no_change,
-    bench_edit_middle,
-    bench_truncation,
-    bench_overlap_sizes,
-    bench_first_capture,
-    bench_large_content,
+    name = benches;
+    config = bench_config();
+    targets = bench_append_only,
+        bench_no_change,
+        bench_edit_middle,
+        bench_truncation,
+        bench_overlap_sizes,
+        bench_first_capture,
+        bench_large_content
 );
 criterion_main!(benches);

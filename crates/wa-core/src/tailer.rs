@@ -155,6 +155,7 @@ impl TailerSupervisor {
     }
 
     /// Number of active tailers.
+    #[must_use]
     pub fn active_count(&self) -> usize {
         self.tailers.len()
     }
@@ -209,13 +210,15 @@ impl TailerSupervisor {
             return;
         }
 
-        // Capture from each ready pane
-        let mut cursors = self.cursors.write().await;
-
         for pane_id in ready_panes {
-            let Some(_cursor) = cursors.get_mut(&pane_id) else {
-                continue;
+            let has_cursor = {
+                let mut cursors = self.cursors.write().await;
+                cursors.get_mut(&pane_id).is_some()
             };
+
+            if !has_cursor {
+                continue;
+            }
 
             // In a real implementation, we would fetch current pane content here
             // and call _cursor.capture_snapshot() with the content.
@@ -240,11 +243,13 @@ impl TailerSupervisor {
     }
 
     /// Get current metrics.
+    #[must_use]
     pub fn metrics(&self) -> &TailerMetrics {
         &self.metrics
     }
 
     /// Get supervisor metrics.
+    #[must_use]
     pub fn supervisor_metrics(&self) -> &SupervisorMetrics {
         &self.supervisor_metrics
     }

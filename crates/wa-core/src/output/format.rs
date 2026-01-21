@@ -4,6 +4,7 @@
 //! output format preferences.
 
 use std::io::IsTerminal;
+use std::str::FromStr;
 
 /// Output format for CLI commands
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -18,21 +19,10 @@ pub enum OutputFormat {
 }
 
 impl OutputFormat {
-    /// Parse format from string argument
-    ///
-    /// # Arguments
-    /// * `s` - Format string: "auto", "plain", or "json"
-    ///
-    /// # Returns
-    /// Parsed format, or None if invalid
+    /// Parse format from string argument.
     #[must_use]
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "auto" => Some(Self::Auto),
-            "plain" | "text" => Some(Self::Plain),
-            "json" => Some(Self::Json),
-            _ => None,
-        }
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::from_str(s).ok()
     }
 
     /// Check if this format should use colors/rich formatting
@@ -42,8 +32,7 @@ impl OutputFormat {
     pub fn is_rich(&self) -> bool {
         match self {
             Self::Auto => std::io::stdout().is_terminal(),
-            Self::Plain => false,
-            Self::Json => false,
+            Self::Plain | Self::Json => false,
         }
     }
 
@@ -80,6 +69,19 @@ impl OutputFormat {
     }
 }
 
+impl FromStr for OutputFormat {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "plain" | "text" => Ok(Self::Plain),
+            "json" => Ok(Self::Json),
+            _ => Err(()),
+        }
+    }
+}
+
 impl std::fmt::Display for OutputFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -111,7 +113,7 @@ pub enum EffectiveFormat {
 pub fn detect_format() -> OutputFormat {
     // Check explicit format override
     if let Ok(format) = std::env::var("WA_OUTPUT_FORMAT") {
-        if let Some(f) = OutputFormat::from_str(&format) {
+        if let Some(f) = OutputFormat::parse(&format) {
             return f;
         }
     }
@@ -130,6 +132,7 @@ pub fn detect_format() -> OutputFormat {
 // =============================================================================
 
 /// ANSI escape codes for terminal colors
+#[allow(dead_code)]
 pub mod colors {
     /// Reset all formatting
     pub const RESET: &str = "\x1b[0m";
@@ -232,6 +235,7 @@ impl Style {
     }
 
     /// Make text blue
+    #[allow(dead_code)]
     #[must_use]
     pub fn blue(&self, text: &str) -> String {
         self.apply(colors::BLUE, text)
@@ -250,6 +254,7 @@ impl Style {
     }
 
     /// Apply status color (green for success, red for failure, yellow for warning)
+    #[allow(dead_code)]
     #[must_use]
     pub fn status(&self, text: &str, success: bool) -> String {
         if success {
@@ -277,12 +282,12 @@ mod tests {
 
     #[test]
     fn test_format_from_str() {
-        assert_eq!(OutputFormat::from_str("auto"), Some(OutputFormat::Auto));
-        assert_eq!(OutputFormat::from_str("plain"), Some(OutputFormat::Plain));
-        assert_eq!(OutputFormat::from_str("text"), Some(OutputFormat::Plain));
-        assert_eq!(OutputFormat::from_str("json"), Some(OutputFormat::Json));
-        assert_eq!(OutputFormat::from_str("JSON"), Some(OutputFormat::Json));
-        assert_eq!(OutputFormat::from_str("invalid"), None);
+        assert_eq!(OutputFormat::parse("auto"), Some(OutputFormat::Auto));
+        assert_eq!(OutputFormat::parse("plain"), Some(OutputFormat::Plain));
+        assert_eq!(OutputFormat::parse("text"), Some(OutputFormat::Plain));
+        assert_eq!(OutputFormat::parse("json"), Some(OutputFormat::Json));
+        assert_eq!(OutputFormat::parse("JSON"), Some(OutputFormat::Json));
+        assert_eq!(OutputFormat::parse("invalid"), None);
     }
 
     #[test]

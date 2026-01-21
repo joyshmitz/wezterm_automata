@@ -7,8 +7,21 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use wa_core::patterns::{DetectionContext, PatternEngine};
 
+mod bench_common;
+
+const BUDGETS: &[bench_common::BenchBudget] = &[
+    bench_common::BenchBudget {
+        name: "quick_reject_no_match",
+        budget: "p50 < 1µs (typical non-matching text)",
+    },
+    bench_common::BenchBudget {
+        name: "pattern_detection_typical",
+        budget: "p50 < 1ms, p99 < 5ms (typical corpus)",
+    },
+];
+
 /// Typical shell output that shouldn't match any patterns.
-const TYPICAL_NO_MATCH: &str = r#"$ ls -la
+const TYPICAL_NO_MATCH: &str = r"$ ls -la
 total 64
 drwxr-xr-x  10 user  staff    320 Jan 18 12:00 .
 drwxr-xr-x   8 user  staff    256 Jan 17 10:00 ..
@@ -25,31 +38,31 @@ nothing to commit, working tree clean
 $ cargo build
    Compiling wa-core v0.1.0 (/path/to/project)
     Finished dev [unoptimized + debuginfo] target(s) in 2.34s
-"#;
+";
 
 /// Short shell command with no patterns.
 const SHORT_NO_MATCH: &str = "$ echo hello\nhello\n";
 
 /// Content that triggers Codex usage warning pattern.
-const CODEX_USAGE_WARNING: &str = r#"
+const CODEX_USAGE_WARNING: &str = r"
 Warning: You have less than 25% of your 20h limit remaining.
 
 Your current usage: 15% of your 20h limit remaining.
 Consider wrapping up your current session soon.
 
 To check your remaining time, run: codex usage
-"#;
+";
 
 /// Content that triggers Claude Code compaction pattern.
-const CLAUDE_COMPACTION: &str = r#"
+const CLAUDE_COMPACTION: &str = r"
 [Claude Code] Auto-compact: Conversation compacted 150,000 tokens to 50,000 tokens.
 
 Your conversation has been summarized to fit within the context window.
 Some earlier messages may no longer be available in full detail.
-"#;
+";
 
 /// Content with multiple potential pattern matches.
-const MULTI_MATCH: &str = r#"
+const MULTI_MATCH: &str = r"
 [Session Info]
 Token usage: total=50,000 input=30,000 (+ 10,000 cached) output=10,000
 
@@ -59,7 +72,7 @@ Note: If you need to resume this session later, use:
   codex resume 12345678-1234-1234-1234-123456789012
 
 [Auto-compact] context compacted 200,000 tokens to 75,000 tokens.
-"#;
+";
 
 /// Large terminal output (simulating scrollback buffer).
 fn large_output(size_kb: usize) -> String {
@@ -74,11 +87,11 @@ fn bench_quick_reject(c: &mut Criterion) {
 
     // Budget: < 1µs for typical non-matching text
     group.bench_function("typical_shell_output", |b| {
-        b.iter(|| engine.detect(TYPICAL_NO_MATCH))
+        b.iter(|| engine.detect(TYPICAL_NO_MATCH));
     });
 
     group.bench_function("short_no_match", |b| {
-        b.iter(|| engine.detect(SHORT_NO_MATCH))
+        b.iter(|| engine.detect(SHORT_NO_MATCH));
     });
 
     // Test with various sizes
@@ -102,14 +115,16 @@ fn bench_pattern_detection(c: &mut Criterion) {
 
     // Budget: p50 < 1ms, p99 < 5ms
     group.bench_function("codex_usage_warning", |b| {
-        b.iter(|| engine.detect(CODEX_USAGE_WARNING))
+        b.iter(|| engine.detect(CODEX_USAGE_WARNING));
     });
 
     group.bench_function("claude_compaction", |b| {
-        b.iter(|| engine.detect(CLAUDE_COMPACTION))
+        b.iter(|| engine.detect(CLAUDE_COMPACTION));
     });
 
-    group.bench_function("multi_match", |b| b.iter(|| engine.detect(MULTI_MATCH)));
+    group.bench_function("multi_match", |b| {
+        b.iter(|| engine.detect(MULTI_MATCH));
+    });
 
     group.finish();
 }
@@ -123,13 +138,13 @@ fn bench_detection_with_context(c: &mut Criterion) {
     group.bench_function("with_context_no_match", |b| {
         let mut ctx = DetectionContext::new();
         ctx.pane_id = Some(1);
-        b.iter(|| engine.detect_with_context(TYPICAL_NO_MATCH, &mut ctx))
+        b.iter(|| engine.detect_with_context(TYPICAL_NO_MATCH, &mut ctx));
     });
 
     group.bench_function("with_context_match", |b| {
         let mut ctx = DetectionContext::new();
         ctx.pane_id = Some(1);
-        b.iter(|| engine.detect_with_context(CODEX_USAGE_WARNING, &mut ctx))
+        b.iter(|| engine.detect_with_context(CODEX_USAGE_WARNING, &mut ctx));
     });
 
     // Context dedup after first detection should be faster
@@ -138,7 +153,7 @@ fn bench_detection_with_context(c: &mut Criterion) {
         ctx.pane_id = Some(1);
         // Prime the context with a detection
         let _ = engine.detect_with_context(CODEX_USAGE_WARNING, &mut ctx);
-        b.iter(|| engine.detect_with_context(CODEX_USAGE_WARNING, &mut ctx))
+        b.iter(|| engine.detect_with_context(CODEX_USAGE_WARNING, &mut ctx));
     });
 
     group.finish();
@@ -163,11 +178,17 @@ fn bench_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_config() -> Criterion {
+    bench_common::emit_bench_metadata("pattern_detection", BUDGETS);
+    Criterion::default().configure_from_args()
+}
+
 criterion_group!(
-    benches,
-    bench_quick_reject,
-    bench_pattern_detection,
-    bench_detection_with_context,
-    bench_throughput,
+    name = benches;
+    config = bench_config();
+    targets = bench_quick_reject,
+        bench_pattern_detection,
+        bench_detection_with_context,
+        bench_throughput
 );
 criterion_main!(benches);

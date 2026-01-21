@@ -13,7 +13,7 @@
 //!
 //! Converts repeated snapshots into minimal deltas using overlap matching.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -285,7 +285,7 @@ impl PaneCursor {
         if self.next_seq == 0 {
             -1
         } else {
-            (self.next_seq - 1) as i64
+            i64::try_from(self.next_seq - 1).unwrap_or(i64::MAX)
         }
     }
 
@@ -929,8 +929,8 @@ impl OutputCache {
     }
 
     fn update_global_lru(&mut self, hash: u64, now: i64) {
-        if self.global_hashes.contains_key(&hash) {
-            self.global_hashes.insert(hash, now);
+        if let Entry::Occupied(mut entry) = self.global_hashes.entry(hash) {
+            entry.insert(now);
             return;
         }
 
@@ -948,7 +948,8 @@ impl OutputCache {
     /// Prune stale per-pane entries older than max_age.
     pub fn prune(&mut self, max_age_ms: u64) {
         let now = epoch_ms();
-        let cutoff = now - max_age_ms as i64;
+        let max_age = i64::try_from(max_age_ms).unwrap_or(i64::MAX);
+        let cutoff = now.saturating_sub(max_age);
 
         self.pane_states
             .retain(|_, state| state.last_updated > cutoff);
@@ -973,6 +974,7 @@ impl OutputCache {
 
     /// Get the current cache hit rate (0.0 - 1.0).
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn hit_rate(&self) -> f64 {
         let total = self.hits + self.misses;
         if total == 0 {
@@ -2446,11 +2448,11 @@ mod tests {
         let mut cache = OutputCache::with_defaults();
 
         // No hits/misses yet - hit rate is 0
-        assert_eq!(cache.hit_rate(), 0.0);
+        assert!(cache.hit_rate().abs() < f64::EPSILON);
 
         // 1 miss
         assert!(cache.is_new(1, "content\n"));
-        assert_eq!(cache.hit_rate(), 0.0);
+        assert!(cache.hit_rate().abs() < f64::EPSILON);
 
         // 1 hit, 1 miss = 50%
         assert!(!cache.is_new(1, "content\n"));

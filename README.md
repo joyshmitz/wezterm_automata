@@ -1,25 +1,18 @@
 # wa — WezTerm Automata
 
 <div align="center">
+  <img src="wa_illustration.webp" alt="wa - Terminal Hypervisor for AI Agent Swarms">
+</div>
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│  ██╗    ██╗ █████╗                                                 │
-│  ██║    ██║██╔══██╗   Terminal Hypervisor for AI Agent Swarms      │
-│  ██║ █╗ ██║███████║                                                │
-│  ██║███╗██║██╔══██║   Perfect observability. Intelligent routing.  │
-│  ╚███╔███╔╝██║  ██║   Reliable automation. Zero guessing.          │
-│   ╚══╝╚══╝ ╚═╝  ╚═╝                                                │
-└────────────────────────────────────────────────────────────────────┘
-```
+<div align="center">
 
 [![CI](https://github.com/Dicklesworthstone/wezterm_automata/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/wezterm_automata/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org/)
 
-**The central nervous system for coordinating fleets of AI coding agents across WezTerm terminal sessions.**
-
 </div>
+
+**The central nervous system for coordinating fleets of AI coding agents across WezTerm terminal sessions.**
 
 <div align="center">
 <h3>Quick Install</h3>

@@ -61,6 +61,10 @@ harness = false
 name = "fts_query"
 harness = false
 
+[[bench]]
+name = "watcher_loop"
+harness = false
+
 [features]
 default = []
 # Public feature flags (stable surface)

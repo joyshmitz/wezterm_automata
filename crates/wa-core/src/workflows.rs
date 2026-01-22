@@ -37,6 +37,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// - `Retry`: Retry this step after a delay
 /// - `Abort`: Stop workflow with an error
 /// - `WaitFor`: Pause until a condition is met
+/// - `SendText`: Send text to pane and proceed (policy-gated)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StepResult {
@@ -60,6 +61,16 @@ pub enum StepResult {
         condition: WaitCondition,
         /// Timeout in milliseconds (None = workflow-level default)
         timeout_ms: Option<u64>,
+    },
+    /// Send text to pane via policy-gated injector, then proceed to next step.
+    /// If policy denies the send, the workflow is aborted with the denial reason.
+    SendText {
+        /// Text to send to the pane
+        text: String,
+        /// Optional condition to wait for after successful send (for verification)
+        wait_for: Option<WaitCondition>,
+        /// Timeout for the wait condition in milliseconds
+        wait_timeout_ms: Option<u64>,
     },
 }
 
@@ -114,6 +125,38 @@ impl StepResult {
             condition,
             timeout_ms: Some(timeout_ms),
         }
+    }
+
+    /// Create a SendText result to inject text into the pane.
+    /// The runner will call the policy-gated injector and abort if denied.
+    #[must_use]
+    pub fn send_text(text: impl Into<String>) -> Self {
+        Self::SendText {
+            text: text.into(),
+            wait_for: None,
+            wait_timeout_ms: None,
+        }
+    }
+
+    /// Create a SendText result with optional verification wait condition.
+    /// After successful send, waits for the condition before proceeding.
+    #[must_use]
+    pub fn send_text_and_wait(
+        text: impl Into<String>,
+        wait_for: WaitCondition,
+        timeout_ms: u64,
+    ) -> Self {
+        Self::SendText {
+            text: text.into(),
+            wait_for: Some(wait_for),
+            wait_timeout_ms: Some(timeout_ms),
+        }
+    }
+
+    /// Check if this result sends text
+    #[must_use]
+    pub fn is_send_text(&self) -> bool {
+        matches!(self, Self::SendText { .. })
     }
 
     /// Check if this result continues to the next step
@@ -770,6 +813,7 @@ impl WorkflowEngine {
             StepResult::Abort { .. } => "abort",
             StepResult::Retry { .. } => "retry",
             StepResult::WaitFor { .. } => "wait_for",
+            StepResult::SendText { .. } => "send_text",
         };
         let result_data = serde_json::to_string(result).ok();
 
@@ -1920,6 +1964,7 @@ impl WorkflowRunner {
                 StepResult::Retry { .. } => "retry",
                 StepResult::Abort { .. } => "abort",
                 StepResult::WaitFor { .. } => "wait_for",
+                StepResult::SendText { .. } => "send_text",
             };
 
             let steps = workflow.steps();
@@ -2137,6 +2182,176 @@ impl WorkflowRunner {
                             error = %e,
                             "Failed to update execution step after wait"
                         );
+                    }
+                }
+                StepResult::SendText {
+                    text,
+                    wait_for,
+                    wait_timeout_ms,
+                } => {
+                    // Attempt to send text via policy-gated injector
+                    tracing::info!(
+                        pane_id,
+                        execution_id,
+                        text_len = text.len(),
+                        "Workflow requesting text injection"
+                    );
+
+                    let send_result = {
+                        let mut guard = self.injector.lock().await;
+                        guard
+                            .send_text(
+                                pane_id,
+                                &text,
+                                crate::policy::ActorKind::Workflow,
+                                ctx.capabilities(),
+                                Some(execution_id),
+                            )
+                            .await
+                    };
+
+                    match send_result {
+                        crate::policy::InjectionResult::Allowed { .. } => {
+                            tracing::info!(
+                                pane_id,
+                                execution_id,
+                                "Text injection succeeded"
+                            );
+
+                            // If there's a wait condition, handle it
+                            if let Some(condition) = wait_for {
+                                let timeout = wait_timeout_ms.map_or_else(
+                                    || Duration::from_millis(self.config.step_timeout_ms),
+                                    Duration::from_millis,
+                                );
+
+                                // Simple wait implementation
+                                match &condition {
+                                    WaitCondition::PaneIdle {
+                                        idle_threshold_ms, ..
+                                    } => {
+                                        tokio::time::sleep(Duration::from_millis(
+                                            *idle_threshold_ms,
+                                        ))
+                                        .await;
+                                    }
+                                    WaitCondition::Pattern { .. } => {
+                                        tokio::time::sleep(timeout).await;
+                                    }
+                                    WaitCondition::External { .. } => {
+                                        tokio::time::sleep(timeout).await;
+                                    }
+                                }
+                            }
+
+                            // Continue to next step
+                            current_step += 1;
+                            retries = 0;
+
+                            if let Err(e) =
+                                self.update_execution_step(execution_id, current_step).await
+                            {
+                                tracing::warn!(
+                                    execution_id,
+                                    error = %e,
+                                    "Failed to update execution step after send"
+                                );
+                            }
+                        }
+                        crate::policy::InjectionResult::Denied { decision, .. } => {
+                            let elapsed_ms = elapsed_ms(start_time);
+                            let reason = match &decision {
+                                crate::policy::PolicyDecision::Deny { reason, .. } => reason.clone(),
+                                _ => "Unknown denial reason".to_string(),
+                            };
+                            let abort_reason =
+                                format!("Policy denied text injection: {reason}");
+
+                            tracing::warn!(
+                                pane_id,
+                                execution_id,
+                                reason = %reason,
+                                "Text injection denied by policy"
+                            );
+
+                            // Update execution to failed
+                            if let Err(e) =
+                                self.fail_execution(execution_id, &abort_reason).await
+                            {
+                                tracing::warn!(
+                                    execution_id,
+                                    error = %e,
+                                    "Failed to fail execution"
+                                );
+                            }
+
+                            // Mark trigger event as handled (with denied status)
+                            if let Err(e) = self
+                                .mark_trigger_event_handled(execution_id, "denied")
+                                .await
+                            {
+                                tracing::warn!(
+                                    execution_id,
+                                    error = %e,
+                                    "Failed to mark trigger event as handled"
+                                );
+                            }
+
+                            // Cleanup and release lock
+                            workflow.cleanup(&mut ctx).await;
+                            self.lock_manager.release(pane_id, execution_id);
+
+                            return WorkflowExecutionResult::Aborted {
+                                execution_id: execution_id.to_string(),
+                                reason: abort_reason,
+                                step_index: current_step,
+                                elapsed_ms,
+                            };
+                        }
+                        crate::policy::InjectionResult::RequiresApproval { decision, .. } => {
+                            let elapsed_ms = elapsed_ms(start_time);
+                            let code = match &decision {
+                                crate::policy::PolicyDecision::RequireApproval { approval, .. } => {
+                                    approval.as_ref().map_or_else(
+                                        || "unknown".to_string(),
+                                        |a| a.allow_once_code.clone(),
+                                    )
+                                }
+                                _ => "unknown".to_string(),
+                            };
+                            let abort_reason = format!(
+                                "Text injection requires approval (code: {code})"
+                            );
+
+                            tracing::warn!(
+                                pane_id,
+                                execution_id,
+                                code = %code,
+                                "Text injection requires approval"
+                            );
+
+                            // Update execution to failed (approval not auto-granted for workflows)
+                            if let Err(e) =
+                                self.fail_execution(execution_id, &abort_reason).await
+                            {
+                                tracing::warn!(
+                                    execution_id,
+                                    error = %e,
+                                    "Failed to fail execution"
+                                );
+                            }
+
+                            // Cleanup and release lock
+                            workflow.cleanup(&mut ctx).await;
+                            self.lock_manager.release(pane_id, execution_id);
+
+                            return WorkflowExecutionResult::Aborted {
+                                execution_id: execution_id.to_string(),
+                                reason: abort_reason,
+                                step_index: current_step,
+                                elapsed_ms,
+                            };
+                        }
                     }
                 }
             }
@@ -2770,9 +2985,7 @@ impl Workflow for HandleCompaction {
                 }
 
                 // Step 2: Send agent-specific prompt
-                // Note: The actual send must be done outside this async block
-                // because ctx.send_text() requires a mutable borrow of ctx.
-                // This step returns Continue and the runner handles the send.
+                // The runner will handle the actual text injection via policy-gated injector.
                 2 => {
                     let prompt = prompt.unwrap_or(compaction_prompts::UNKNOWN);
 
@@ -2780,7 +2993,7 @@ impl Workflow for HandleCompaction {
                         pane_id,
                         execution_id = %execution_id,
                         prompt_len = prompt.len(),
-                        "handle_compaction: prepared context refresh prompt"
+                        "handle_compaction: sending context refresh prompt"
                     );
 
                     // Check if injector is available
@@ -2789,17 +3002,9 @@ impl Workflow for HandleCompaction {
                         return StepResult::abort("No injector configured for text injection");
                     }
 
-                    // For now, we can't send from inside this async block due to lifetime constraints.
-                    // The workflow runner should handle the actual send when we return Continue.
-                    // TODO: Implement proper send-and-verify pattern once runner supports it.
-                    //
-                    // For the initial implementation, we log intent and succeed optimistically.
-                    tracing::info!(
-                        pane_id,
-                        prompt = %prompt.trim(),
-                        "handle_compaction: would send prompt (send pending runner support)"
-                    );
-                    StepResult::cont()
+                    // Use SendText to request the runner inject the prompt.
+                    // The runner will call the policy-gated injector and abort if denied.
+                    StepResult::send_text(prompt)
                 }
 
                 // Step 3: Verify the send (best-effort)

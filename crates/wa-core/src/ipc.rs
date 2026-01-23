@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 
 use crate::events::{Event, EventBus, UserVarError, UserVarPayload};
 use crate::ingest::PaneRegistry;
@@ -391,11 +391,7 @@ impl IpcServer {
     /// # Arguments
     /// * `event_bus` - Event bus to publish received events
     /// * `shutdown_rx` - Channel to receive shutdown signal
-    pub async fn run(
-        self,
-        event_bus: Arc<EventBus>,
-        mut shutdown_rx: mpsc::Receiver<()>,
-    ) {
+    pub async fn run(self, event_bus: Arc<EventBus>, mut shutdown_rx: mpsc::Receiver<()>) {
         let ctx = Arc::new(IpcHandlerContext::new(event_bus));
         self.run_with_context(ctx, &mut shutdown_rx).await;
     }
@@ -516,9 +512,7 @@ async fn handle_request_with_context(request: IpcRequest, ctx: &IpcHandlerContex
                 Err(e) => IpcResponse::error(e.to_string()),
             }
         }
-        IpcRequest::StatusUpdate(update) => {
-            handle_status_update(update, ctx).await
-        }
+        IpcRequest::StatusUpdate(update) => handle_status_update(update, ctx).await,
         IpcRequest::Ping => {
             let uptime_ms = u64::try_from(ctx.event_bus.uptime().as_millis()).unwrap_or(u64::MAX);
             IpcResponse::ok_with_data(serde_json::json!({
@@ -560,15 +554,13 @@ async fn handle_status_update(update: StatusUpdate, ctx: &IpcHandlerContext) -> 
 
     // Step 2: Check rate limit / coalesce
     let prev_update = {
-        let mut limiter = match ctx.rate_limiter.lock() {
-            Ok(guard) => guard,
+        let Some(prev) = (match ctx.rate_limiter.lock() {
+            Ok(mut guard) => guard.should_process(&update),
             Err(e) => {
                 tracing::error!(error = %e, "Rate limiter lock poisoned");
                 return IpcResponse::error("internal error: rate limiter unavailable");
             }
-        };
-
-        let Some(prev) = limiter.should_process(&update) else {
+        }) else {
             // Dropped due to rate limiting (not material change)
             tracing::trace!(pane_id, "Status update coalesced (rate limited)");
             return IpcResponse::ok_with_data(serde_json::json!({
@@ -625,16 +617,12 @@ async fn handle_status_update(update: StatusUpdate, ctx: &IpcHandlerContext) -> 
     // Step 4: Determine what changed (from rate limiter's previous state)
     let alt_screen_changed = prev_update
         .as_ref()
-        .map_or(true, |p| p.is_alt_screen != update.is_alt_screen);
-    let title_changed = prev_update.as_ref().map_or(true, |p| p.title != update.title);
+        .is_none_or(|p| p.is_alt_screen != update.is_alt_screen);
+    let title_changed = prev_update.as_ref().is_none_or(|p| p.title != update.title);
 
     // Step 5: Update pane registry state
-    let dimensions = update
-        .dimensions
-        .map(|d| (d.cols, d.rows));
-    let cursor = update
-        .cursor
-        .map(|c| (c.col, c.row));
+    let dimensions = update.dimensions.map(|d| (d.cols, d.rows));
+    let cursor = update.cursor.map(|c| (c.col, c.row));
 
     {
         let mut registry = registry_lock.write().await;
@@ -1243,7 +1231,10 @@ mod tests {
     fn material_change_dimensions_change_is_material() {
         let update1 = make_status_update(1);
         let mut update2 = make_status_update(1);
-        update2.dimensions = Some(PaneDimensions { rows: 48, cols: 120 });
+        update2.dimensions = Some(PaneDimensions {
+            rows: 48,
+            cols: 120,
+        });
 
         assert!(update2.is_material_change(Some(&update1)));
     }
@@ -1436,7 +1427,12 @@ mod tests {
         let response: IpcResponse = serde_json::from_str(&line).unwrap();
         assert!(!response.ok);
         assert!(response.error.is_some());
-        assert!(response.error.unwrap().contains("unsupported schema_version"));
+        assert!(
+            response
+                .error
+                .unwrap()
+                .contains("unsupported schema_version")
+        );
 
         let _ = shutdown_tx.send(()).await;
         let _ = server_handle.await;
@@ -1504,6 +1500,7 @@ mod tests {
     async fn status_update_updates_pane_registry() {
         use crate::ingest::{ObservationDecision, PaneEntry, PaneFingerprint, PaneRegistry};
         use crate::wezterm::PaneInfo;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
         let temp_dir = TempDir::new().unwrap();
         let socket_path = temp_dir.path().join("test.sock");
@@ -1536,7 +1533,7 @@ mod tests {
             };
             let fingerprint = PaneFingerprint::without_content(&pane_info);
             let entry = PaneEntry::new(pane_info, fingerprint, ObservationDecision::Observed);
-            reg.update(vec![entry.info.clone()]);
+            reg.update(vec![entry.info]);
         }
 
         let server = IpcServer::bind(&socket_path).await.unwrap();
@@ -1557,13 +1554,15 @@ mod tests {
         let mut update = make_status_update(42);
         update.title = Some("new title".to_string());
         update.is_alt_screen = true;
-        update.dimensions = Some(PaneDimensions { rows: 50, cols: 120 });
+        update.dimensions = Some(PaneDimensions {
+            rows: 50,
+            cols: 120,
+        });
 
         let request = IpcRequest::StatusUpdate(update);
         let request_json = serde_json::to_string(&request).unwrap();
 
         let mut stream = UnixStream::connect(&socket_path).await.unwrap();
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         stream.write_all(request_json.as_bytes()).await.unwrap();
         stream.write_all(b"\n").await.unwrap();
         stream.flush().await.unwrap();
@@ -1580,14 +1579,20 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         // Verify registry was updated
-        {
+        let (title, is_alt_screen, rows, cols) = {
             let reg = registry.read().await;
             let entry = reg.get_entry(42).expect("Pane should exist");
-            assert_eq!(entry.info.title.as_deref(), Some("new title"));
-            assert!(entry.is_alt_screen);
-            assert_eq!(entry.info.rows, Some(50));
-            assert_eq!(entry.info.cols, Some(120));
-        }
+            (
+                entry.info.title.clone(),
+                entry.is_alt_screen,
+                entry.info.rows,
+                entry.info.cols,
+            )
+        };
+        assert_eq!(title.as_deref(), Some("new title"));
+        assert!(is_alt_screen);
+        assert_eq!(rows, Some(50));
+        assert_eq!(cols, Some(120));
 
         let _ = shutdown_tx.send(()).await;
         let _ = server_handle.await;
@@ -1595,6 +1600,8 @@ mod tests {
 
     #[tokio::test]
     async fn status_update_ignores_unknown_panes() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
         let temp_dir = TempDir::new().unwrap();
         let socket_path = temp_dir.path().join("test.sock");
 
@@ -1621,7 +1628,6 @@ mod tests {
         let request_json = serde_json::to_string(&request).unwrap();
 
         let mut stream = UnixStream::connect(&socket_path).await.unwrap();
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         stream.write_all(request_json.as_bytes()).await.unwrap();
         stream.write_all(b"\n").await.unwrap();
         stream.flush().await.unwrap();
@@ -1636,17 +1642,17 @@ mod tests {
 
         // Response should indicate pane was unknown
         let data = response.data.unwrap();
-        assert_eq!(data.get("processed").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            data.get("processed").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
         assert_eq!(
             data.get("reason").and_then(|v| v.as_str()),
             Some("unknown_pane")
         );
 
         // Registry should still be empty
-        {
-            let reg = registry.read().await;
-            assert!(reg.is_empty());
-        }
+        assert!(registry.read().await.is_empty());
 
         let _ = shutdown_tx.send(()).await;
         let _ = server_handle.await;
@@ -1657,6 +1663,7 @@ mod tests {
         use crate::config::{PaneFilterConfig, PaneFilterRule};
         use crate::ingest::PaneRegistry;
         use crate::wezterm::PaneInfo;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
         let temp_dir = TempDir::new().unwrap();
         let socket_path = temp_dir.path().join("test.sock");
@@ -1723,7 +1730,6 @@ mod tests {
         let request_json = serde_json::to_string(&request).unwrap();
 
         let mut stream = UnixStream::connect(&socket_path).await.unwrap();
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         stream.write_all(request_json.as_bytes()).await.unwrap();
         stream.write_all(b"\n").await.unwrap();
         stream.flush().await.unwrap();
@@ -1738,7 +1744,10 @@ mod tests {
 
         // Response should indicate pane was ignored
         let data = response.data.unwrap();
-        assert_eq!(data.get("processed").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            data.get("processed").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
         assert_eq!(
             data.get("reason").and_then(|v| v.as_str()),
             Some("pane_ignored")

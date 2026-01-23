@@ -376,6 +376,18 @@ enum RobotCommands {
     Approve {
         /// The approval code (8-character alphanumeric)
         code: String,
+
+        /// Target pane ID for fingerprint validation (optional)
+        #[arg(long)]
+        pane: Option<u64>,
+
+        /// Expected action fingerprint (optional)
+        #[arg(long)]
+        fingerprint: Option<String>,
+
+        /// Check approval status without consuming
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -839,9 +851,26 @@ struct RobotApproveData {
     #[serde(skip_serializing_if = "Option::is_none")]
     consumed_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     action_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug)]
+struct RobotApproveError {
+    code: &'static str,
+    message: String,
+    hint: Option<String>,
+}
+
+impl RobotApproveError {
+    fn new(code: &'static str, message: impl Into<String>, hint: Option<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            hint,
+        }
+    }
 }
 
 /// Robot workflow list response data (matches wa-robot-workflow-list.json schema)
@@ -910,33 +939,225 @@ fn redact_for_output(text: &str) -> String {
     REDACTOR.redact(text)
 }
 
+async fn evaluate_robot_approve(
+    storage: &wa_core::storage::StorageHandle,
+    workspace_id: &str,
+    code: &str,
+    pane: Option<u64>,
+    fingerprint: Option<&str>,
+    dry_run: bool,
+) -> Result<RobotApproveData, RobotApproveError> {
+    let code_hash = wa_core::approval::hash_allow_once_code(code);
+
+    let token = match storage.get_approval_token(&code_hash).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return Err(RobotApproveError::new(
+                "E_APPROVAL_NOT_FOUND",
+                format!("No approval found with code: {code}"),
+                Some(
+                    "Approval codes are issued when policy requires approval. \
+                     Check that you have the correct code."
+                        .to_string(),
+                ),
+            ));
+        }
+        Err(e) => {
+            return Err(RobotApproveError::new(
+                ROBOT_ERR_STORAGE,
+                format!("Failed to look up approval: {e}"),
+                None,
+            ));
+        }
+    };
+
+    // Workspace scope check (explicit to provide E_WRONG_WORKSPACE)
+    if token.workspace_id != workspace_id {
+        return Err(RobotApproveError::new(
+            "E_WRONG_WORKSPACE",
+            format!(
+                "Approval code is scoped to workspace '{}', but current workspace is '{}'",
+                token.workspace_id, workspace_id
+            ),
+            Some("Use the approval code in the workspace where it was issued.".to_string()),
+        ));
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    if token.used_at.is_some() {
+        return Err(RobotApproveError::new(
+            "E_APPROVAL_CONSUMED",
+            "Approval code has already been used".to_string(),
+            Some(
+                "Approval codes can only be used once. Request a new approval if needed."
+                    .to_string(),
+            ),
+        ));
+    }
+
+    if token.expires_at < now_ms {
+        return Err(RobotApproveError::new(
+            "E_APPROVAL_EXPIRED",
+            format!(
+                "Approval code expired at {} (now: {})",
+                token.expires_at, now_ms
+            ),
+            Some(
+                "Approval codes have a limited validity period. Request a new approval."
+                    .to_string(),
+            ),
+        ));
+    }
+
+    if let Some(expected_pane) = pane {
+        if token.pane_id != Some(expected_pane) {
+            return Err(RobotApproveError::new(
+                "E_WRONG_PANE",
+                format!(
+                    "Approval was for pane {:?}, but --pane {} was specified",
+                    token.pane_id, expected_pane
+                ),
+                Some("Use the correct pane ID or omit --pane.".to_string()),
+            ));
+        }
+    }
+
+    if let Some(expected_fingerprint) = fingerprint {
+        if token.action_fingerprint != expected_fingerprint {
+            return Err(RobotApproveError::new(
+                "E_FINGERPRINT_MISMATCH",
+                "Approval fingerprint does not match the requested action".to_string(),
+                Some(
+                    "The approval was issued for a different action. Request a new approval."
+                        .to_string(),
+                ),
+            ));
+        }
+    }
+
+    if dry_run {
+        return Ok(RobotApproveData {
+            code: code.to_string(),
+            valid: true,
+            action_kind: Some(token.action_kind),
+            pane_id: token.pane_id,
+            expires_at: Some(token.expires_at as u64),
+            consumed_at: None,
+            action_fingerprint: Some(token.action_fingerprint),
+            dry_run: Some(true),
+        });
+    }
+
+    let consumed_token = match storage
+        .consume_approval_token_by_code(&code_hash, workspace_id)
+        .await
+    {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return Err(RobotApproveError::new(
+                "E_APPROVAL_CONSUMED",
+                "Approval code was consumed by another process".to_string(),
+                Some(
+                    "The approval was valid but consumed between validation and consumption. \
+                     This is a race condition."
+                        .to_string(),
+                ),
+            ));
+        }
+        Err(e) => {
+            return Err(RobotApproveError::new(
+                ROBOT_ERR_STORAGE,
+                format!("Failed to consume approval: {e}"),
+                None,
+            ));
+        }
+    };
+
+    let consumed_at = consumed_token.used_at.unwrap_or(now_ms);
+
+    let audit = wa_core::storage::AuditActionRecord {
+        id: 0,
+        ts: consumed_at,
+        actor_kind: "robot".to_string(),
+        actor_id: None,
+        pane_id: consumed_token.pane_id,
+        domain: None,
+        action_kind: "approve_allow_once".to_string(),
+        policy_decision: "allow".to_string(),
+        decision_reason: Some("Robot submitted approval code".to_string()),
+        rule_id: None,
+        input_summary: Some(format!(
+            "wa robot approve {} for {} pane {:?}",
+            code, consumed_token.action_kind, consumed_token.pane_id
+        )),
+        verification_summary: Some(format!(
+            "code_hash={}, fingerprint={}",
+            code_hash, consumed_token.action_fingerprint
+        )),
+        decision_context: None,
+        result: "success".to_string(),
+    };
+
+    if let Err(e) = storage.record_audit_action_redacted(audit).await {
+        tracing::warn!("Failed to record approval audit: {e}");
+    }
+
+    Ok(RobotApproveData {
+        code: code.to_string(),
+        valid: true,
+        action_kind: Some(consumed_token.action_kind),
+        pane_id: consumed_token.pane_id,
+        expires_at: Some(consumed_token.expires_at as u64),
+        consumed_at: Some(consumed_at as u64),
+        action_fingerprint: Some(consumed_token.action_fingerprint),
+        dry_run: None,
+    })
+}
+
 fn build_send_dry_run_report(
     command_ctx: &wa_core::dry_run::CommandContext,
     pane_id: u64,
+    pane_info: Option<&wa_core::wezterm::PaneInfo>,
     text: &str,
     no_paste: bool,
     wait_for: Option<&str>,
     timeout_secs: u64,
+    config: &wa_core::config::Config,
 ) -> wa_core::dry_run::DryRunReport {
     use wa_core::dry_run::{
         TargetResolution, build_send_policy_evaluation, create_send_action, create_wait_for_action,
     };
+    use wa_core::policy::PaneCapabilities;
 
     let mut ctx = command_ctx.dry_run_context();
 
-    // Target resolution (simulated for now)
-    ctx.set_target(
-        TargetResolution::new(pane_id, "local")
-            .with_title("(pane title)")
-            .with_cwd("(current directory)"),
-    );
+    // Target resolution (best-effort)
+    if let Some(info) = pane_info {
+        let mut target =
+            TargetResolution::new(pane_id, info.inferred_domain()).with_is_active(info.is_active);
+        if let Some(title) = &info.title {
+            target = target.with_title(title.clone());
+        }
+        if let Some(cwd) = &info.cwd {
+            target = target.with_cwd(cwd.clone());
+        }
+        ctx.set_target(target);
+    } else {
+        ctx.set_target(TargetResolution::new(pane_id, "unknown"));
+        ctx.add_warning("Pane metadata unavailable; ensure WezTerm is running and pane exists.");
+    }
 
-    // Policy evaluation (simulated values)
+    // Policy evaluation (best-effort; uses config defaults + assumed prompt state)
+    let capabilities = PaneCapabilities::prompt();
     let eval = build_send_policy_evaluation(
-        (2, 30), // rate limit status
-        true,    // is_prompt_active
-        true,    // require_prompt_active
-        false,   // has_recent_gaps
+        (0, config.safety.rate_limit_per_pane),
+        capabilities.prompt_active,
+        config.safety.require_prompt_active,
+        capabilities.has_recent_gap,
     );
     ctx.set_policy_evaluation(eval);
 
@@ -1206,7 +1427,9 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 name: "workflow abort",
                 args: "<execution_id> [--reason \"<reason>\"]",
                 summary: "Abort a running workflow",
-                examples: vec!["wa robot workflow abort robot-handle_compaction-1234567890 --reason \"User requested\""],
+                examples: vec![
+                    "wa robot workflow abort robot-handle_compaction-1234567890 --reason \"User requested\"",
+                ],
             },
             QuickStartCommand {
                 name: "why",
@@ -1219,9 +1442,12 @@ fn build_robot_quick_start() -> RobotQuickStartData {
             },
             QuickStartCommand {
                 name: "approve",
-                args: "<code>",
+                args: "<code> [--pane <id>] [--dry-run] [--fingerprint <hash>]",
                 summary: "Submit an approval code for a pending action",
-                examples: vec!["wa robot approve ABC12345"],
+                examples: vec![
+                    "wa robot approve ABC12345",
+                    "wa robot approve ABC12345 --dry-run",
+                ],
             },
             QuickStartCommand {
                 name: "help",
@@ -1915,13 +2141,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 wa_core::dry_run::CommandContext::new(command, dry_run);
 
                             if command_ctx.is_dry_run() {
+                                let wezterm = wa_core::wezterm::WeztermClient::new();
+                                let pane_info = wezterm.get_pane(pane_id).await.ok();
                                 let report = build_send_dry_run_report(
                                     &command_ctx,
                                     pane_id,
+                                    pane_info.as_ref(),
                                     &text,
                                     false,
                                     wait_for.as_deref(),
                                     timeout_secs,
+                                    &config,
                                 );
                                 let response =
                                     RobotResponse::success(report.redacted(), elapsed_ms(start));
@@ -2503,10 +2733,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     // Handle dry-run mode
                                     if dry_run {
-                                        let command_ctx =
-                                            wa_core::dry_run::CommandContext::new("workflow run", true);
-                                        let report =
-                                            build_workflow_dry_run_report(&command_ctx, &name, pane_id);
+                                        let command_ctx = wa_core::dry_run::CommandContext::new(
+                                            "workflow run",
+                                            true,
+                                        );
+                                        let report = build_workflow_dry_run_report(
+                                            &command_ctx,
+                                            &name,
+                                            pane_id,
+                                        );
                                         let response =
                                             RobotResponse::success(report, elapsed_ms(start));
                                         println!("{}", serde_json::to_string_pretty(&response)?);
@@ -2612,8 +2847,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         let execution_id = format!("robot-{name}-{now_ms}");
 
                                         // Run the workflow
-                                        let result =
-                                            runner.run_workflow(pane_id, wf, &execution_id, 0).await;
+                                        let result = runner
+                                            .run_workflow(pane_id, wf, &execution_id, 0)
+                                            .await;
 
                                         let (
                                             status,
@@ -2723,9 +2959,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     // Clean shutdown of storage
                                     if let Err(e) = storage.shutdown().await {
-                                        tracing::warn!(
-                                            "Failed to shutdown storage cleanly: {e}"
-                                        );
+                                        tracing::warn!("Failed to shutdown storage cleanly: {e}");
                                     }
                                 }
                                 RobotWorkflowCommands::List => {
@@ -2820,11 +3054,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                             if let Some(tmpl) = get_explanation(&code) {
                                 // Extract category from code (e.g., "deny.alt_screen" -> "deny")
-                                let category = code
-                                    .split('.')
-                                    .next()
-                                    .unwrap_or("unknown")
-                                    .to_string();
+                                let category =
+                                    code.split('.').next().unwrap_or("unknown").to_string();
 
                                 let data = RobotWhyData {
                                     code: code.clone(),
@@ -2865,36 +3096,86 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         available[..available.len().min(10)].join(", ")
                                     )
                                 };
-                                let response =
-                                    RobotResponse::<RobotWhyData>::error_with_code(
-                                        "robot.code_not_found",
-                                        format!("Unknown error code: {code}"),
-                                        Some(hint),
-                                        elapsed_ms(start),
-                                    );
+                                let response = RobotResponse::<RobotWhyData>::error_with_code(
+                                    "robot.code_not_found",
+                                    format!("Unknown error code: {code}"),
+                                    Some(hint),
+                                    elapsed_ms(start),
+                                );
                                 println!("{}", serde_json::to_string_pretty(&response)?);
                             }
                         }
-                        RobotCommands::Approve { code } => {
-                            // Approval token consumption requires running daemon
-                            // For now, return not-implemented
-                            let response =
-                                RobotResponse::<RobotApproveData>::error_with_code(
-                                    "robot.not_implemented",
-                                    format!(
-                                        "Approval code submission not yet implemented \
-                                         (code: {code})"
-                                    ),
-                                    Some(
-                                        "Approval tokens are issued by the daemon when a \
-                                         'RequireApproval' policy decision is made. This \
-                                         command will consume and validate those tokens in a \
-                                         future release."
-                                            .to_string(),
-                                    ),
-                                    elapsed_ms(start),
-                                );
-                            println!("{}", serde_json::to_string_pretty(&response)?);
+                        RobotCommands::Approve {
+                            code,
+                            pane,
+                            fingerprint,
+                            dry_run,
+                        } => {
+                            // Get workspace layout for db path and workspace_id
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<RobotApproveData>::error_with_code(
+                                            ROBOT_ERR_CONFIG,
+                                            format!("Failed to get workspace layout: {e}"),
+                                            Some("Check --workspace or WA_WORKSPACE".to_string()),
+                                            elapsed_ms(start),
+                                        );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    return Ok(());
+                                }
+                            };
+
+                            // Open storage handle
+                            let db_path = layout.db_path.to_string_lossy();
+                            let storage = match wa_core::storage::StorageHandle::new(&db_path).await
+                            {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<RobotApproveData>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to open storage: {e}"),
+                                            Some(
+                                                "Is the database initialized? Run 'wa watch' first."
+                                                    .to_string(),
+                                            ),
+                                            elapsed_ms(start),
+                                        );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    return Ok(());
+                                }
+                            };
+
+                            // Get workspace ID for scoping
+                            let workspace_id = layout.root.to_string_lossy().to_string();
+
+                            match evaluate_robot_approve(
+                                &storage,
+                                &workspace_id,
+                                &code,
+                                pane,
+                                fingerprint.as_deref(),
+                                dry_run,
+                            )
+                            .await
+                            {
+                                Ok(data) => {
+                                    let response = RobotResponse::success(data, elapsed_ms(start));
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                }
+                                Err(err) => {
+                                    let response =
+                                        RobotResponse::<RobotApproveData>::error_with_code(
+                                            err.code,
+                                            err.message,
+                                            err.hint,
+                                            elapsed_ms(start),
+                                        );
+                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                }
+                            }
                         }
                         RobotCommands::Help | RobotCommands::QuickStart => {
                             unreachable!("handled above")
@@ -3061,8 +3342,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let command_ctx = wa_core::dry_run::CommandContext::new(command, dry_run);
 
             if command_ctx.is_dry_run() {
-                let report =
-                    build_send_dry_run_report(&command_ctx, pane_id, &text, no_paste, None, 30);
+                let wezterm = wa_core::wezterm::WeztermClient::new();
+                let pane_info = wezterm.get_pane(pane_id).await.ok();
+                let report = build_send_dry_run_report(
+                    &command_ctx,
+                    pane_id,
+                    pane_info.as_ref(),
+                    &text,
+                    no_paste,
+                    None,
+                    30,
+                    &config,
+                );
                 println!("{}", wa_core::dry_run::format_human(&report));
             } else {
                 tracing::info!(
@@ -3923,6 +4214,58 @@ fn parse_toml_value(value: &str) -> toml_edit::Item {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wa_core::approval::hash_allow_once_code;
+    use wa_core::storage::{ApprovalTokenRecord, StorageHandle};
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    async fn setup_storage(label: &str) -> (StorageHandle, String) {
+        let temp_dir = std::env::temp_dir();
+        let unique = now_ms();
+        let db_path = temp_dir.join(format!(
+            "wa_robot_approve_{label}_{}_{}.db",
+            std::process::id(),
+            unique
+        ));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let storage = StorageHandle::new(&db_path_str).await.unwrap();
+        (storage, db_path_str)
+    }
+
+    async fn cleanup_storage(storage: StorageHandle, db_path: &str) {
+        let _ = storage.shutdown().await;
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+    }
+
+    async fn insert_token(
+        storage: &StorageHandle,
+        workspace_id: &str,
+        code: &str,
+        pane_id: Option<u64>,
+        expires_at: i64,
+        used_at: Option<i64>,
+        fingerprint: &str,
+    ) {
+        let token = ApprovalTokenRecord {
+            id: 0,
+            code_hash: hash_allow_once_code(code),
+            created_at: now_ms(),
+            expires_at,
+            used_at,
+            workspace_id: workspace_id.to_string(),
+            action_kind: "send_text".to_string(),
+            pane_id,
+            action_fingerprint: fingerprint.to_string(),
+        };
+        storage.insert_approval_token(token).await.unwrap();
+    }
 
     #[test]
     fn structured_uservar_name_detection() {
@@ -3951,5 +4294,248 @@ mod tests {
         let name = "wa_event";
         let value = "eyJraW5kIjoicHJvbXB0In0="; // {"kind":"prompt"}
         assert!(validate_uservar_request(1, name, value).is_ok());
+    }
+
+    #[tokio::test]
+    async fn robot_approve_valid_code_consumes() {
+        let (storage, db_path) = setup_storage("valid").await;
+        let workspace_id = "ws-valid";
+        let code = "ABC12345";
+        let fingerprint = "sha256:valid";
+        let expires_at = now_ms() + 60_000;
+
+        insert_token(
+            &storage,
+            workspace_id,
+            code,
+            Some(5),
+            expires_at,
+            None,
+            fingerprint,
+        )
+        .await;
+
+        let data = evaluate_robot_approve(
+            &storage,
+            workspace_id,
+            code,
+            Some(5),
+            Some(fingerprint),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(data.valid);
+        assert_eq!(data.code, code);
+        assert_eq!(data.pane_id, Some(5));
+        assert!(data.consumed_at.is_some());
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn robot_approve_dry_run_does_not_consume() {
+        let (storage, db_path) = setup_storage("dry_run").await;
+        let workspace_id = "ws-dry";
+        let code = "DRY12345";
+        let fingerprint = "sha256:dry";
+        let expires_at = now_ms() + 60_000;
+
+        insert_token(
+            &storage,
+            workspace_id,
+            code,
+            Some(1),
+            expires_at,
+            None,
+            fingerprint,
+        )
+        .await;
+
+        let data = evaluate_robot_approve(
+            &storage,
+            workspace_id,
+            code,
+            Some(1),
+            Some(fingerprint),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(data.dry_run, Some(true));
+        assert!(data.consumed_at.is_none());
+
+        let data2 = evaluate_robot_approve(
+            &storage,
+            workspace_id,
+            code,
+            Some(1),
+            Some(fingerprint),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(data2.consumed_at.is_some());
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn robot_approve_expired_code() {
+        let (storage, db_path) = setup_storage("expired").await;
+        let workspace_id = "ws-expired";
+        let code = "EXP12345";
+        let fingerprint = "sha256:expired";
+
+        insert_token(
+            &storage,
+            workspace_id,
+            code,
+            Some(2),
+            now_ms() - 1,
+            None,
+            fingerprint,
+        )
+        .await;
+
+        let err = evaluate_robot_approve(
+            &storage,
+            workspace_id,
+            code,
+            Some(2),
+            Some(fingerprint),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, "E_APPROVAL_EXPIRED");
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn robot_approve_consumed_code() {
+        let (storage, db_path) = setup_storage("consumed").await;
+        let workspace_id = "ws-consumed";
+        let code = "CON12345";
+        let fingerprint = "sha256:consumed";
+        let used_at = now_ms() - 10;
+
+        insert_token(
+            &storage,
+            workspace_id,
+            code,
+            Some(3),
+            now_ms() + 60_000,
+            Some(used_at),
+            fingerprint,
+        )
+        .await;
+
+        let err = evaluate_robot_approve(
+            &storage,
+            workspace_id,
+            code,
+            Some(3),
+            Some(fingerprint),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, "E_APPROVAL_CONSUMED");
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn robot_approve_wrong_pane() {
+        let (storage, db_path) = setup_storage("wrong_pane").await;
+        let workspace_id = "ws-pane";
+        let code = "PANE1234";
+        let fingerprint = "sha256:pane";
+        let expires_at = now_ms() + 60_000;
+
+        insert_token(
+            &storage,
+            workspace_id,
+            code,
+            Some(9),
+            expires_at,
+            None,
+            fingerprint,
+        )
+        .await;
+
+        let err = evaluate_robot_approve(
+            &storage,
+            workspace_id,
+            code,
+            Some(7),
+            Some(fingerprint),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, "E_WRONG_PANE");
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn robot_approve_wrong_workspace() {
+        let (storage, db_path) = setup_storage("wrong_ws").await;
+        let code = "WS123456";
+        let fingerprint = "sha256:ws";
+        let expires_at = now_ms() + 60_000;
+
+        insert_token(&storage, "ws-a", code, None, expires_at, None, fingerprint).await;
+
+        let err = evaluate_robot_approve(&storage, "ws-b", code, None, Some(fingerprint), false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, "E_WRONG_WORKSPACE");
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn robot_approve_fingerprint_mismatch() {
+        let (storage, db_path) = setup_storage("fingerprint").await;
+        let workspace_id = "ws-fp";
+        let code = "FP123456";
+        let expires_at = now_ms() + 60_000;
+
+        insert_token(
+            &storage,
+            workspace_id,
+            code,
+            Some(4),
+            expires_at,
+            None,
+            "sha256:expected",
+        )
+        .await;
+
+        let err = evaluate_robot_approve(
+            &storage,
+            workspace_id,
+            code,
+            Some(4),
+            Some("sha256:other"),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, "E_FINGERPRINT_MISMATCH");
+
+        cleanup_storage(storage, &db_path).await;
     }
 }

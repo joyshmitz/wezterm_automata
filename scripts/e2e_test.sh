@@ -333,6 +333,9 @@ SCENARIO_REGISTRY=(
     "compaction_workflow:Validate pattern detection and workflow execution"
     "policy_denial:Validate safety gates block sends to protected panes"
     "graceful_shutdown:Validate wa watch graceful shutdown (SIGINT flush, lock release, restart clean)"
+    "pane_exclude_filter:Validate pane selection filters protect privacy (ignored pane absent from search)"
+    "workspace_isolation:Validate workspace isolation (no cross-project DB leakage)"
+    "uservar_forwarding:Validate user-var forwarding lane (wezterm.lua -> wa event -> watcher)"
 )
 
 list_scenarios() {
@@ -1183,6 +1186,681 @@ run_scenario_graceful_shutdown() {
     return $result
 }
 
+# ==============================================================================
+# Scenario: pane_exclude_filter
+# ==============================================================================
+# Tests that pane exclude filters prevent capture of matching panes.
+# - Spawns an "observed" pane that prints OBSERVED_TOKEN
+# - Spawns an "ignored" pane with title "IGNORED_PANE" that prints SECRET_TOKEN
+# - Asserts observed pane is searchable, ignored is NOT
+# - Asserts wa status shows ignored pane with exclude reason
+# - Asserts SECRET_TOKEN never appears in any artifacts (privacy guarantee)
+
+run_scenario_pane_exclude_filter() {
+    local scenario_dir="$1"
+    local observed_marker="OBSERVED_TOKEN_$(date +%s%N)"
+    local secret_token="SECRET_TOKEN_$(date +%s%N)"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-XXXXXX)
+    local wa_pid=""
+    local observed_pane_id=""
+    local ignored_pane_id=""
+    local result=0
+
+    log_info "Using observed marker: $observed_marker"
+    log_info "Using secret token: $secret_token"
+    log_info "Workspace: $temp_workspace"
+
+    # Setup environment for isolated wa instance
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    # Copy pane exclude config
+    local exclude_config="$PROJECT_ROOT/fixtures/e2e/config_pane_exclude.toml"
+    if [[ -f "$exclude_config" ]]; then
+        cp "$exclude_config" "$temp_workspace/wa.toml"
+        export WA_CONFIG="$temp_workspace/wa.toml"
+        log_verbose "Using exclude config: $exclude_config"
+    else
+        log_fail "Pane exclude config not found: $exclude_config"
+        return 1
+    fi
+
+    # Record tokens for artifact verification
+    echo "observed_marker: $observed_marker" >> "$scenario_dir/scenario.log"
+    echo "secret_token: $secret_token" >> "$scenario_dir/scenario.log"
+
+    # Cleanup function
+    cleanup_pane_exclude_filter() {
+        log_verbose "Cleaning up pane_exclude_filter scenario"
+        # Kill wa watch if running (use :- to avoid unbound variable with set -u)
+        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            log_verbose "Stopping wa watch (pid $wa_pid)"
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        # Close observed pane if it exists
+        if [[ -n "${observed_pane_id:-}" ]]; then
+            log_verbose "Closing observed pane $observed_pane_id"
+            wezterm cli kill-pane --pane-id "$observed_pane_id" 2>/dev/null || true
+        fi
+        # Close ignored pane if it exists
+        if [[ -n "${ignored_pane_id:-}" ]]; then
+            log_verbose "Closing ignored pane $ignored_pane_id"
+            wezterm cli kill-pane --pane-id "$ignored_pane_id" 2>/dev/null || true
+        fi
+        # Copy artifacts before cleanup (use :- to avoid unbound variable with set -u)
+        if [[ -d "${temp_workspace:-}" ]]; then
+            cp -r "${temp_workspace}/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "${temp_workspace}/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "${temp_workspace:-}"
+    }
+    trap cleanup_pane_exclude_filter EXIT
+
+    # Step 1: Spawn the OBSERVED pane (standard dummy_print.sh)
+    log_info "Step 1: Spawning observed pane..."
+    local dummy_script="$PROJECT_ROOT/fixtures/e2e/dummy_print.sh"
+    if [[ ! -x "$dummy_script" ]]; then
+        log_fail "Dummy print script not found or not executable: $dummy_script"
+        return 1
+    fi
+
+    local spawn_output
+    # Run dummy_print.sh then sleep to keep pane alive for observation
+    spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- bash -c "'$dummy_script' '$observed_marker' 50; sleep 300" 2>&1)
+    observed_pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+
+    if [[ -z "$observed_pane_id" ]]; then
+        log_fail "Failed to spawn observed pane"
+        echo "Spawn output: $spawn_output" >> "$scenario_dir/scenario.log"
+        return 1
+    fi
+    log_info "Spawned observed pane: $observed_pane_id"
+    echo "observed_pane_id: $observed_pane_id" >> "$scenario_dir/scenario.log"
+
+    # Step 2: Spawn the IGNORED pane (dummy_ignored_pane.sh with title matching exclude rule)
+    log_info "Step 2: Spawning ignored pane (title=IGNORED_PANE)..."
+    local ignored_script="$PROJECT_ROOT/fixtures/e2e/dummy_ignored_pane.sh"
+    if [[ ! -x "$ignored_script" ]]; then
+        log_fail "Ignored pane script not found or not executable: $ignored_script"
+        return 1
+    fi
+
+    spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- bash "$ignored_script" "$secret_token" 50 2>&1)
+    ignored_pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+
+    if [[ -z "$ignored_pane_id" ]]; then
+        log_fail "Failed to spawn ignored pane"
+        echo "Spawn output: $spawn_output" >> "$scenario_dir/scenario.log"
+        return 1
+    fi
+    log_info "Spawned ignored pane: $ignored_pane_id"
+    echo "ignored_pane_id: $ignored_pane_id" >> "$scenario_dir/scenario.log"
+
+    # Give time for title change to propagate
+    sleep 2
+
+    # Step 3: Start wa watch in background with custom config
+    log_info "Step 3: Starting wa watch with exclude config..."
+    "$WA_BINARY" watch --foreground --config "$temp_workspace/wa.toml" \
+        > "$scenario_dir/wa_watch.log" 2>&1 &
+    wa_pid=$!
+    log_verbose "wa watch started with PID $wa_pid"
+    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    # Give wa watch a moment to initialize
+    sleep 2
+
+    # Verify wa watch is running
+    if ! kill -0 "$wa_pid" 2>/dev/null; then
+        log_fail "wa watch exited immediately"
+        return 1
+    fi
+
+    # Step 4a: Wait for observed pane to appear in robot state
+    log_info "Step 4a: Waiting for observed pane to be observed..."
+    local wait_timeout=${TIMEOUT:-60}
+    local check_observed_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $observed_pane_id)' >/dev/null 2>&1"
+
+    if ! wait_for_condition "observed pane $observed_pane_id in robot state" "$check_observed_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for observed pane to appear in robot state"
+        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        return 1
+    fi
+    log_pass "Observed pane detected in robot state"
+
+    # Step 4b: Wait for observed content to be searchable (proves FTS indexing works)
+    log_info "Step 4b: Waiting for observed content to be searchable..."
+    # Search for the observed marker - check total_hits > 0
+    local check_search_cmd="\"$WA_BINARY\" robot search \"$observed_marker\" 2>/dev/null | jq -e '.data.total_hits > 0' >/dev/null 2>&1"
+
+    if ! wait_for_condition "observed content searchable" "$check_search_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for observed content to be searchable"
+        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        "$WA_BINARY" robot search "$observed_marker" > "$scenario_dir/search_debug.json" 2>&1 || true
+        return 1
+    fi
+    log_pass "Observed content captured and searchable"
+
+    # Capture robot state (while watcher is still running)
+    "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+
+    # Step 5: Assert OBSERVED_TOKEN is searchable (watcher still running for IPC)
+    log_info "Step 5: Asserting observed token is searchable..."
+    local search_output
+    search_output=$("$WA_BINARY" robot search "$observed_marker" 2>&1)
+    echo "$search_output" > "$scenario_dir/search_observed.json"
+
+    local observed_count
+    observed_count=$(echo "$search_output" | jq -r '.data.total_hits // .data.total // 0' 2>/dev/null || echo "0")
+
+    if [[ "$observed_count" -gt 0 ]]; then
+        log_pass "Observed token found in search ($observed_count results)"
+    else
+        log_fail "Observed token NOT found in search"
+        result=1
+    fi
+
+    # Step 6: Assert SECRET_TOKEN is NOT searchable (privacy guarantee)
+    log_info "Step 6: Asserting secret token is NOT searchable..."
+    search_output=$("$WA_BINARY" robot search "$secret_token" 2>&1)
+    echo "$search_output" > "$scenario_dir/search_secret.json"
+
+    local secret_count
+    secret_count=$(echo "$search_output" | jq -r '.data.total_hits // .data.total // 0' 2>/dev/null || echo "0")
+
+    if [[ "$secret_count" -eq 0 ]]; then
+        log_pass "Secret token correctly NOT found in search"
+    else
+        log_fail "SECRET TOKEN FOUND IN SEARCH - PRIVACY VIOLATION!"
+        result=1
+    fi
+
+    # Step 7: Stop wa watch gracefully (after search tests complete)
+    log_info "Step 7: Stopping wa watch..."
+    kill -TERM "$wa_pid" 2>/dev/null || true
+    wait "$wa_pid" 2>/dev/null || true
+    wa_pid=""
+
+    # Step 8: Assert SECRET_TOKEN never appears in any captured data files
+    log_info "Step 8: Scanning captured data for secret token leakage..."
+
+    # Copy all wa data artifacts first (database, logs, segments)
+    cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+
+    # Search for leaks in captured data - exclude our own test harness files:
+    # - scenario.log: intentionally contains tokens for debugging
+    # - search_*.json: contains search queries (not search results finding the token)
+    local leaked_files
+    leaked_files=$(grep -rl "$secret_token" "$scenario_dir" \
+        --exclude="scenario.log" \
+        --exclude="search_*.json" \
+        2>/dev/null || true)
+
+    if [[ -z "$leaked_files" ]]; then
+        log_pass "Secret token not found in any captured data"
+    else
+        log_fail "SECRET TOKEN LEAKED IN CAPTURED DATA:"
+        echo "$leaked_files" | while read -r file; do
+            log_fail "  - $file"
+        done
+        result=1
+    fi
+
+    # Step 9: Check robot state shows ignored pane was filtered (informational)
+    log_info "Step 9: Checking status output for exclude reason..."
+
+    # This is informational - we check robot state for pane visibility
+    local state_output
+    state_output=$(cat "$scenario_dir/robot_state.json" 2>/dev/null || echo "{}")
+
+    # Check if ignored pane appears in state with any exclusion indicator
+    # (Implementation may vary - this is advisory logging)
+    local ignored_in_state
+    ignored_in_state=$(echo "$state_output" | jq -e ".data[]? | select(.pane_id == $ignored_pane_id)" 2>/dev/null || true)
+
+    if [[ -z "$ignored_in_state" ]]; then
+        log_pass "Ignored pane correctly absent from robot state"
+    else
+        # Check if it has an exclusion reason
+        local exclude_reason
+        exclude_reason=$(echo "$ignored_in_state" | jq -r '.exclude_reason // .ignored_reason // empty' 2>/dev/null || true)
+        if [[ -n "$exclude_reason" ]]; then
+            log_pass "Ignored pane present with exclude reason: $exclude_reason"
+        else
+            log_warn "Ignored pane present in state without clear exclude reason"
+        fi
+    fi
+
+    # Cleanup
+    trap - EXIT
+    cleanup_pane_exclude_filter
+
+    return $result
+}
+
+run_scenario_workspace_isolation() {
+    local scenario_dir="$1"
+    local token_a="WORKSPACE_TOKEN_A_$(date +%s%N)"
+    local token_b="WORKSPACE_TOKEN_B_$(date +%s%N)"
+    local workspace_a
+    local workspace_b
+    workspace_a=$(mktemp -d /tmp/wa-e2e-a-XXXXXX)
+    workspace_b=$(mktemp -d /tmp/wa-e2e-b-XXXXXX)
+    local wa_pid=""
+    local pane_a_id=""
+    local pane_b_id=""
+    local result=0
+
+    log_info "Workspace A token: $token_a"
+    log_info "Workspace B token: $token_b"
+    log_info "Workspace A: $workspace_a"
+    log_info "Workspace B: $workspace_b"
+
+    mkdir -p "$workspace_a/.wa" "$workspace_b/.wa"
+
+    echo "workspace_a: $workspace_a" >> "$scenario_dir/scenario.log"
+    echo "workspace_b: $workspace_b" >> "$scenario_dir/scenario.log"
+    echo "token_a: $token_a" >> "$scenario_dir/scenario.log"
+    echo "token_b: $token_b" >> "$scenario_dir/scenario.log"
+
+    cleanup_workspace_isolation() {
+        log_verbose "Cleaning up workspace_isolation scenario"
+        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            log_verbose "Stopping wa watch (pid $wa_pid)"
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        if [[ -n "${pane_a_id:-}" ]]; then
+            log_verbose "Closing workspace A pane $pane_a_id"
+            wezterm cli kill-pane --pane-id "$pane_a_id" 2>/dev/null || true
+        fi
+        if [[ -n "${pane_b_id:-}" ]]; then
+            log_verbose "Closing workspace B pane $pane_b_id"
+            wezterm cli kill-pane --pane-id "$pane_b_id" 2>/dev/null || true
+        fi
+
+        if [[ -d "${workspace_a:-}" ]]; then
+            mkdir -p "$scenario_dir/workspace_a"
+            cp -r "$workspace_a/.wa"/* "$scenario_dir/workspace_a/" 2>/dev/null || true
+        fi
+        if [[ -d "${workspace_b:-}" ]]; then
+            mkdir -p "$scenario_dir/workspace_b"
+            cp -r "$workspace_b/.wa"/* "$scenario_dir/workspace_b/" 2>/dev/null || true
+        fi
+
+        if [[ "${WA_E2E_PRESERVE_TEMP:-}" == "1" ]]; then
+            log_warn "Preserving temp workspaces (WA_E2E_PRESERVE_TEMP=1)"
+        else
+            rm -rf "${workspace_a:-}" "${workspace_b:-}"
+        fi
+    }
+    trap cleanup_workspace_isolation EXIT
+
+    # Step 1: Spawn workspace A pane
+    log_info "Step 1: Spawning workspace A pane..."
+    local dummy_script="$PROJECT_ROOT/fixtures/e2e/dummy_print.sh"
+    if [[ ! -x "$dummy_script" ]]; then
+        log_fail "Dummy print script not found or not executable: $dummy_script"
+        return 1
+    fi
+
+    local spawn_output
+    spawn_output=$(wezterm cli spawn --cwd "$workspace_a" -- bash -c "'$dummy_script' '$token_a' 80; sleep 300" 2>&1)
+    pane_a_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+
+    if [[ -z "$pane_a_id" ]]; then
+        log_fail "Failed to spawn workspace A pane"
+        echo "Spawn output: $spawn_output" >> "$scenario_dir/scenario.log"
+        return 1
+    fi
+    log_info "Spawned workspace A pane: $pane_a_id"
+    echo "pane_a_id: $pane_a_id" >> "$scenario_dir/scenario.log"
+
+    # Step 2: Start wa watch for workspace A
+    log_info "Step 2: Starting wa watch for workspace A..."
+    WA_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+        "$WA_BINARY" watch --foreground \
+        > "$scenario_dir/wa_watch_a.log" 2>&1 &
+    wa_pid=$!
+    log_verbose "wa watch (A) started with PID $wa_pid"
+    echo "wa_pid_a: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    sleep 2
+    if ! kill -0 "$wa_pid" 2>/dev/null; then
+        log_fail "wa watch (A) exited immediately"
+        return 1
+    fi
+
+    # Step 3: Wait for workspace A pane to be observed
+    log_info "Step 3: Waiting for workspace A pane to be observed..."
+    local wait_timeout=${TIMEOUT:-60}
+    local check_observed_a="WA_LOG_LEVEL=error WA_WORKSPACE=\"$workspace_a\" WA_DATA_DIR=\"$workspace_a/.wa\" \"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_a_id)' >/dev/null 2>&1"
+
+    if ! wait_for_condition "workspace A pane observed" "$check_observed_a" "$wait_timeout"; then
+        log_fail "Timeout waiting for workspace A pane to be observed"
+        WA_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+            "$WA_BINARY" robot state > "$scenario_dir/robot_state_a.json" 2>&1 || true
+        return 1
+    fi
+    log_pass "Workspace A pane observed"
+
+    # Step 4: Wait for token A to be searchable in workspace A
+    log_info "Step 4: Waiting for token A to be searchable..."
+    local check_search_a="WA_LOG_LEVEL=error WA_WORKSPACE=\"$workspace_a\" WA_DATA_DIR=\"$workspace_a/.wa\" \"$WA_BINARY\" robot search \"$token_a\" 2>/dev/null | jq -e '.data.total_hits > 0' >/dev/null 2>&1"
+    if ! wait_for_condition "token A searchable" "$check_search_a" "$wait_timeout"; then
+        log_fail "Timeout waiting for token A to be searchable"
+        WA_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+            "$WA_BINARY" robot search "$token_a" > "$scenario_dir/search_a.json" 2>&1 || true
+        return 1
+    fi
+    log_pass "Token A searchable in workspace A"
+
+    WA_LOG_LEVEL=error WA_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+        "$WA_BINARY" robot state > "$scenario_dir/robot_state_a.json" 2>&1 || true
+    WA_LOG_LEVEL=error WA_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+        "$WA_BINARY" robot search "$token_a" > "$scenario_dir/search_a.json" 2>&1 || true
+    WA_LOG_LEVEL=error WA_WORKSPACE="$workspace_a" WA_DATA_DIR="$workspace_a/.wa" \
+        "$WA_BINARY" config show --effective --json > "$scenario_dir/config_effective_a.json" 2>&1 || true
+
+    # Step 5: Stop wa watch for workspace A
+    log_info "Step 5: Stopping wa watch for workspace A..."
+    kill -TERM "$wa_pid" 2>/dev/null || true
+    wait "$wa_pid" 2>/dev/null || true
+    wa_pid=""
+
+    # Step 6: Spawn workspace B pane
+    log_info "Step 6: Spawning workspace B pane..."
+    spawn_output=$(wezterm cli spawn --cwd "$workspace_b" -- bash -c "'$dummy_script' '$token_b' 80; sleep 300" 2>&1)
+    pane_b_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+
+    if [[ -z "$pane_b_id" ]]; then
+        log_fail "Failed to spawn workspace B pane"
+        echo "Spawn output: $spawn_output" >> "$scenario_dir/scenario.log"
+        return 1
+    fi
+    log_info "Spawned workspace B pane: $pane_b_id"
+    echo "pane_b_id: $pane_b_id" >> "$scenario_dir/scenario.log"
+
+    # Step 7: Start wa watch for workspace B
+    log_info "Step 7: Starting wa watch for workspace B..."
+    WA_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+        "$WA_BINARY" watch --foreground \
+        > "$scenario_dir/wa_watch_b.log" 2>&1 &
+    wa_pid=$!
+    log_verbose "wa watch (B) started with PID $wa_pid"
+    echo "wa_pid_b: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    sleep 2
+    if ! kill -0 "$wa_pid" 2>/dev/null; then
+        log_fail "wa watch (B) exited immediately"
+        return 1
+    fi
+
+    # Step 8: Wait for workspace B pane to be observed
+    log_info "Step 8: Waiting for workspace B pane to be observed..."
+    local check_observed_b="WA_LOG_LEVEL=error WA_WORKSPACE=\"$workspace_b\" WA_DATA_DIR=\"$workspace_b/.wa\" \"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_b_id)' >/dev/null 2>&1"
+
+    if ! wait_for_condition "workspace B pane observed" "$check_observed_b" "$wait_timeout"; then
+        log_fail "Timeout waiting for workspace B pane to be observed"
+        WA_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+            "$WA_BINARY" robot state > "$scenario_dir/robot_state_b.json" 2>&1 || true
+        return 1
+    fi
+    log_pass "Workspace B pane observed"
+
+    # Step 9: Wait for token B to be searchable in workspace B
+    log_info "Step 9: Waiting for token B to be searchable..."
+    local check_search_b="WA_LOG_LEVEL=error WA_WORKSPACE=\"$workspace_b\" WA_DATA_DIR=\"$workspace_b/.wa\" \"$WA_BINARY\" robot search \"$token_b\" 2>/dev/null | jq -e '.data.total_hits > 0' >/dev/null 2>&1"
+    if ! wait_for_condition "token B searchable" "$check_search_b" "$wait_timeout"; then
+        log_fail "Timeout waiting for token B to be searchable"
+        WA_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+            "$WA_BINARY" robot search "$token_b" > "$scenario_dir/search_b.json" 2>&1 || true
+        return 1
+    fi
+    log_pass "Token B searchable in workspace B"
+
+    WA_LOG_LEVEL=error WA_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+        "$WA_BINARY" robot state > "$scenario_dir/robot_state_b.json" 2>&1 || true
+    WA_LOG_LEVEL=error WA_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+        "$WA_BINARY" robot search "$token_b" > "$scenario_dir/search_b.json" 2>&1 || true
+    WA_LOG_LEVEL=error WA_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+        "$WA_BINARY" config show --effective --json > "$scenario_dir/config_effective_b.json" 2>&1 || true
+
+    # Step 10: Assert token A is NOT searchable in workspace B
+    log_info "Step 10: Asserting token A is NOT searchable in workspace B..."
+    local search_output_ba
+    search_output_ba=$(WA_LOG_LEVEL=error WA_WORKSPACE="$workspace_b" WA_DATA_DIR="$workspace_b/.wa" \
+        "$WA_BINARY" robot search "$token_a" 2>&1)
+    echo "$search_output_ba" > "$scenario_dir/search_a_in_b.json"
+
+    local token_a_hits
+    token_a_hits=$(echo "$search_output_ba" | jq -r '.data.total_hits // .data.total // 0' 2>/dev/null || echo "0")
+    if [[ "$token_a_hits" -eq 0 ]]; then
+        log_pass "Token A not found in workspace B (isolation OK)"
+    else
+        log_fail "Token A found in workspace B ($token_a_hits hits) - isolation broken"
+        result=1
+    fi
+
+    # Step 11: Stop wa watch for workspace B
+    log_info "Step 11: Stopping wa watch for workspace B..."
+    kill -TERM "$wa_pid" 2>/dev/null || true
+    wait "$wa_pid" 2>/dev/null || true
+    wa_pid=""
+
+    # Step 12: Verify derived paths differ between workspaces
+    log_info "Step 12: Verifying workspace paths are distinct..."
+    local db_a
+    local db_b
+    db_a=$(jq -r '.paths.db_path // empty' "$scenario_dir/config_effective_a.json" 2>/dev/null || echo "")
+    db_b=$(jq -r '.paths.db_path // empty' "$scenario_dir/config_effective_b.json" 2>/dev/null || echo "")
+
+    echo "db_path_a: $db_a" >> "$scenario_dir/scenario.log"
+    echo "db_path_b: $db_b" >> "$scenario_dir/scenario.log"
+
+    if [[ -n "$db_a" && -n "$db_b" ]]; then
+        if [[ "$db_a" != "$db_b" ]]; then
+            log_pass "Workspace db paths are distinct"
+        else
+            log_fail "Workspace db paths are identical (expected distinct)"
+            result=1
+        fi
+    else
+        log_fail "Could not parse db paths from effective config"
+        result=1
+    fi
+
+    trap - EXIT
+    cleanup_workspace_isolation
+
+    return $result
+}
+
+run_scenario_uservar_forwarding() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-uservar-XXXXXX)
+    local wa_pid=""
+    local wezterm_pid=""
+    local pane_id=""
+    local result=0
+    local wezterm_class="wa-e2e-uservar-$(date +%s%N)"
+    local uservar_name="wa_event"
+    local payload_json
+    payload_json=$(printf '{"type":"e2e_uservar","ts":%s}' "$(date +%s)")
+    local payload_b64
+    payload_b64=$(printf '%s' "$payload_json" | base64 | tr -d '\n')
+    local config_file="$temp_workspace/wezterm.lua"
+    local emit_script="$temp_workspace/emit_uservar.sh"
+    local wait_timeout=${TIMEOUT:-60}
+
+    log_info "User-var name: $uservar_name"
+    log_info "User-var payload: $payload_json"
+    log_info "WezTerm class: $wezterm_class"
+    log_info "Workspace: $temp_workspace"
+
+    mkdir -p "$temp_workspace/.wa"
+
+    echo "workspace: $temp_workspace" >> "$scenario_dir/scenario.log"
+    echo "wezterm_class: $wezterm_class" >> "$scenario_dir/scenario.log"
+    echo "uservar_name: $uservar_name" >> "$scenario_dir/scenario.log"
+    echo "payload_json: $payload_json" >> "$scenario_dir/scenario.log"
+
+    cleanup_uservar_forwarding() {
+        log_verbose "Cleaning up uservar_forwarding scenario"
+        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            log_verbose "Stopping wa watch (pid $wa_pid)"
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        if [[ -n "${pane_id:-}" ]]; then
+            log_verbose "Closing uservar pane $pane_id"
+            wezterm cli --no-auto-start --class "$wezterm_class" kill-pane \
+                --pane-id "$pane_id" 2>/dev/null || true
+        fi
+        if [[ -n "${wezterm_pid:-}" ]] && kill -0 "$wezterm_pid" 2>/dev/null; then
+            log_verbose "Stopping wezterm (pid $wezterm_pid)"
+            kill "$wezterm_pid" 2>/dev/null || true
+            wait "$wezterm_pid" 2>/dev/null || true
+        fi
+        if [[ -d "${temp_workspace:-}" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$config_file" "$scenario_dir/wezterm.lua" 2>/dev/null || true
+        fi
+        rm -rf "${temp_workspace:-}"
+    }
+    trap cleanup_uservar_forwarding EXIT
+
+    # Step 1: Write a minimal wezterm.lua that forwards user-var events to wa
+    log_info "Step 1: Writing wezterm.lua forwarding snippet..."
+    cat > "$config_file" <<'EOF'
+local wezterm = require 'wezterm'
+local wa_bin = os.getenv("WA_E2E_WA_BINARY") or "wa"
+
+wezterm.on('user-var-changed', function(window, pane, name, value)
+  if not name or name == "" then
+    return
+  end
+  local pane_id = tostring(pane:pane_id())
+  wezterm.background_child_process {
+    wa_bin,
+    "event",
+    "--from-uservar",
+    "--pane",
+    pane_id,
+    "--name",
+    name,
+    "--value",
+    value,
+  }
+end)
+
+return {}
+EOF
+
+    # Step 2: Start a dedicated wezterm instance with the forwarding config
+    log_info "Step 2: Starting wezterm with forwarding config..."
+    WA_E2E_WA_BINARY="$WA_BINARY" wezterm --config-file "$config_file" start \
+        --always-new-process --class "$wezterm_class" --workspace "wa-e2e-uservar" \
+        > "$scenario_dir/wezterm.log" 2>&1 &
+    wezterm_pid=$!
+    echo "wezterm_pid: $wezterm_pid" >> "$scenario_dir/scenario.log"
+
+    local check_mux_cmd="wezterm cli --no-auto-start --class \"$wezterm_class\" list >/dev/null 2>&1"
+    if ! wait_for_condition "wezterm mux ready" "$check_mux_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for wezterm mux"
+        result=1
+        return $result
+    fi
+    log_pass "WezTerm mux ready"
+
+    # Step 3: Start wa watch with debug logging
+    log_info "Step 3: Starting wa watch..."
+    WA_WORKSPACE="$temp_workspace" WA_DATA_DIR="$temp_workspace/.wa" WA_LOG_LEVEL=debug \
+        "$WA_BINARY" watch --foreground \
+        > "$scenario_dir/wa_watch.log" 2>&1 &
+    wa_pid=$!
+    log_verbose "wa watch started with PID $wa_pid"
+    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    sleep 2
+    if ! kill -0 "$wa_pid" 2>/dev/null; then
+        log_fail "wa watch exited immediately"
+        result=1
+        return $result
+    fi
+
+    # Step 4: Create a temporary script to emit the user-var
+    log_info "Step 4: Preparing user-var emitter script..."
+    cat > "$emit_script" <<'EOS'
+#!/bin/bash
+set -euo pipefail
+name="$1"
+payload="$2"
+sleep_time="${3:-120}"
+printf '\033]1337;SetUserVar=%s=%s\007' "$name" "$payload"
+echo "USERVAR_SENT name=$name"
+sleep "$sleep_time"
+EOS
+    chmod +x "$emit_script"
+
+    # Step 5: Spawn a pane that emits the user-var
+    log_info "Step 5: Spawning pane to emit user-var..."
+    local spawn_output
+    spawn_output=$(wezterm cli --no-auto-start --class "$wezterm_class" spawn \
+        --cwd "$temp_workspace" -- "$emit_script" "$uservar_name" "$payload_b64" 120 2>&1)
+    pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+
+    if [[ -z "$pane_id" ]]; then
+        log_fail "Failed to spawn uservar pane"
+        echo "Spawn output: $spawn_output" >> "$scenario_dir/scenario.log"
+        result=1
+        return $result
+    fi
+    log_info "Spawned uservar pane: $pane_id"
+    echo "pane_id: $pane_id" >> "$scenario_dir/scenario.log"
+
+    # Step 6: Wait for wa watch to record the forwarded user-var event
+    log_info "Step 6: Waiting for forwarded user-var event..."
+    local check_event_cmd="grep -q \"Published user-var event\" \"$scenario_dir/wa_watch.log\""
+    if ! wait_for_condition "user-var forwarded to watcher" "$check_event_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for user-var forwarding"
+        tail -200 "$scenario_dir/wa_watch.log" >> "$scenario_dir/scenario.log" 2>/dev/null || true
+        result=1
+    else
+        log_pass "User-var forwarded and received by watcher"
+    fi
+
+    # Step 7: Malformed payload should be rejected (validation check)
+    log_info "Step 7: Verifying malformed payload is rejected..."
+    local invalid_output=""
+    local invalid_exit=0
+    set +e
+    invalid_output=$(WA_WORKSPACE="$temp_workspace" WA_DATA_DIR="$temp_workspace/.wa" \
+        "$WA_BINARY" event --from-uservar --pane "${pane_id:-0}" \
+        --name "$uservar_name" --value "invalid_base64" 2>&1)
+    invalid_exit=$?
+    set -e
+
+    echo "$invalid_output" > "$scenario_dir/wa_event_invalid.log"
+    echo "invalid_exit: $invalid_exit" >> "$scenario_dir/scenario.log"
+
+    if [[ "$invalid_exit" -ne 0 ]]; then
+        log_pass "Malformed payload rejected"
+    else
+        log_fail "Malformed payload unexpectedly accepted"
+        result=1
+    fi
+
+    trap - EXIT
+    cleanup_uservar_forwarding
+
+    return $result
+}
+
 run_scenario() {
     local name="$1"
     local scenario_num="$2"
@@ -1207,6 +1885,15 @@ run_scenario() {
             ;;
         graceful_shutdown)
             run_scenario_graceful_shutdown "$scenario_dir" || result=$?
+            ;;
+        pane_exclude_filter)
+            run_scenario_pane_exclude_filter "$scenario_dir" || result=$?
+            ;;
+        workspace_isolation)
+            run_scenario_workspace_isolation "$scenario_dir" || result=$?
+            ;;
+        uservar_forwarding)
+            run_scenario_uservar_forwarding "$scenario_dir" || result=$?
             ;;
         *)
             log_fail "Unknown scenario: $name"

@@ -242,24 +242,23 @@ impl RuleDef {
     pub fn interpolate_template(
         template: &str,
         pane_id: u64,
-        event_id: Option<i64>,
+        event_id_value: Option<i64>,
         agent_type: &AgentType,
-        rule_id: &str,
+        rule_id_value: &str,
     ) -> String {
         template
             .replace("{pane}", &pane_id.to_string())
-            .replace("{event_id}", &event_id.map_or_else(|| "unknown".to_string(), |id| id.to_string()))
+            .replace(
+                "{event_id}",
+                &event_id_value.map_or_else(|| "unknown".to_string(), |id| id.to_string()),
+            )
             .replace("{agent}", &agent_type.to_string())
-            .replace("{rule_id}", rule_id)
+            .replace("{rule_id}", rule_id_value)
     }
 
     /// Get the interpolated preview command for this rule.
     #[must_use]
-    pub fn get_preview_command(
-        &self,
-        pane_id: u64,
-        event_id: Option<i64>,
-    ) -> Option<String> {
+    pub fn get_preview_command(&self, pane_id: u64, event_id: Option<i64>) -> Option<String> {
         self.preview_command.as_ref().map(|cmd| {
             Self::interpolate_template(cmd, pane_id, event_id, &self.agent_type, &self.id)
         })
@@ -267,11 +266,7 @@ impl RuleDef {
 
     /// Get the interpolated manual fix instructions for this rule.
     #[must_use]
-    pub fn get_manual_fix(
-        &self,
-        pane_id: u64,
-        event_id: Option<i64>,
-    ) -> Option<String> {
+    pub fn get_manual_fix(&self, pane_id: u64, event_id: Option<i64>) -> Option<String> {
         self.manual_fix.as_ref().map(|fix| {
             Self::interpolate_template(fix, pane_id, event_id, &self.agent_type, &self.id)
         })
@@ -1149,33 +1144,35 @@ impl PatternEngine {
                 .unwrap_or_default();
 
             if let Some(regex) = compiled.regex.as_ref() {
-                let Ok(Some(captures)) = regex.captures(text) else {
-                    continue;
-                };
+                for capture_result in regex.captures_iter(text) {
+                    let Ok(captures) = capture_result else {
+                        continue;
+                    };
 
-                let mut extracted = serde_json::Map::new();
-                for name in regex.capture_names().flatten() {
-                    if let Some(value) = captures.name(name) {
-                        extracted.insert(
-                            name.to_string(),
-                            serde_json::Value::String(value.as_str().to_string()),
-                        );
+                    let mut extracted = serde_json::Map::new();
+                    for name in regex.capture_names().flatten() {
+                        if let Some(value) = captures.name(name) {
+                            extracted.insert(
+                                name.to_string(),
+                                serde_json::Value::String(value.as_str().to_string()),
+                            );
+                        }
                     }
+
+                    let matched_text = captures
+                        .get(0)
+                        .map_or_else(|| fallback_anchor.clone(), |m| m.as_str().to_string());
+
+                    detections.push(Detection {
+                        rule_id: rule.id.clone(),
+                        agent_type: rule.agent_type,
+                        event_type: rule.event_type.clone(),
+                        severity: rule.severity,
+                        confidence: 0.95,
+                        extracted: serde_json::Value::Object(extracted),
+                        matched_text,
+                    });
                 }
-
-                let matched_text = captures
-                    .get(0)
-                    .map_or_else(|| fallback_anchor.clone(), |m| m.as_str().to_string());
-
-                detections.push(Detection {
-                    rule_id: rule.id.clone(),
-                    agent_type: rule.agent_type,
-                    event_type: rule.event_type.clone(),
-                    severity: rule.severity,
-                    confidence: 0.95,
-                    extracted: serde_json::Value::Object(extracted),
-                    matched_text,
-                });
             } else {
                 detections.push(Detection {
                     rule_id: rule.id.clone(),

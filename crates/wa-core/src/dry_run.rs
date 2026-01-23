@@ -609,7 +609,12 @@ pub fn build_send_policy_evaluation(
 
     // Rate limit check
     let (current, limit) = rate_limit_status;
-    if current < limit {
+    if limit == 0 {
+        eval.add_check(PolicyCheck::passed(
+            "rate_limit",
+            "Rate limit disabled".to_string(),
+        ));
+    } else if current < limit {
         eval.add_check(PolicyCheck::passed(
             "rate_limit",
             format!("{current}/{limit} sends in last minute (within budget)"),

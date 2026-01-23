@@ -5121,4 +5121,514 @@ mod tests {
         assert!(workflow.idle_timeout_ms > 0);
         assert!(workflow.idle_timeout_ms > workflow.stabilization_ms);
     }
+
+    // ========================================================================
+    // HandleCompaction Integration Tests (wa-nu4.1.2.4)
+    // ========================================================================
+    //
+    // These tests verify the full workflow execution path with synthetic
+    // detections and various pane states.
+
+    /// Test: Synthetic compaction detection + PromptActive state
+    /// Expected: Workflow proceeds through guards → step logs show completion path
+    #[test]
+    fn handle_compaction_integration_prompt_active_passes_guards() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_hc_integration.db")
+            .to_string_lossy()
+            .to_string();
+
+        rt.block_on(async {
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+
+            // Create PromptActive capabilities (pane is ready for input)
+            let prompt_caps = PaneCapabilities {
+                alt_screen: Some(false),
+                command_running: false,
+                has_recent_gap: false,
+                ..Default::default()
+            };
+
+            let execution_id = "test-hc-prompt-active-001";
+            let pane_id = 42u64;
+
+            // Create context with PromptActive state
+            let ctx =
+                WorkflowContext::new(storage.clone(), pane_id, prompt_caps.clone(), execution_id);
+
+            // Verify guards pass for PromptActive state
+            let guard_result = HandleCompaction::check_pane_guards(&ctx);
+            assert!(
+                guard_result.is_ok(),
+                "Guard check should pass for PromptActive state, got: {:?}",
+                guard_result
+            );
+
+            // Create synthetic compaction detection
+            let detection = Detection {
+                rule_id: "claude_code.compaction".to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: "session.compaction".to_string(),
+                severity: Severity::Info,
+                confidence: 1.0,
+                extracted: serde_json::json!({
+                    "tokens_before": 150_000,
+                    "tokens_after": 25_000
+                }),
+                matched_text: "Auto-compact: compacted 150,000 tokens to 25,000 tokens".to_string(),
+            };
+
+            // Verify HandleCompaction handles this detection
+            let workflow = HandleCompaction::new();
+            assert!(
+                workflow.handles(&detection),
+                "HandleCompaction should handle compaction detections"
+            );
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    /// Test: AltScreen active state causes workflow abort
+    /// Expected: Guard check fails with "alt-screen" in error message
+    #[test]
+    fn handle_compaction_integration_alt_screen_aborts() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_hc_altscreen.db")
+            .to_string_lossy()
+            .to_string();
+
+        rt.block_on(async {
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+
+            // Create AltScreen capabilities (vim, less, htop, etc.)
+            let alt_screen_caps = PaneCapabilities {
+                alt_screen: Some(true),
+                command_running: false,
+                has_recent_gap: false,
+                ..Default::default()
+            };
+
+            let execution_id = "test-hc-altscreen-001";
+            let pane_id = 42u64;
+
+            let ctx = WorkflowContext::new(storage.clone(), pane_id, alt_screen_caps, execution_id);
+
+            // Verify guards fail for AltScreen state
+            let guard_result = HandleCompaction::check_pane_guards(&ctx);
+            assert!(
+                guard_result.is_err(),
+                "Guard check should fail for AltScreen state"
+            );
+
+            // Verify error message is actionable (contains "alt-screen")
+            let err = guard_result.unwrap_err();
+            assert!(
+                err.contains("alt-screen"),
+                "Error message should mention 'alt-screen' for actionable diagnosis, got: {}",
+                err
+            );
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    /// Test: Command running state causes workflow abort
+    /// Expected: Guard check fails with "running" in error message
+    #[test]
+    fn handle_compaction_integration_command_running_aborts() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_hc_cmdrunning.db")
+            .to_string_lossy()
+            .to_string();
+
+        rt.block_on(async {
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+
+            // Create capabilities where command is running
+            let running_caps = PaneCapabilities {
+                alt_screen: Some(false),
+                command_running: true,
+                has_recent_gap: false,
+                ..Default::default()
+            };
+
+            let execution_id = "test-hc-running-001";
+            let pane_id = 42u64;
+
+            let ctx = WorkflowContext::new(storage.clone(), pane_id, running_caps, execution_id);
+
+            // Verify guards fail
+            let guard_result = HandleCompaction::check_pane_guards(&ctx);
+            assert!(
+                guard_result.is_err(),
+                "Guard check should fail when command is running"
+            );
+
+            // Verify error message is actionable
+            let err = guard_result.unwrap_err();
+            assert!(
+                err.contains("running"),
+                "Error message should mention 'running' for actionable diagnosis, got: {}",
+                err
+            );
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    /// Test: Recent gap state causes workflow abort
+    /// Expected: Guard check fails with "gap" in error message
+    #[test]
+    fn handle_compaction_integration_recent_gap_aborts() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_hc_gap.db")
+            .to_string_lossy()
+            .to_string();
+
+        rt.block_on(async {
+            let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+
+            // Create capabilities with recent gap
+            let gap_caps = PaneCapabilities {
+                alt_screen: Some(false),
+                command_running: false,
+                has_recent_gap: true,
+                ..Default::default()
+            };
+
+            let execution_id = "test-hc-gap-001";
+            let pane_id = 42u64;
+
+            let ctx = WorkflowContext::new(storage.clone(), pane_id, gap_caps, execution_id);
+
+            // Verify guards fail
+            let guard_result = HandleCompaction::check_pane_guards(&ctx);
+            assert!(
+                guard_result.is_err(),
+                "Guard check should fail with recent gap"
+            );
+
+            // Verify error message is actionable
+            let err = guard_result.unwrap_err();
+            assert!(
+                err.contains("gap"),
+                "Error message should mention 'gap' for actionable diagnosis, got: {}",
+                err
+            );
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    /// Test: Verify step metadata is correct for handle_compaction
+    /// Expected: Steps array contains check_guards, stabilize, send_prompt, verify_send
+    #[test]
+    fn handle_compaction_step_metadata_complete() {
+        let workflow = HandleCompaction::new();
+        let steps = workflow.steps();
+
+        // Verify all expected steps are present
+        assert_eq!(steps.len(), 4, "HandleCompaction should have 4 steps");
+
+        // Verify step names are descriptive (for logging/debugging)
+        let step_names: Vec<&str> = steps.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            step_names.contains(&"check_guards"),
+            "Should have check_guards step"
+        );
+        assert!(
+            step_names.contains(&"stabilize"),
+            "Should have stabilize step"
+        );
+        assert!(
+            step_names.contains(&"send_prompt"),
+            "Should have send_prompt step"
+        );
+        assert!(
+            step_names.contains(&"verify_send"),
+            "Should have verify_send step"
+        );
+
+        // Verify step descriptions are non-empty (for actionable logging)
+        for step in &steps {
+            assert!(
+                !step.description.is_empty(),
+                "Step '{}' should have a description for actionable logging",
+                step.name
+            );
+        }
+    }
+
+    /// Test: Agent-specific prompt selection is deterministic
+    /// Expected: Each agent type gets a consistent, non-empty prompt
+    #[test]
+    fn handle_compaction_agent_prompt_selection_deterministic() {
+        // Test each agent type gets a deterministic prompt
+        let agents = vec![
+            (AgentType::ClaudeCode, compaction_prompts::CLAUDE_CODE),
+            (AgentType::Codex, compaction_prompts::CODEX),
+            (AgentType::Gemini, compaction_prompts::GEMINI),
+            (AgentType::Unknown, compaction_prompts::UNKNOWN),
+        ];
+
+        for (agent_type, expected_prompt) in agents {
+            // Verify prompt is non-empty
+            assert!(
+                !expected_prompt.is_empty(),
+                "Prompt for {:?} should not be empty",
+                agent_type
+            );
+
+            // Verify prompt contains AGENTS.md reference (except Unknown)
+            if agent_type != AgentType::Unknown {
+                assert!(
+                    expected_prompt.contains("AGENTS.md"),
+                    "Prompt for {:?} should reference AGENTS.md",
+                    agent_type
+                );
+            }
+
+            // Verify prompt ends with newline (for clean send)
+            assert!(
+                expected_prompt.ends_with('\n'),
+                "Prompt for {:?} should end with newline for clean send",
+                agent_type
+            );
+        }
+    }
+
+    /// Test: Workflow execution step 0 (check_guards) with PromptActive state
+    /// Expected: Step returns Continue (not Abort)
+    #[tokio::test]
+    async fn handle_compaction_execute_step0_prompt_active_continues() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_step0.db")
+            .to_string_lossy()
+            .to_string();
+
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+
+        // Create PromptActive capabilities
+        let prompt_caps = PaneCapabilities {
+            alt_screen: Some(false),
+            command_running: false,
+            has_recent_gap: false,
+            ..Default::default()
+        };
+
+        let mut ctx = WorkflowContext::new(storage.clone(), 42, prompt_caps, "test-step0-001");
+
+        let workflow = HandleCompaction::new();
+        let result = workflow.execute_step(&mut ctx, 0).await;
+
+        // Step 0 should return Continue for valid state
+        match result {
+            StepResult::Continue => {
+                // Success - guards passed
+            }
+            StepResult::Abort { reason } => {
+                panic!("Step 0 should not abort for PromptActive state: {}", reason);
+            }
+            other => {
+                panic!("Unexpected step result for step 0: {:?}", other);
+            }
+        }
+
+        storage.shutdown().await.unwrap();
+    }
+
+    /// Test: Workflow execution step 0 (check_guards) with AltScreen state
+    /// Expected: Step returns Abort with actionable reason
+    #[tokio::test]
+    async fn handle_compaction_execute_step0_alt_screen_aborts() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_step0_alt.db")
+            .to_string_lossy()
+            .to_string();
+
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+
+        // Create AltScreen capabilities
+        let alt_caps = PaneCapabilities {
+            alt_screen: Some(true),
+            command_running: false,
+            has_recent_gap: false,
+            ..Default::default()
+        };
+
+        let mut ctx = WorkflowContext::new(storage.clone(), 42, alt_caps, "test-step0-alt-001");
+
+        let workflow = HandleCompaction::new();
+        let result = workflow.execute_step(&mut ctx, 0).await;
+
+        // Step 0 should abort for AltScreen
+        match result {
+            StepResult::Abort { reason } => {
+                assert!(
+                    reason.contains("alt-screen"),
+                    "Abort reason should mention 'alt-screen': {}",
+                    reason
+                );
+            }
+            StepResult::Continue => {
+                panic!("Step 0 should abort for AltScreen state, got Continue");
+            }
+            other => {
+                panic!(
+                    "Unexpected step result for step 0 with AltScreen: {:?}",
+                    other
+                );
+            }
+        }
+
+        storage.shutdown().await.unwrap();
+    }
+
+    /// Test: Workflow execution step 1 (stabilize) returns WaitFor condition
+    /// Expected: Step returns WaitFor with PaneIdle condition
+    #[tokio::test]
+    async fn handle_compaction_execute_step1_returns_wait_for() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_step1.db")
+            .to_string_lossy()
+            .to_string();
+
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+
+        let prompt_caps = PaneCapabilities {
+            alt_screen: Some(false),
+            command_running: false,
+            has_recent_gap: false,
+            ..Default::default()
+        };
+
+        let mut ctx = WorkflowContext::new(storage.clone(), 42, prompt_caps, "test-step1-001");
+
+        let workflow = HandleCompaction::new();
+        let result = workflow.execute_step(&mut ctx, 1).await;
+
+        // Step 1 should return WaitFor with PaneIdle condition
+        match result {
+            StepResult::WaitFor { condition, .. } => {
+                // Verify it's waiting for pane idle
+                if let WaitCondition::PaneIdle {
+                    idle_threshold_ms, ..
+                } = condition
+                {
+                    assert!(idle_threshold_ms > 0, "Idle threshold should be positive");
+                } else {
+                    panic!("Step 1 should wait for PaneIdle, got: {:?}", condition);
+                }
+            }
+            other => {
+                panic!("Step 1 should return WaitFor, got: {:?}", other);
+            }
+        }
+
+        storage.shutdown().await.unwrap();
+    }
+
+    /// Test: Workflow execution step 2 (send_prompt) without injector
+    /// Expected: Step returns Abort (no injector configured)
+    #[tokio::test]
+    async fn handle_compaction_execute_step2_no_injector_aborts() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_step2_no_inj.db")
+            .to_string_lossy()
+            .to_string();
+
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+
+        let prompt_caps = PaneCapabilities {
+            alt_screen: Some(false),
+            command_running: false,
+            has_recent_gap: false,
+            ..Default::default()
+        };
+
+        // Create context WITHOUT injector
+        let mut ctx =
+            WorkflowContext::new(storage.clone(), 42, prompt_caps, "test-step2-no-inj-001");
+
+        let workflow = HandleCompaction::new();
+        let result = workflow.execute_step(&mut ctx, 2).await;
+
+        // Step 2 should abort without injector
+        match result {
+            StepResult::Abort { reason } => {
+                assert!(
+                    reason.to_lowercase().contains("injector"),
+                    "Abort reason should mention missing injector: {}",
+                    reason
+                );
+            }
+            other => {
+                panic!("Step 2 should abort without injector, got: {:?}", other);
+            }
+        }
+
+        storage.shutdown().await.unwrap();
+    }
+
+    /// Test: Unexpected step index returns Abort
+    /// Expected: Step indices >= step_count return Abort
+    #[tokio::test]
+    async fn handle_compaction_execute_invalid_step_aborts() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_invalid_step.db")
+            .to_string_lossy()
+            .to_string();
+
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+
+        let prompt_caps = PaneCapabilities::default();
+
+        let mut ctx =
+            WorkflowContext::new(storage.clone(), 42, prompt_caps, "test-invalid-step-001");
+
+        let workflow = HandleCompaction::new();
+
+        // Try to execute step beyond the workflow's steps
+        let invalid_step = workflow.step_count() + 1;
+        let result = workflow.execute_step(&mut ctx, invalid_step).await;
+
+        // Should abort for invalid step
+        match result {
+            StepResult::Abort { reason } => {
+                assert!(
+                    reason.contains("step") || reason.contains("index"),
+                    "Abort reason should mention invalid step: {}",
+                    reason
+                );
+            }
+            other => {
+                panic!("Invalid step should abort, got: {:?}", other);
+            }
+        }
+
+        storage.shutdown().await.unwrap();
+    }
 }

@@ -1427,7 +1427,8 @@ static GENERIC_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Generic password assignments (password=..., password: ...)
 static GENERIC_PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)password\s*[=:]\s*['"]?([^\s'"]{4,})['"]?"#).expect("Generic password regex")
+    Regex::new(r#"(?i)password\s*[=:]\s*(?:'[^']{4,}'|"[^"]{4,}"|[^\s'"]{4,})"#)
+        .expect("Generic password regex")
 });
 
 /// Generic secret assignments

@@ -6,7 +6,7 @@
 //! Performance budgets:
 //! - Watcher loop overhead (idle): **< 100µs per pane check**
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use wa_core::config::{PaneFilterConfig, PaneFilterRule};
 use wa_core::ingest::PaneFingerprint;
 use wa_core::wezterm::PaneInfo;
@@ -24,14 +24,23 @@ fn test_pane(pane_id: u64) -> PaneInfo {
         pane_id,
         tab_id: 1,
         window_id: 1,
-        domain_name: "local".to_string(),
-        title: "zsh".to_string(),
-        cwd: "/home/user/projects/wezterm_automata".to_string(),
+        domain_id: None,
+        domain_name: Some("local".to_string()),
+        workspace: None,
         size: None,
+        rows: None,
+        cols: None,
+        title: Some("zsh".to_string()),
+        cwd: Some("/home/user/projects/wezterm_automata".to_string()),
+        tty_name: None,
         cursor_x: Some(0),
         cursor_y: Some(24),
+        cursor_visibility: None,
+        left_col: None,
+        top_row: None,
         is_active: true,
         is_zoomed: false,
+        extra: std::collections::HashMap::new(),
     }
 }
 
@@ -142,7 +151,11 @@ fn bench_pane_check_combined(c: &mut Criterion) {
     // Budget: < 100µs total
     group.bench_function("filter_and_fingerprint", |b| {
         b.iter(|| {
-            let _excluded = filter.check_pane(&pane.domain_name, &pane.title, &pane.cwd);
+            let _excluded = filter.check_pane(
+                pane.domain_name.as_deref().unwrap_or("local"),
+                pane.title.as_deref().unwrap_or(""),
+                pane.cwd.as_deref().unwrap_or(""),
+            );
             let _fp = PaneFingerprint::new(&pane, Some(content));
         });
     });
@@ -152,7 +165,11 @@ fn bench_pane_check_combined(c: &mut Criterion) {
     group.bench_function("check_10_panes", |b| {
         b.iter(|| {
             for pane in &panes {
-                let _excluded = filter.check_pane(&pane.domain_name, &pane.title, &pane.cwd);
+                let _excluded = filter.check_pane(
+                    pane.domain_name.as_deref().unwrap_or("local"),
+                    pane.title.as_deref().unwrap_or(""),
+                    pane.cwd.as_deref().unwrap_or(""),
+                );
                 let _fp = PaneFingerprint::without_content(pane);
             }
         });
@@ -166,7 +183,11 @@ fn bench_pane_check_combined(c: &mut Criterion) {
         |b, panes| {
             b.iter(|| {
                 for pane in panes {
-                    let _excluded = filter.check_pane(&pane.domain_name, &pane.title, &pane.cwd);
+                    let _excluded = filter.check_pane(
+                        pane.domain_name.as_deref().unwrap_or("local"),
+                        pane.title.as_deref().unwrap_or(""),
+                        pane.cwd.as_deref().unwrap_or(""),
+                    );
                     let _fp = PaneFingerprint::without_content(pane);
                 }
             });

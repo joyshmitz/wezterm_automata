@@ -76,11 +76,13 @@ pub fn generate_pane_uuid(domain: &str, pane_id: u64, created_at: i64) -> String
 
 /// Encode bytes as lowercase hex string
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 // =============================================================================
@@ -446,15 +448,25 @@ impl PaneCursor {
 
         // Check for alt-screen changes before delta extraction
         let alt_screen_changes = detect_alt_screen_changes(current_snapshot);
-        let had_alt_screen_change = !alt_screen_changes.is_empty();
+        
+        // Determine if an actual state transition occurred relative to current state
+        let mut simulated_state = self.in_alt_screen;
+        let mut actual_transition_occurred = false;
 
-        // Update alt-screen tracking based on final state
         for change in &alt_screen_changes {
-            match change {
-                AltScreenChange::Entered => self.in_alt_screen = true,
-                AltScreenChange::Exited => self.in_alt_screen = false,
+            let new_state = match change {
+                AltScreenChange::Entered => true,
+                AltScreenChange::Exited => false,
+            };
+            
+            if new_state != simulated_state {
+                simulated_state = new_state;
+                actual_transition_occurred = true;
             }
         }
+        
+        // Update final state
+        self.in_alt_screen = simulated_state;
 
         let delta = extract_delta(&self.last_snapshot, current_snapshot, overlap_size);
 
@@ -464,7 +476,7 @@ impl PaneCursor {
 
         // If alt-screen changed, force a gap even if delta extraction succeeded
         // because the content relationship is broken
-        if had_alt_screen_change {
+        if actual_transition_occurred {
             self.in_gap = true;
             let seq = self.next_seq;
             self.next_seq = self.next_seq.saturating_add(1);

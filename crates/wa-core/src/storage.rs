@@ -926,6 +926,18 @@ enum WriteCommand {
         action_fingerprint: String,
         respond: oneshot::Sender<Result<Option<ApprovalTokenRecord>>>,
     },
+    /// Get an approval token by code hash (without consuming)
+    GetApprovalTokenByCode {
+        code_hash: String,
+        workspace_id: String,
+        respond: oneshot::Sender<Result<Option<ApprovalTokenRecord>>>,
+    },
+    /// Consume an approval token by code hash only (without fingerprint validation)
+    ConsumeApprovalTokenByCode {
+        code_hash: String,
+        workspace_id: String,
+        respond: oneshot::Sender<Result<Option<ApprovalTokenRecord>>>,
+    },
     /// Record a maintenance event
     RecordMaintenance {
         record: MaintenanceRecord,
@@ -1299,6 +1311,46 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
     }
 
+    /// Get an approval token by code hash (without consuming)
+    pub async fn get_approval_token_by_code(
+        &self,
+        code_hash: &str,
+        workspace_id: &str,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::GetApprovalTokenByCode {
+                code_hash: code_hash.to_string(),
+                workspace_id: workspace_id.to_string(),
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Consume an approval token by code hash only (without fingerprint validation)
+    pub async fn consume_approval_token_by_code(
+        &self,
+        code_hash: &str,
+        workspace_id: &str,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::ConsumeApprovalTokenByCode {
+                code_hash: code_hash.to_string(),
+                workspace_id: workspace_id.to_string(),
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
     /// Upsert a pane record
     pub async fn upsert_pane(&self, pane: PaneRecord) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -1568,6 +1620,25 @@ impl StorageHandle {
             })?;
 
             query_active_approvals_count(&conn, &workspace_id, now_ms)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Look up an approval token by code hash (without consuming it)
+    ///
+    /// Returns the token record if found, regardless of whether it's expired or consumed.
+    /// Use this for validation and dry-run checks.
+    pub async fn get_approval_token(&self, code_hash: &str) -> Result<Option<ApprovalTokenRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+        let code_hash = code_hash.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_approval_token_by_hash(&conn, &code_hash)
         })
         .await
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
@@ -1876,6 +1947,22 @@ fn writer_loop(conn: &mut Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
                     pane_id,
                     &action_fingerprint,
                 );
+                let _ = respond.send(result);
+            }
+            WriteCommand::GetApprovalTokenByCode {
+                code_hash,
+                workspace_id,
+                respond,
+            } => {
+                let result = get_approval_token_by_code_sync(conn, &code_hash, &workspace_id);
+                let _ = respond.send(result);
+            }
+            WriteCommand::ConsumeApprovalTokenByCode {
+                code_hash,
+                workspace_id,
+                respond,
+            } => {
+                let result = consume_approval_token_by_code_sync(conn, &code_hash, &workspace_id);
                 let _ = respond.send(result);
             }
             WriteCommand::RecordMaintenance { record, respond } => {
@@ -2440,6 +2527,107 @@ fn consume_approval_token_sync(
         })?;
 
         stmt.query_row(rusqlite::params_from_iter(params), |row| {
+            Ok(ApprovalTokenRecord {
+                id: row.get(0)?,
+                code_hash: row.get(1)?,
+                created_at: row.get(2)?,
+                expires_at: row.get(3)?,
+                used_at: row.get(4)?,
+                workspace_id: row.get(5)?,
+                action_kind: row.get(6)?,
+                pane_id: {
+                    let val: Option<i64> = row.get(7)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    val.map(|v| v as u64)
+                },
+                action_fingerprint: row.get(8)?,
+            })
+        })
+        .optional()
+        .map_err(|e| StorageError::Database(format!("Approval query failed: {e}")))?
+    };
+
+    if let Some(mut record) = record {
+        tx.execute(
+            "UPDATE approval_tokens SET used_at = ?1 WHERE id = ?2",
+            params![now, record.id],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to consume approval token: {e}")))?;
+        record.used_at = Some(now);
+        tx.commit()
+            .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
+        return Ok(Some(record));
+    }
+
+    tx.commit()
+        .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
+    Ok(None)
+}
+
+/// Get an approval token by code hash without consuming it (synchronous)
+fn get_approval_token_by_code_sync(
+    conn: &Connection,
+    code_hash: &str,
+    workspace_id: &str,
+) -> Result<Option<ApprovalTokenRecord>> {
+    let sql = "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
+               pane_id, action_fingerprint
+               FROM approval_tokens
+               WHERE code_hash = ?
+                 AND workspace_id = ?
+               LIMIT 1";
+
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| StorageError::Database(format!("Failed to prepare approval query: {e}")))?;
+
+    stmt.query_row([code_hash, workspace_id], |row| {
+        Ok(ApprovalTokenRecord {
+            id: row.get(0)?,
+            code_hash: row.get(1)?,
+            created_at: row.get(2)?,
+            expires_at: row.get(3)?,
+            used_at: row.get(4)?,
+            workspace_id: row.get(5)?,
+            action_kind: row.get(6)?,
+            pane_id: {
+                let val: Option<i64> = row.get(7)?;
+                #[allow(clippy::cast_sign_loss)]
+                val.map(|v| v as u64)
+            },
+            action_fingerprint: row.get(8)?,
+        })
+    })
+    .optional()
+    .map_err(|e| StorageError::Database(format!("Approval query failed: {e}")).into())
+}
+
+/// Consume an approval token by code hash only, without fingerprint validation (synchronous)
+fn consume_approval_token_by_code_sync(
+    conn: &mut Connection,
+    code_hash: &str,
+    workspace_id: &str,
+) -> Result<Option<ApprovalTokenRecord>> {
+    let now = now_ms();
+    let tx = conn
+        .transaction()
+        .map_err(|e| StorageError::Database(format!("Failed to start transaction: {e}")))?;
+
+    let sql = "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
+               pane_id, action_fingerprint
+               FROM approval_tokens
+               WHERE code_hash = ?
+                 AND workspace_id = ?
+                 AND used_at IS NULL
+                 AND expires_at >= ?
+               LIMIT 1";
+
+    let record = {
+        let mut stmt = tx.prepare(sql).map_err(|e| {
+            StorageError::Database(format!("Failed to prepare approval query: {e}"))
+        })?;
+
+        stmt.query_row([code_hash, workspace_id, &now.to_string()], |row| {
             Ok(ApprovalTokenRecord {
                 id: row.get(0)?,
                 code_hash: row.get(1)?,
@@ -3073,6 +3261,43 @@ fn query_active_approvals_count(conn: &Connection, workspace_id: &str, now_ms: i
     u32::try_from(count).map_err(|_| {
         StorageError::Database(format!("Active approval count {count} exceeds u32 range")).into()
     })
+}
+
+/// Look up an approval token by code hash (without consuming)
+fn query_approval_token_by_hash(
+    conn: &Connection,
+    code_hash: &str,
+) -> Result<Option<ApprovalTokenRecord>> {
+    let result = conn.query_row(
+        "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
+         pane_id, action_fingerprint
+         FROM approval_tokens
+         WHERE code_hash = ?1",
+        params![code_hash],
+        |row| {
+            Ok(ApprovalTokenRecord {
+                id: row.get(0)?,
+                code_hash: row.get(1)?,
+                created_at: row.get(2)?,
+                expires_at: row.get(3)?,
+                used_at: row.get(4)?,
+                workspace_id: row.get(5)?,
+                action_kind: row.get(6)?,
+                pane_id: {
+                    let val: Option<i64> = row.get(7)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    val.map(|v| v as u64)
+                },
+                action_fingerprint: row.get(8)?,
+            })
+        },
+    );
+
+    match result {
+        Ok(record) => Ok(Some(record)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(StorageError::Database(format!("Approval token lookup failed: {e}")).into()),
+    }
 }
 
 /// Query all panes

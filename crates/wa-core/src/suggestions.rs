@@ -19,6 +19,7 @@ pub struct PaneInfo {
 
 impl PaneInfo {
     /// Create a new PaneInfo.
+    #[must_use]
     pub fn new(id: u64) -> Self {
         Self {
             id,
@@ -29,18 +30,21 @@ impl PaneInfo {
     }
 
     /// Set the title.
+    #[must_use]
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
         self.title = Some(title.into());
         self
     }
 
     /// Set the domain.
+    #[must_use]
     pub fn with_domain(mut self, domain: impl Into<String>) -> Self {
         self.domain = Some(domain.into());
         self
     }
 
     /// Set alt screen state.
+    #[must_use]
     pub fn with_alt_screen(mut self, is_alt: bool) -> Self {
         self.is_alt_screen = is_alt;
         self
@@ -67,6 +71,7 @@ pub struct StateChange {
 
 impl StateChange {
     /// Create a new state change.
+    #[must_use]
     pub fn new(pane_id: u64, description: impl Into<String>) -> Self {
         Self {
             pane_id,
@@ -76,6 +81,7 @@ impl StateChange {
     }
 
     /// Create with explicit timestamp.
+    #[must_use]
     pub fn with_timestamp(mut self, ts: std::time::SystemTime) -> Self {
         self.timestamp = ts;
         self
@@ -435,44 +441,36 @@ pub fn format_available<T: fmt::Display>(items: &[T]) -> String {
     if items.len() <= MAX_SHOWN {
         items
             .iter()
-            .map(|i| i.to_string())
+            .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ")
     } else {
-        let shown: Vec<String> = items.iter().take(MAX_SHOWN).map(|i| i.to_string()).collect();
+        let shown: Vec<String> = items
+            .iter()
+            .take(MAX_SHOWN)
+            .map(ToString::to_string)
+            .collect();
         let remaining = items.len() - MAX_SHOWN;
         format!("{}, ... and {} more", shown.join(", "), remaining)
     }
 }
 
 /// Generate a "Did you mean?" suggestion for a pane not found error.
-pub fn pane_not_found_suggestion(
-    requested: u64,
-    ctx: &SuggestionContext,
-) -> Option<String> {
+pub fn pane_not_found_suggestion(requested: u64, ctx: &SuggestionContext) -> Option<String> {
     let closest = ctx.suggest_pane(requested)?;
 
-    let mut suggestion = format!(
-        "Did you mean pane {}?",
-        closest
-    );
+    let mut suggestion = format!("Did you mean pane {closest}?");
 
     // Add available panes
     if !ctx.available_panes.is_empty() {
-        suggestion.push_str(&format!(
-            "\nAvailable: {}",
-            ctx.format_available_panes()
-        ));
+        suggestion.push_str(&format!("\nAvailable: {}", ctx.format_available_panes()));
     }
 
     Some(suggestion)
 }
 
 /// Generate a suggestion for a workflow not found error.
-pub fn workflow_not_found_suggestion(
-    requested: &str,
-    ctx: &SuggestionContext,
-) -> Option<String> {
+pub fn workflow_not_found_suggestion(requested: &str, ctx: &SuggestionContext) -> Option<String> {
     let mut suggestion = String::new();
 
     if let Some(closest) = ctx.suggest_workflow(requested) {
@@ -494,10 +492,7 @@ pub fn workflow_not_found_suggestion(
 }
 
 /// Generate a suggestion for a rule not found error.
-pub fn rule_not_found_suggestion(
-    requested: &str,
-    ctx: &SuggestionContext,
-) -> Option<String> {
+pub fn rule_not_found_suggestion(requested: &str, ctx: &SuggestionContext) -> Option<String> {
     let mut suggestion = String::new();
 
     if let Some(closest) = ctx.suggest_rule(requested) {
@@ -526,9 +521,7 @@ pub fn state_hint_for_pane(pane_id: u64, ctx: &SuggestionContext) -> Option<Stri
     }
 
     // Get most recent state change
-    let latest = recent
-        .iter()
-        .max_by_key(|s| s.timestamp)?;
+    let latest = recent.iter().max_by_key(|s| s.timestamp)?;
 
     Some(format!(
         "Hint: Pane {} {} {}",
@@ -554,10 +547,7 @@ pub fn enhance_pane_not_found(
 ) -> Remediation {
     // Add closest match suggestion
     if let Some(closest) = ctx.suggest_pane(requested) {
-        let suggestion = format!(
-            "Did you mean pane {}?",
-            closest
-        );
+        let suggestion = format!("Did you mean pane {}?", closest);
         remediation = remediation.alternative(suggestion);
     }
 
@@ -770,7 +760,11 @@ mod tests {
         // Should detect something valid
         assert!(matches!(
             platform,
-            Platform::MacOS | Platform::Linux | Platform::Windows | Platform::Container | Platform::Unknown
+            Platform::MacOS
+                | Platform::Linux
+                | Platform::Windows
+                | Platform::Container
+                | Platform::Unknown
         ));
     }
 

@@ -30,6 +30,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::config::{HotReloadableConfig, PaneFilterConfig};
 use crate::crash::{HealthSnapshot, ShutdownSummary};
 use crate::error::Result;
+use crate::events::{Event, EventBus};
 use crate::ingest::{PaneCursor, PaneRegistry, persist_captured_segment};
 use crate::patterns::{Detection, DetectionContext, PatternEngine};
 use crate::storage::{StorageHandle, StoredEvent};
@@ -184,6 +185,8 @@ pub struct ObservationRuntime {
     config_tx: watch::Sender<HotReloadableConfig>,
     /// Hot-reloadable config receiver (for tasks to receive updates)
     config_rx: watch::Receiver<HotReloadableConfig>,
+    /// Optional event bus for publishing detection events to workflow runners
+    event_bus: Option<Arc<EventBus>>,
 }
 
 impl ObservationRuntime {
@@ -228,7 +231,19 @@ impl ObservationRuntime {
             metrics,
             config_tx,
             config_rx,
+            event_bus: None,
         }
+    }
+
+    /// Set an event bus for publishing detection events.
+    ///
+    /// When set, the runtime will publish `PatternDetected` events to this bus
+    /// after persisting them to storage. This enables workflow runners to
+    /// subscribe and handle detections in real-time.
+    #[must_use]
+    pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
+        self.event_bus = Some(event_bus);
+        self
     }
 
     /// Start the observation runtime.
@@ -262,6 +277,7 @@ impl ObservationRuntime {
             cursors: Arc::clone(&self.cursors),
             start_time: Instant::now(),
             config_tx: self.config_tx.clone(),
+            event_bus: self.event_bus.clone(),
         })
     }
 
@@ -485,6 +501,7 @@ impl ObservationRuntime {
         let detection_contexts = Arc::clone(&self.detection_contexts);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let metrics = Arc::clone(&self.metrics);
+        let event_bus = self.event_bus.clone();
 
         tokio::spawn(async move {
             // Process events until channel closes or shutdown
@@ -608,6 +625,8 @@ pub struct RuntimeHandle {
     pub start_time: Instant,
     /// Hot-reload config sender for broadcasting updates
     config_tx: watch::Sender<HotReloadableConfig>,
+    /// Optional event bus for workflow integration
+    pub event_bus: Option<Arc<EventBus>>,
 }
 
 impl RuntimeHandle {

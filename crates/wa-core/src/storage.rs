@@ -17,6 +17,8 @@
 //! - `workflow_executions`: Durable workflow state
 //! - `workflow_step_logs`: Step execution history
 //! - `audit_actions`: Audit trail for policy decisions and outcomes
+//! - `action_undo`: Undo metadata for audit actions
+//! - `action_history`: View joining audit + undo + workflow step info
 //! - `approval_tokens`: Allow-once approvals scoped to actions
 //! - `config`: Key-value settings
 //! - `maintenance_log`: System events and metrics
@@ -48,7 +50,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// Schema initialization SQL
 ///
@@ -176,6 +178,7 @@ CREATE INDEX IF NOT EXISTS idx_workflows_started ON workflow_executions(started_
 CREATE TABLE IF NOT EXISTS workflow_step_logs (
     id INTEGER PRIMARY KEY,
     workflow_id TEXT NOT NULL REFERENCES workflow_executions(id) ON DELETE CASCADE,
+    audit_action_id INTEGER REFERENCES audit_actions(id) ON DELETE SET NULL,
     step_index INTEGER NOT NULL,
     step_name TEXT NOT NULL,
     result_type TEXT NOT NULL,        -- continue, done, retry, abort, wait_for
@@ -186,6 +189,7 @@ CREATE TABLE IF NOT EXISTS workflow_step_logs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_step_logs_workflow ON workflow_step_logs(workflow_id, step_index);
+CREATE INDEX IF NOT EXISTS idx_step_logs_audit_action ON workflow_step_logs(audit_action_id);
 
 -- Audit actions: policy decisions and outcomes
 CREATE TABLE IF NOT EXISTS audit_actions (
@@ -210,6 +214,19 @@ CREATE INDEX IF NOT EXISTS idx_audit_actions_pane ON audit_actions(pane_id, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actions_actor ON audit_actions(actor_kind, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actions_action ON audit_actions(action_kind, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actions_decision ON audit_actions(policy_decision, ts);
+
+-- Undo metadata for audit actions
+CREATE TABLE IF NOT EXISTS action_undo (
+    audit_action_id INTEGER PRIMARY KEY REFERENCES audit_actions(id) ON DELETE CASCADE,
+    undoable INTEGER NOT NULL DEFAULT 0,
+    undo_strategy TEXT NOT NULL,       -- none|manual|workflow_abort|pane_close|custom
+    undo_hint TEXT,                    -- redacted guidance for humans
+    undo_payload TEXT,                 -- JSON for executor (redacted)
+    undone_at INTEGER,
+    undone_by TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_undo_undoable ON action_undo(undoable) WHERE undoable = 1;
 
 -- Approval tokens: allow-once approvals scoped to actions
 CREATE TABLE IF NOT EXISTS approval_tokens (
@@ -296,6 +313,15 @@ CREATE TRIGGER IF NOT EXISTS output_segments_au AFTER UPDATE ON output_segments 
     INSERT INTO output_segments_fts(output_segments_fts, rowid, content) VALUES('delete', old.id, old.content);
     INSERT INTO output_segments_fts(rowid, content) VALUES (new.id, new.content);
 END;
+
+-- Action history view (audit + undo + workflow step info)
+CREATE VIEW IF NOT EXISTS action_history AS
+SELECT a.*,
+       u.undoable, u.undo_strategy, u.undo_hint, u.undone_at, u.undone_by,
+       w.workflow_id, w.step_name
+FROM audit_actions a
+LEFT JOIN action_undo u ON u.audit_action_id = a.id
+LEFT JOIN workflow_step_logs w ON w.audit_action_id = a.id;
 "#;
 
 // =============================================================================
@@ -341,6 +367,34 @@ static MIGRATIONS: &[Migration] = &[
         version: 3,
         description: "Add pane_uuid to panes for stable identity",
         up_sql: "ALTER TABLE panes ADD COLUMN pane_uuid TEXT;",
+    },
+    Migration {
+        version: 4,
+        description: "Add action_undo + action_history view + audit_action_id on step logs",
+        up_sql: r#"
+            ALTER TABLE workflow_step_logs ADD COLUMN audit_action_id INTEGER REFERENCES audit_actions(id);
+            CREATE INDEX IF NOT EXISTS idx_step_logs_audit_action ON workflow_step_logs(audit_action_id);
+
+            CREATE TABLE IF NOT EXISTS action_undo (
+                audit_action_id INTEGER PRIMARY KEY REFERENCES audit_actions(id) ON DELETE CASCADE,
+                undoable INTEGER NOT NULL DEFAULT 0,
+                undo_strategy TEXT NOT NULL,
+                undo_hint TEXT,
+                undo_payload TEXT,
+                undone_at INTEGER,
+                undone_by TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_action_undo_undoable ON action_undo(undoable) WHERE undoable = 1;
+
+            CREATE VIEW IF NOT EXISTS action_history AS
+            SELECT a.*,
+                   u.undoable, u.undo_strategy, u.undo_hint, u.undone_at, u.undone_by,
+                   w.workflow_id, w.step_name
+            FROM audit_actions a
+            LEFT JOIN action_undo u ON u.audit_action_id = a.id
+            LEFT JOIN workflow_step_logs w ON w.audit_action_id = a.id;
+        "#,
     },
 ];
 
@@ -558,6 +612,8 @@ pub struct WorkflowStepLogRecord {
     pub id: i64,
     /// Workflow execution ID
     pub workflow_id: String,
+    /// Linked audit action ID (if available)
+    pub audit_action_id: Option<i64>,
     /// Step index within workflow
     pub step_index: usize,
     /// Step name
@@ -627,6 +683,80 @@ impl AuditActionRecord {
             .as_ref()
             .map(|value| redactor.redact(value));
     }
+}
+
+/// Undo metadata for an audit action
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionUndoRecord {
+    /// Audit action ID (primary key)
+    pub audit_action_id: i64,
+    /// Whether the action is undoable
+    pub undoable: bool,
+    /// Undo strategy (none|manual|workflow_abort|pane_close|custom)
+    pub undo_strategy: String,
+    /// Redacted guidance for humans
+    pub undo_hint: Option<String>,
+    /// Redacted JSON payload for executor
+    pub undo_payload: Option<String>,
+    /// When the action was undone (epoch ms)
+    pub undone_at: Option<i64>,
+    /// Who performed the undo
+    pub undone_by: Option<String>,
+}
+
+impl ActionUndoRecord {
+    /// Redact sensitive fields before persistence or export
+    pub fn redact_fields(&mut self, redactor: &Redactor) {
+        self.undo_hint = self.undo_hint.as_ref().map(|value| redactor.redact(value));
+        self.undo_payload = self.undo_payload.as_ref().map(|value| redactor.redact(value));
+    }
+}
+
+/// Read-optimized action history record (audit + undo + workflow step info)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionHistoryRecord {
+    /// Audit record ID
+    pub id: i64,
+    /// Timestamp (epoch ms)
+    pub ts: i64,
+    /// Actor kind (human, robot, mcp, workflow)
+    pub actor_kind: String,
+    /// Optional actor identifier (workflow id, MCP client id)
+    pub actor_id: Option<String>,
+    /// Pane ID (if action targeted a pane)
+    pub pane_id: Option<u64>,
+    /// Domain name (if applicable)
+    pub domain: Option<String>,
+    /// Action kind (send_text, workflow_run, etc.)
+    pub action_kind: String,
+    /// Policy decision (allow, deny, require_approval)
+    pub policy_decision: String,
+    /// Policy decision reason (redacted)
+    pub decision_reason: Option<String>,
+    /// Policy rule ID, if any
+    pub rule_id: Option<String>,
+    /// Redacted input summary
+    pub input_summary: Option<String>,
+    /// Redacted verification summary
+    pub verification_summary: Option<String>,
+    /// Decision context (JSON), if available
+    pub decision_context: Option<String>,
+    /// Result (success, denied, failed, timeout)
+    pub result: String,
+    /// Whether the action is undoable (from action_undo)
+    pub undoable: Option<bool>,
+    /// Undo strategy (from action_undo)
+    pub undo_strategy: Option<String>,
+    /// Redacted undo hint
+    pub undo_hint: Option<String>,
+    /// When the action was undone (epoch ms)
+    pub undone_at: Option<i64>,
+    /// Who performed the undo
+    pub undone_by: Option<String>,
+    /// Workflow ID associated with the action (if any)
+    pub workflow_id: Option<String>,
+    /// Workflow step name associated with the action (if any)
+    pub step_name: Option<String>,
 }
 
 /// Maintenance log record for system events
@@ -889,12 +1019,18 @@ enum WriteCommand {
     /// Insert a workflow step log
     InsertStepLog {
         workflow_id: String,
+        audit_action_id: Option<i64>,
         step_index: usize,
         step_name: String,
         result_type: String,
         result_data: Option<String>,
         started_at: i64,
         completed_at: i64,
+        respond: oneshot::Sender<Result<()>>,
+    },
+    /// Upsert undo metadata for an audit action
+    UpsertActionUndo {
+        record: ActionUndoRecord,
         respond: oneshot::Sender<Result<()>>,
     },
     /// Upsert an agent session record
@@ -1196,6 +1332,31 @@ impl StorageHandle {
         self.record_audit_action(action).await
     }
 
+    /// Upsert undo metadata for an audit action
+    pub async fn upsert_action_undo(&self, record: ActionUndoRecord) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::UpsertActionUndo {
+                record,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
+    /// Upsert undo metadata after applying redaction
+    pub async fn upsert_action_undo_redacted(
+        &self,
+        mut record: ActionUndoRecord,
+    ) -> Result<()> {
+        let redactor = Redactor::new();
+        record.redact_fields(&redactor);
+        self.upsert_action_undo(record).await
+    }
+
     /// Purge audit actions older than a cutoff timestamp
     pub async fn purge_audit_actions_before(&self, before_ts: i64) -> Result<usize> {
         let (tx, rx) = oneshot::channel();
@@ -1383,6 +1544,7 @@ impl StorageHandle {
     pub async fn insert_step_log(
         &self,
         workflow_id: &str,
+        audit_action_id: Option<i64>,
         step_index: usize,
         step_name: &str,
         result_type: &str,
@@ -1394,6 +1556,7 @@ impl StorageHandle {
         self.write_tx
             .send(WriteCommand::InsertStepLog {
                 workflow_id: workflow_id.to_string(),
+                audit_action_id,
                 step_index,
                 step_name: step_name.to_string(),
                 result_type: result_type.to_string(),
@@ -1604,6 +1767,24 @@ impl StorageHandle {
             })?;
 
             crate::storage::query_audit_actions(&conn, &query)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Query action history view with filters
+    pub async fn get_action_history(
+        &self,
+        query: ActionHistoryQuery,
+    ) -> Result<Vec<ActionHistoryRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            crate::storage::query_action_history(&conn, &query)
         })
         .await
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
@@ -1826,6 +2007,35 @@ pub struct AuditQuery {
     pub until: Option<i64>,
 }
 
+/// Query options for action history view
+#[derive(Debug, Clone, Default)]
+pub struct ActionHistoryQuery {
+    /// Maximum number of results (default: 100)
+    pub limit: Option<usize>,
+    /// Filter by pane ID
+    pub pane_id: Option<u64>,
+    /// Filter by domain name
+    pub domain: Option<String>,
+    /// Filter by actor kind
+    pub actor_kind: Option<String>,
+    /// Filter by actor identifier
+    pub actor_id: Option<String>,
+    /// Filter by action kind
+    pub action_kind: Option<String>,
+    /// Filter by policy decision
+    pub policy_decision: Option<String>,
+    /// Filter by rule ID
+    pub rule_id: Option<String>,
+    /// Filter by result
+    pub result: Option<String>,
+    /// Filter by undoable flag
+    pub undoable: Option<bool>,
+    /// Filter by time range start (epoch ms)
+    pub since: Option<i64>,
+    /// Filter by time range end (epoch ms)
+    pub until: Option<i64>,
+}
+
 /// Query options for events
 #[derive(Debug, Clone, Default)]
 pub struct EventQuery {
@@ -1895,6 +2105,7 @@ fn writer_loop(conn: &mut Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
             }
             WriteCommand::InsertStepLog {
                 workflow_id,
+                audit_action_id,
                 step_index,
                 step_name,
                 result_type,
@@ -1906,6 +2117,7 @@ fn writer_loop(conn: &mut Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
                 let result = insert_step_log_sync(
                     conn,
                     &workflow_id,
+                    audit_action_id,
                     step_index,
                     &step_name,
                     &result_type,
@@ -1921,6 +2133,10 @@ fn writer_loop(conn: &mut Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
             }
             WriteCommand::RecordAuditAction { action, respond } => {
                 let result = record_audit_action_sync(conn, &action);
+                let _ = respond.send(result);
+            }
+            WriteCommand::UpsertActionUndo { record, respond } => {
+                let result = upsert_action_undo_sync(conn, &record);
                 let _ = respond.send(result);
             }
             WriteCommand::PurgeAuditActions { before_ts, respond } => {
@@ -2278,6 +2494,7 @@ fn upsert_workflow_sync(conn: &Connection, workflow: &WorkflowRecord) -> Result<
 fn insert_step_log_sync(
     conn: &Connection,
     workflow_id: &str,
+    audit_action_id: Option<i64>,
     step_index: usize,
     step_name: &str,
     result_type: &str,
@@ -2289,11 +2506,12 @@ fn insert_step_log_sync(
     let step_index_i64 = usize_to_i64(step_index, "step_index")?;
 
     conn.execute(
-        "INSERT INTO workflow_step_logs (workflow_id, step_index, step_name, result_type,
+        "INSERT INTO workflow_step_logs (workflow_id, audit_action_id, step_index, step_name, result_type,
          result_data, started_at, completed_at, duration_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             workflow_id,
+            audit_action_id,
             step_index_i64,
             step_name,
             result_type,
@@ -2408,6 +2626,35 @@ fn record_audit_action_sync(conn: &Connection, action: &AuditActionRecord) -> Re
     .map_err(|e| StorageError::Database(format!("Failed to insert audit action: {e}")))?;
 
     Ok(conn.last_insert_rowid())
+}
+
+/// Upsert undo metadata for an audit action (synchronous)
+fn upsert_action_undo_sync(conn: &Connection, record: &ActionUndoRecord) -> Result<()> {
+    let undoable_i64 = if record.undoable { 1i64 } else { 0i64 };
+
+    conn.execute(
+        "INSERT INTO action_undo (audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(audit_action_id) DO UPDATE SET
+            undoable = excluded.undoable,
+            undo_strategy = excluded.undo_strategy,
+            undo_hint = excluded.undo_hint,
+            undo_payload = excluded.undo_payload,
+            undone_at = excluded.undone_at,
+            undone_by = excluded.undone_by",
+        params![
+            record.audit_action_id,
+            undoable_i64,
+            record.undo_strategy,
+            record.undo_hint,
+            record.undo_payload,
+            record.undone_at,
+            record.undone_by,
+        ],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to upsert action_undo: {e}")))?;
+
+    Ok(())
 }
 
 /// Purge audit actions before a cutoff timestamp (synchronous)
@@ -3247,6 +3494,119 @@ fn query_audit_actions(conn: &Connection, query: &AuditQuery) -> Result<Vec<Audi
     Ok(results)
 }
 
+/// Query action history view with optional filters
+fn query_action_history(
+    conn: &Connection,
+    query: &ActionHistoryQuery,
+) -> Result<Vec<ActionHistoryRecord>> {
+    let mut sql = String::from(
+        "SELECT id, ts, actor_kind, actor_id, pane_id, domain, action_kind, policy_decision,
+         decision_reason, rule_id, input_summary, verification_summary, decision_context, result,
+         undoable, undo_strategy, undo_hint, undone_at, undone_by, workflow_id, step_name
+         FROM action_history WHERE 1=1",
+    );
+    let mut params: Vec<SqlValue> = Vec::new();
+
+    if let Some(pane_id) = query.pane_id {
+        let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+        sql.push_str(" AND pane_id = ?");
+        params.push(SqlValue::Integer(pane_id_i64));
+    }
+    if let Some(domain) = &query.domain {
+        sql.push_str(" AND domain = ?");
+        params.push(SqlValue::Text(domain.clone()));
+    }
+    if let Some(actor_kind) = &query.actor_kind {
+        sql.push_str(" AND actor_kind = ?");
+        params.push(SqlValue::Text(actor_kind.clone()));
+    }
+    if let Some(actor_id) = &query.actor_id {
+        sql.push_str(" AND actor_id = ?");
+        params.push(SqlValue::Text(actor_id.clone()));
+    }
+    if let Some(action_kind) = &query.action_kind {
+        sql.push_str(" AND action_kind = ?");
+        params.push(SqlValue::Text(action_kind.clone()));
+    }
+    if let Some(policy_decision) = &query.policy_decision {
+        sql.push_str(" AND policy_decision = ?");
+        params.push(SqlValue::Text(policy_decision.clone()));
+    }
+    if let Some(rule_id) = &query.rule_id {
+        sql.push_str(" AND rule_id = ?");
+        params.push(SqlValue::Text(rule_id.clone()));
+    }
+    if let Some(result) = &query.result {
+        sql.push_str(" AND result = ?");
+        params.push(SqlValue::Text(result.clone()));
+    }
+    if let Some(undoable) = query.undoable {
+        if undoable {
+            sql.push_str(" AND undoable = 1");
+        } else {
+            sql.push_str(" AND (undoable = 0 OR undoable IS NULL)");
+        }
+    }
+    if let Some(since) = query.since {
+        sql.push_str(" AND ts >= ?");
+        params.push(SqlValue::Integer(since));
+    }
+    if let Some(until) = query.until {
+        sql.push_str(" AND ts <= ?");
+        params.push(SqlValue::Integer(until));
+    }
+
+    sql.push_str(" ORDER BY ts DESC, id DESC LIMIT ?");
+    let limit_i64 = usize_to_i64(query.limit.unwrap_or(100), "limit")?;
+    params.push(SqlValue::Integer(limit_i64));
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| StorageError::Database(format!("Failed to prepare action history query: {e}")))?;
+
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            Ok(ActionHistoryRecord {
+                id: row.get(0)?,
+                ts: row.get(1)?,
+                actor_kind: row.get(2)?,
+                actor_id: row.get(3)?,
+                pane_id: {
+                    let val: Option<i64> = row.get(4)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    val.map(|v| v as u64)
+                },
+                domain: row.get(5)?,
+                action_kind: row.get(6)?,
+                policy_decision: row.get(7)?,
+                decision_reason: row.get(8)?,
+                rule_id: row.get(9)?,
+                input_summary: row.get(10)?,
+                verification_summary: row.get(11)?,
+                decision_context: row.get(12)?,
+                result: row.get(13)?,
+                undoable: {
+                    let val: Option<i64> = row.get(14)?;
+                    val.map(|v| v != 0)
+                },
+                undo_strategy: row.get(15)?,
+                undo_hint: row.get(16)?,
+                undone_at: row.get(17)?,
+                undone_by: row.get(18)?,
+                workflow_id: row.get(19)?,
+                step_name: row.get(20)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Action history query failed: {e}")))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+    }
+
+    Ok(results)
+}
+
 /// Count active (unused + unexpired) approval tokens for a workspace
 fn query_active_approvals_count(conn: &Connection, workspace_id: &str, now_ms: i64) -> Result<u32> {
     let count: i64 = conn
@@ -3515,7 +3875,7 @@ fn query_workflow(conn: &Connection, workflow_id: &str) -> Result<Option<Workflo
 fn query_step_logs(conn: &Connection, workflow_id: &str) -> Result<Vec<WorkflowStepLogRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, workflow_id, step_index, step_name, result_type, result_data,
+            "SELECT id, workflow_id, audit_action_id, step_index, step_name, result_type, result_data,
              started_at, completed_at, duration_ms
              FROM workflow_step_logs
              WHERE workflow_id = ?1
@@ -3528,16 +3888,17 @@ fn query_step_logs(conn: &Connection, workflow_id: &str) -> Result<Vec<WorkflowS
             Ok(WorkflowStepLogRecord {
                 id: row.get(0)?,
                 workflow_id: row.get(1)?,
+                audit_action_id: row.get(2)?,
                 step_index: {
-                    let val: i64 = row.get(2)?;
+                    let val: i64 = row.get(3)?;
                     i64_to_usize(val)?
                 },
-                step_name: row.get(3)?,
-                result_type: row.get(4)?,
-                result_data: row.get(5)?,
-                started_at: row.get(6)?,
-                completed_at: row.get(7)?,
-                duration_ms: row.get(8)?,
+                step_name: row.get(4)?,
+                result_type: row.get(5)?,
+                result_data: row.get(6)?,
+                started_at: row.get(7)?,
+                completed_at: row.get(8)?,
+                duration_ms: row.get(9)?,
             })
         })
         .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
@@ -3666,6 +4027,7 @@ mod tests {
             "workflow_executions",
             "workflow_step_logs",
             "audit_actions",
+            "action_undo",
             "approval_tokens",
             "config",
             "maintenance_log",
@@ -3696,6 +4058,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "FTS5 table should exist");
+    }
+
+    #[test]
+    fn action_history_view_exists_after_init() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='action_history'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "action_history view should exist");
     }
 
     #[test]
@@ -4394,6 +4771,62 @@ mod tests {
         assert_eq!(rows[0].actor_kind, "human");
         assert_eq!(rows[0].action_kind, "send_text");
         assert_eq!(rows[0].policy_decision, "allow");
+    }
+
+    #[test]
+    fn action_history_includes_undo_metadata() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let now_ms = 1_700_000_000_000i64;
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, "local", now_ms, now_ms, 1],
+        )
+        .unwrap();
+
+        let action = AuditActionRecord {
+            id: 0,
+            ts: now_ms,
+            actor_kind: "human".to_string(),
+            actor_id: Some("cli".to_string()),
+            pane_id: Some(1),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some("ok".to_string()),
+            rule_id: None,
+            input_summary: Some("echo hi".to_string()),
+            verification_summary: Some("prompt".to_string()),
+            decision_context: None,
+            result: "success".to_string(),
+        };
+
+        let action_id = record_audit_action_sync(&conn, &action).unwrap();
+
+        let undo = ActionUndoRecord {
+            audit_action_id: action_id,
+            undoable: true,
+            undo_strategy: "manual".to_string(),
+            undo_hint: Some("run undo manually".to_string()),
+            undo_payload: Some(r#"{"command":"undo"}"#.to_string()),
+            undone_at: None,
+            undone_by: None,
+        };
+        upsert_action_undo_sync(&conn, &undo).unwrap();
+
+        let rows = query_action_history(&conn, &ActionHistoryQuery::default()).unwrap();
+        assert!(!rows.is_empty());
+
+        let row = &rows[0];
+        assert_eq!(row.id, action_id);
+        assert_eq!(row.action_kind, "send_text");
+        assert_eq!(row.undoable, Some(true));
+        assert_eq!(row.undo_strategy.as_deref(), Some("manual"));
+        assert_eq!(row.undo_hint.as_deref(), Some("run undo manually"));
+        assert!(row.workflow_id.is_none());
+        assert!(row.step_name.is_none());
     }
 
     #[test]
@@ -5266,6 +5699,7 @@ fn can_insert_and_query_workflow_step_logs() {
     insert_step_log_sync(
         &conn,
         "wf-test-001",
+        None,
         0,
         "step_one",
         "continue",
@@ -5278,6 +5712,7 @@ fn can_insert_and_query_workflow_step_logs() {
     insert_step_log_sync(
         &conn,
         "wf-test-001",
+        None,
         1,
         "step_two",
         "done",
@@ -5341,6 +5776,7 @@ fn workflow_step_log_result_data_is_optional() {
     insert_step_log_sync(
         &conn,
         "wf-test-002",
+        None,
         0,
         "simple_step",
         "continue",
@@ -5361,6 +5797,7 @@ fn workflow_step_log_record_serializes() {
     let log = WorkflowStepLogRecord {
         id: 1,
         workflow_id: "wf-001".to_string(),
+        audit_action_id: None,
         step_index: 0,
         step_name: "init".to_string(),
         result_type: "continue".to_string(),
@@ -5464,6 +5901,7 @@ async fn storage_handle_insert_step_log_and_query() {
     storage
         .insert_step_log(
             "wf-async-001",
+            None,
             0,
             "async_step",
             "continue",
@@ -5829,6 +6267,7 @@ mod storage_handle_tests {
         handle
             .insert_step_log(
                 workflow_id,
+                None,
                 0,
                 "init",
                 "success",
@@ -5842,6 +6281,7 @@ mod storage_handle_tests {
         handle
             .insert_step_log(
                 workflow_id,
+                None,
                 1,
                 "send_text",
                 "success",
@@ -5855,6 +6295,7 @@ mod storage_handle_tests {
         handle
             .insert_step_log(
                 workflow_id,
+                None,
                 2,
                 "wait_for",
                 "success",

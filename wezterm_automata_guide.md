@@ -162,6 +162,47 @@ local cursor = pane:get_cursor_position()
 -- cursor.y: row (0-indexed, viewport-relative)
 ```
 
+### 2.5 Pane Identity: pane_id vs pane_uuid
+
+WezTerm assigns a numeric `pane_id` per mux session. That value is perfect for
+immediate CLI actions (get-text, send-text), but it is not a stable long-lived
+identity. Pane ids can be recycled after a pane closes, and they do not survive
+daemon restarts or a new mux session.
+
+wa therefore assigns a stable `pane_uuid` at discovery time and persists it:
+
+- Assignment: when a pane is first discovered, wa generates a `pane_uuid` from
+  the pane's domain, `pane_id`, first-seen timestamp, and random entropy.
+- Stability: the `pane_uuid` never changes while that pane exists, even if the
+  pane title, cwd, tab, or window changes.
+- Recreation: if a pane is closed and a new pane appears (even if it reuses the
+  same numeric `pane_id`), a new `pane_uuid` is generated.
+- Persistence: `pane_uuid` is stored in the `panes` table and surfaced in
+  `wa status` / `wa robot state` once the watcher has observed the pane.
+
+Identity vs generation:
+
+- `pane_uuid` is the long-lived identity for a pane instance.
+- A separate fingerprint (domain + title + cwd + optional initial content hash)
+  tracks "generation" changes when the context shifts. Generation increments
+  do not change `pane_uuid`.
+
+Observe/act separation:
+
+- `pane_uuid` assignment is passive. wa does not write to panes or use OSC
+  handshakes for identity in the current design.
+- If a future handshake is added, it must be explicit and rate-limited to avoid
+  any "spam" writes in observed panes.
+
+Debugging guidance:
+
+- Use `wa status` or `wa robot state` to confirm the `pane_uuid` associated
+  with a pane.
+- If identity looks wrong, verify domain/title/cwd and recent pane lifecycle
+  changes before taking action.
+- When in doubt, treat the pane as new and allow a fresh `pane_uuid` to be
+  assigned after rediscovery.
+
 ---
 
 ## 3. The WezTerm CLI: Your Primary Interface
@@ -2527,6 +2568,37 @@ pub async fn safe_send_text(
     unreachable!()
 }
 ```
+
+Backpressure and GAPs (what happens under load):
+
+- Bounded queues: capture and storage use bounded channels. When the capture
+  queue is full, the tailer logs a backpressure warning and treats the poll as
+  "no change", which naturally backs off the polling interval.
+- Storage writer queue: the async storage handle serializes writes through a
+  bounded writer queue. A saturated queue increases ingest lag and can delay
+  event persistence.
+- GAP insertion: if delta extraction cannot guarantee continuity (overlap
+  failure, in-place edits, alt-screen toggles, or sequence discontinuity), wa
+  records an explicit GAP with a reason and stores the full snapshot to make
+  the discontinuity auditable.
+
+Troubleshooting "wa is behind":
+
+- Check `wa status` (or `wa robot state`) for last-seen timestamps and pane
+  observation state.
+- Inspect logs for backpressure warnings (capture queue full) and GAP reasons
+  like `overlap_not_found` or `seq_discontinuity`.
+- Use `wa events` / `wa robot events` to confirm whether gap events are being
+  emitted for a specific pane.
+- If available in your build, `wa doctor` / `wa triage` should summarize ingest
+  lag and recent gap reasons.
+
+Tuning knobs (safe mitigations):
+
+- Reduce the number of observed panes with include/exclude filters.
+- Increase `ingest.poll_interval_ms` to lower capture pressure.
+- Lower `ingest.max_concurrent_captures` to reduce burst load.
+- Adjust `storage.writer_queue_size` if the writer queue is persistently full.
 
 ### 14.2 State Validation
 

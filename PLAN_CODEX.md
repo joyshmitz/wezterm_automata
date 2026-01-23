@@ -722,6 +722,11 @@ Recommended robot commands (minimum):
 - `wa robot rules list [--pack <name>]`
 - `wa robot rules test "<text>" [--agent <type>]` (returns match trace)
 
+Explain-match trace (v0, per detection):
+- bounded + redacted; no raw input snippets
+- includes rule_id, spans (indices only), extracted_keys, optional confidence,
+  eval_path (which subpatterns matched), and bounds/redaction metadata.
+
 ### A.3 MCP tools/resources (via `fastmcp_rust`)
 
 Tool naming: keep short and obvious (agents hate surprises):
@@ -1060,4 +1065,3 @@ If we enable vendoring:
   - reports if upstream changes broke compilation
 
 Default posture remains: **CLI-first**; vendoring is an optimization lane, not the foundation.
-

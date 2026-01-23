@@ -200,10 +200,7 @@ impl QueryClient for ProductionQueryClient {
     }
 
     fn health(&self) -> Result<HealthStatus, QueryError> {
-        let wezterm_accessible = self
-            .list_panes()
-            .map(|p| !p.is_empty())
-            .unwrap_or(false);
+        let wezterm_accessible = self.list_panes().map(|p| !p.is_empty()).unwrap_or(false);
 
         let db_accessible = self.db_exists();
         let watcher_running = self.is_watcher_running();
@@ -239,16 +236,14 @@ mod tests {
     impl MockQueryClient {
         fn new() -> Self {
             Self {
-                panes: vec![
-                    PaneView {
-                        pane_id: 0,
-                        title: "test-pane".to_string(),
-                        domain: "local".to_string(),
-                        cwd: Some("/home/test".to_string()),
-                        is_excluded: false,
-                        agent_type: Some("claude-code".to_string()),
-                    },
-                ],
+                panes: vec![PaneView {
+                    pane_id: 0,
+                    title: "test-pane".to_string(),
+                    domain: "local".to_string(),
+                    cwd: Some("/home/test".to_string()),
+                    is_excluded: false,
+                    agent_type: Some("claude-code".to_string()),
+                }],
                 events: Vec::new(),
                 watcher_running: true,
             }

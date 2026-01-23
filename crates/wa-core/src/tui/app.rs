@@ -13,17 +13,20 @@ use std::time::{Duration, Instant};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
-    Terminal,
 };
 
-use super::query::{QueryClient, QueryError, EventFilters};
-use super::views::{View, ViewState, render_tabs, render_home_view, render_panes_view, render_events_view, render_search_view, render_help_view};
+use super::query::{EventFilters, QueryClient, QueryError};
+use super::views::{
+    View, ViewState, render_events_view, render_help_view, render_home_view, render_panes_view,
+    render_search_view, render_tabs,
+};
 
 /// Application configuration
 #[derive(Debug, Clone)]
@@ -112,7 +115,10 @@ impl<Q: QueryClient> App<Q> {
     }
 
     /// Main event loop
-    fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> TuiResult<()> {
+    fn event_loop(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> TuiResult<()> {
         let tick_rate = Duration::from_millis(100);
 
         while !self.should_quit {
@@ -272,7 +278,8 @@ impl<Q: QueryClient> App<Q> {
                 self.view_state.health = Some(health);
             }
             Err(e) => {
-                self.view_state.set_error(format!("Health check failed: {e}"));
+                self.view_state
+                    .set_error(format!("Health check failed: {e}"));
             }
         }
 
@@ -286,7 +293,8 @@ impl<Q: QueryClient> App<Q> {
                 }
             }
             Err(e) => {
-                self.view_state.set_error(format!("Failed to list panes: {e}"));
+                self.view_state
+                    .set_error(format!("Failed to list panes: {e}"));
             }
         }
 
@@ -303,7 +311,8 @@ impl<Q: QueryClient> App<Q> {
                 // This is expected if watcher hasn't run yet
             }
             Err(e) => {
-                self.view_state.set_error(format!("Failed to list events: {e}"));
+                self.view_state
+                    .set_error(format!("Failed to list events: {e}"));
             }
         }
 
@@ -354,7 +363,7 @@ pub fn run_tui<Q: QueryClient>(query_client: Q, config: AppConfig) -> TuiResult<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::query::{PaneView, EventView, HealthStatus, SearchResultView};
+    use crate::tui::query::{EventView, HealthStatus, PaneView, SearchResultView};
 
     struct TestQueryClient;
 

@@ -5,7 +5,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
@@ -370,6 +370,14 @@ enum RobotCommands {
         /// Only return events since this timestamp (epoch ms)
         #[arg(long)]
         since: Option<i64>,
+
+        /// Preview which workflows would handle these events (no execution)
+        #[arg(long)]
+        would_handle: bool,
+
+        /// Mark output as dry-run preview (implies --would-handle)
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Workflow management commands
@@ -428,8 +436,20 @@ enum RobotWorkflowCommands {
 
     /// Check workflow execution status
     Status {
-        /// Execution ID
-        execution_id: String,
+        /// Execution ID (optional when using --pane or --active)
+        execution_id: Option<String>,
+
+        /// Filter by pane ID (list all workflows for this pane)
+        #[arg(long)]
+        pane: Option<u64>,
+
+        /// List all active workflows (status: running or waiting)
+        #[arg(long)]
+        active: bool,
+
+        /// Include step logs in response
+        #[arg(long, short)]
+        verbose: bool,
     },
 
     /// Abort a running workflow
@@ -795,6 +815,10 @@ struct RobotEventsData {
     unhandled_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     since_filter: Option<i64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    would_handle: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    dry_run: bool,
 }
 
 /// Individual event for robot mode
@@ -814,6 +838,24 @@ struct RobotEventItem {
     handled_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workflow_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    would_handle_with: Option<RobotEventWouldHandle>,
+}
+
+/// Workflow preview for robot events dry-run
+#[derive(serde::Serialize)]
+struct RobotEventWouldHandle {
+    workflow: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_step: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    estimated_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    would_run: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 /// Workflow execution result for robot mode
@@ -913,11 +955,25 @@ struct RobotWorkflowStatusData {
     workflow_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pane_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_event_id: Option<i64>,
     status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_step_result: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     current_step: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     total_steps: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait_condition: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -926,6 +982,34 @@ struct RobotWorkflowStatusData {
     updated_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     completed_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step_logs: Option<Vec<RobotWorkflowStepLog>>,
+}
+
+/// Robot workflow step log entry (matches wa-robot-workflow-status.json schema)
+#[derive(Debug, serde::Serialize)]
+struct RobotWorkflowStepLog {
+    step_index: usize,
+    step_name: String,
+    result_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_data: Option<serde_json::Value>,
+    started_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<i64>,
+}
+
+/// Robot workflow status list response (for --pane or --active)
+#[derive(Debug, serde::Serialize)]
+struct RobotWorkflowStatusListData {
+    executions: Vec<RobotWorkflowStatusData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_filter: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_only: Option<bool>,
+    count: usize,
 }
 
 /// Robot workflow abort response data (matches wa-robot-workflow-abort.json schema)
@@ -1250,6 +1334,71 @@ fn build_workflow_dry_run_report(
     ctx.take_report()
 }
 
+fn workflow_enabled(workflow: &str, config: &wa_core::config::WorkflowsConfig) -> bool {
+    if config.enabled.is_empty() {
+        return true;
+    }
+    config.enabled.iter().any(|name| name == workflow)
+}
+
+fn workflow_auto_run(workflow: &str, config: &wa_core::config::WorkflowsConfig) -> bool {
+    if config.auto_run_denylist.iter().any(|name| name == workflow) {
+        return false;
+    }
+    if config.auto_run_allowlist.is_empty() {
+        return true;
+    }
+    config
+        .auto_run_allowlist
+        .iter()
+        .any(|name| name == workflow)
+}
+
+fn workflow_first_step(name: &str) -> Option<String> {
+    use wa_core::workflows::{HandleCompaction, Workflow};
+
+    match name {
+        "handle_compaction" => HandleCompaction::new()
+            .steps()
+            .first()
+            .map(|step| step.name.clone()),
+        _ => None,
+    }
+}
+
+fn build_event_would_handle(
+    event: &wa_core::storage::StoredEvent,
+    rule: Option<&wa_core::patterns::RuleDef>,
+    config: &wa_core::config::Config,
+) -> Option<RobotEventWouldHandle> {
+    let rule = rule?;
+    let workflow = rule.workflow.as_ref()?;
+
+    let enabled = workflow_enabled(workflow, &config.workflows);
+    let auto_run = workflow_auto_run(workflow, &config.workflows);
+    let already_handled = event.handled_at.is_some();
+    let would_run = enabled && auto_run && !already_handled;
+
+    let reason = if already_handled {
+        Some("event already handled".to_string())
+    } else if !enabled {
+        Some("workflow disabled by config".to_string())
+    } else if !auto_run {
+        Some("workflow not in auto-run allowlist".to_string())
+    } else {
+        None
+    };
+
+    Some(RobotEventWouldHandle {
+        workflow: workflow.clone(),
+        preview_command: rule.get_preview_command(event.pane_id, Some(event.id)),
+        first_step: workflow_first_step(workflow),
+        estimated_duration_ms: None,
+        would_run: Some(would_run),
+        reason,
+    })
+}
+
 #[allow(dead_code)]
 struct RobotContext {
     effective: wa_core::config::EffectiveConfig,
@@ -1292,7 +1441,7 @@ fn build_robot_help() -> RobotHelp {
             },
             RobotCommandInfo {
                 name: "events",
-                description: "Fetch recent events",
+                description: "Fetch recent events (optional workflow preview)",
             },
             RobotCommandInfo {
                 name: "workflow run",
@@ -1407,11 +1556,12 @@ fn build_robot_quick_start() -> RobotQuickStartData {
             },
             QuickStartCommand {
                 name: "events",
-                args: "[--limit N] [--pane ID] [--rule-id ID]",
-                summary: "Fetch recent pattern detection events",
+                args: "[--limit N] [--pane ID] [--rule-id ID] [--event-type TYPE] [--unhandled-only] [--would-handle] [--dry-run]",
+                summary: "Fetch recent pattern detection events (with optional workflow preview)",
                 examples: vec![
                     "wa robot events",
                     "wa robot events --rule-id codex.usage_reached",
+                    "wa robot events --would-handle --dry-run",
                 ],
             },
             QuickStartCommand {
@@ -2628,6 +2778,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             event_type,
                             unhandled,
                             since,
+                            would_handle,
+                            dry_run,
                         } => {
                             // Get workspace layout for DB path
                             let layout = match config.workspace_layout(Some(&workspace_root)) {
@@ -2676,6 +2828,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             // Query events
                             match storage.get_events(query).await {
                                 Ok(events) => {
+                                    let include_preview = would_handle || dry_run;
+                                    let rule_index = if include_preview {
+                                        let engine = wa_core::patterns::PatternEngine::new();
+                                        let mut index = std::collections::HashMap::new();
+                                        for rule in engine.rules() {
+                                            index.insert(rule.id.clone(), rule.clone());
+                                        }
+                                        Some(index)
+                                    } else {
+                                        None
+                                    };
                                     let total_count = events.len();
                                     let items: Vec<RobotEventItem> = events
                                         .into_iter()
@@ -2685,6 +2848,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 || "builtin:unknown".to_string(),
                                                 |agent| format!("builtin:{agent}"),
                                             );
+                                            let preview = if include_preview {
+                                                let rule = rule_index
+                                                    .as_ref()
+                                                    .and_then(|index| index.get(&e.rule_id));
+                                                build_event_would_handle(&e, rule, &config)
+                                            } else {
+                                                None
+                                            };
                                             RobotEventItem {
                                                 id: e.id,
                                                 pane_id: e.pane_id,
@@ -2697,6 +2868,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 captured_at: e.detected_at,
                                                 handled_at: e.handled_at,
                                                 workflow_id: e.handled_by_workflow_id,
+                                                would_handle_with: preview,
                                             }
                                         })
                                         .collect();
@@ -2710,6 +2882,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         event_type_filter: event_type,
                                         unhandled_only: unhandled,
                                         since_filter: since,
+                                        would_handle: include_preview,
+                                        dry_run,
                                     };
                                     let response = RobotResponse::success(data, elapsed_ms(start));
                                     println!("{}", serde_json::to_string_pretty(&response)?);
@@ -3014,49 +3188,421 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let response = RobotResponse::success(data, elapsed_ms(start));
                                     println!("{}", serde_json::to_string_pretty(&response)?);
                                 }
-                                RobotWorkflowCommands::Status { execution_id } => {
-                                    // Workflow status lookup is not yet persisted
-                                    // Return a not-implemented response for now
-                                    let response =
-                                        RobotResponse::<RobotWorkflowStatusData>::error_with_code(
-                                            "robot.not_implemented",
-                                            format!(
-                                                "Workflow status lookup not yet implemented \
-                                                 (execution_id: {execution_id})"
-                                            ),
+                                RobotWorkflowCommands::Status {
+                                    execution_id,
+                                    pane,
+                                    active,
+                                    verbose,
+                                } => {
+                                    // Get workspace layout for DB path
+                                    let layout =
+                                        match config.workspace_layout(Some(&workspace_root)) {
+                                            Ok(l) => l,
+                                            Err(e) => {
+                                                let response = RobotResponse::<
+                                                    RobotWorkflowStatusData,
+                                                >::error_with_code(
+                                                    ROBOT_ERR_CONFIG,
+                                                    format!("Failed to get workspace layout: {e}"),
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
+                                                println!(
+                                                    "{}",
+                                                    serde_json::to_string_pretty(&response)?
+                                                );
+                                                return Ok(());
+                                            }
+                                        };
+
+                                    // Open storage handle
+                                    let db_path = layout.db_path.to_string_lossy();
+                                    let storage = match wa_core::storage::StorageHandle::new(
+                                        &db_path,
+                                    )
+                                    .await
+                                    {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            let response = RobotResponse::<
+                                                    RobotWorkflowStatusData,
+                                                >::error_with_code(
+                                                    ROBOT_ERR_STORAGE,
+                                                    format!("Failed to open storage: {e}"),
+                                                    Some(
+                                                        "Is the database initialized? Run 'wa watch' first."
+                                                            .to_string(),
+                                                    ),
+                                                    elapsed_ms(start),
+                                                );
+                                            println!(
+                                                "{}",
+                                                serde_json::to_string_pretty(&response)?
+                                            );
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    // Validate arguments
+                                    if execution_id.is_none() && !active && pane.is_none() {
+                                        let response = RobotResponse::<
+                                            RobotWorkflowStatusData,
+                                        >::error_with_code(
+                                            "E_MISSING_ARGUMENT",
+                                            "Must provide execution_id, --pane, or --active"
+                                                .to_string(),
                                             Some(
-                                                "Workflow execution status is currently only \
-                                                 available during execution. Persistent status \
-                                                 tracking is planned for a future release."
+                                                "Specify an execution ID, or use --pane <id> to list workflows for a pane, or --active to list all active workflows."
                                                     .to_string(),
                                             ),
                                             elapsed_ms(start),
                                         );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                        println!("{}", serde_json::to_string_pretty(&response)?);
+                                        return Ok(());
+                                    }
+
+                                    // Query by execution_id if provided
+                                    if let Some(exec_id) = &execution_id {
+                                        match storage.get_workflow(exec_id).await {
+                                            Ok(Some(record)) => {
+                                                // Get step logs if verbose
+                                                let step_logs = if verbose {
+                                                    match storage.get_step_logs(exec_id).await {
+                                                        Ok(logs) => Some(
+                                                            logs.into_iter()
+                                                                .map(|log| RobotWorkflowStepLog {
+                                                                    step_index: log.step_index,
+                                                                    step_name: log.step_name,
+                                                                    result_type: log.result_type,
+                                                                    result_data: log
+                                                                        .result_data
+                                                                        .and_then(|s| {
+                                                                            serde_json::from_str(&s)
+                                                                                .ok()
+                                                                        }),
+                                                                    started_at: log.started_at,
+                                                                    completed_at: Some(
+                                                                        log.completed_at,
+                                                                    ),
+                                                                    duration_ms: Some(
+                                                                        log.duration_ms,
+                                                                    ),
+                                                                })
+                                                                .collect(),
+                                                        ),
+                                                        Err(_) => None,
+                                                    }
+                                                } else {
+                                                    None
+                                                };
+
+                                                // Calculate elapsed_ms
+                                                let now = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_millis()
+                                                    as i64;
+                                                let elapsed = if record.completed_at.is_some() {
+                                                    record
+                                                        .completed_at
+                                                        .map(|c| (c - record.started_at) as u64)
+                                                } else {
+                                                    Some((now - record.started_at) as u64)
+                                                };
+
+                                                let data = RobotWorkflowStatusData {
+                                                    execution_id: record.id,
+                                                    workflow_name: record.workflow_name,
+                                                    pane_id: Some(record.pane_id),
+                                                    trigger_event_id: record.trigger_event_id,
+                                                    status: record.status,
+                                                    step_name: None, // Would need workflow definition to get step names
+                                                    elapsed_ms: elapsed,
+                                                    last_step_result: None, // Would need step logs to derive
+                                                    current_step: Some(record.current_step),
+                                                    total_steps: None, // Would need workflow definition
+                                                    wait_condition: record.wait_condition,
+                                                    context: record.context,
+                                                    result: record.result,
+                                                    error: record.error,
+                                                    started_at: Some(record.started_at as u64),
+                                                    updated_at: Some(record.updated_at as u64),
+                                                    completed_at: record
+                                                        .completed_at
+                                                        .map(|c| c as u64),
+                                                    step_logs,
+                                                };
+
+                                                let response =
+                                                    RobotResponse::success(data, elapsed_ms(start));
+                                                println!(
+                                                    "{}",
+                                                    serde_json::to_string_pretty(&response)?
+                                                );
+                                            }
+                                            Ok(None) => {
+                                                let response = RobotResponse::<
+                                                    RobotWorkflowStatusData,
+                                                >::error_with_code(
+                                                    "E_EXECUTION_NOT_FOUND",
+                                                    format!(
+                                                        "No workflow execution found with ID: {exec_id}"
+                                                    ),
+                                                    Some(
+                                                        "Check the execution ID is correct. Use 'wa robot workflow status --active' to list running workflows."
+                                                            .to_string(),
+                                                    ),
+                                                    elapsed_ms(start),
+                                                );
+                                                println!(
+                                                    "{}",
+                                                    serde_json::to_string_pretty(&response)?
+                                                );
+                                            }
+                                            Err(e) => {
+                                                let response = RobotResponse::<
+                                                    RobotWorkflowStatusData,
+                                                >::error_with_code(
+                                                    ROBOT_ERR_STORAGE,
+                                                    format!("Failed to query workflow: {e}"),
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
+                                                println!(
+                                                    "{}",
+                                                    serde_json::to_string_pretty(&response)?
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        // Query active/by-pane workflows
+                                        let records = if active {
+                                            storage.find_incomplete_workflows().await
+                                        } else {
+                                            // Note: pane filter would require a custom query
+                                            // For now, filter in-memory after getting incomplete workflows
+                                            storage.find_incomplete_workflows().await
+                                        };
+
+                                        match records {
+                                            Ok(mut workflows) => {
+                                                // Filter by pane if specified
+                                                if let Some(pane_id) = pane {
+                                                    workflows.retain(|w| w.pane_id == pane_id);
+                                                }
+
+                                                let executions: Vec<RobotWorkflowStatusData> =
+                                                    workflows
+                                                        .into_iter()
+                                                        .map(|record| {
+                                                            let now = std::time::SystemTime::now()
+                                                                .duration_since(
+                                                                    std::time::UNIX_EPOCH,
+                                                                )
+                                                                .unwrap_or_default()
+                                                                .as_millis()
+                                                                as i64;
+                                                            let elapsed =
+                                                                if record.completed_at.is_some() {
+                                                                    record.completed_at.map(|c| {
+                                                                        (c - record.started_at)
+                                                                            as u64
+                                                                    })
+                                                                } else {
+                                                                    Some(
+                                                                        (now - record.started_at)
+                                                                            as u64,
+                                                                    )
+                                                                };
+
+                                                            RobotWorkflowStatusData {
+                                                                execution_id: record.id,
+                                                                workflow_name: record.workflow_name,
+                                                                pane_id: Some(record.pane_id),
+                                                                trigger_event_id: record
+                                                                    .trigger_event_id,
+                                                                status: record.status,
+                                                                step_name: None,
+                                                                elapsed_ms: elapsed,
+                                                                last_step_result: None,
+                                                                current_step: Some(
+                                                                    record.current_step,
+                                                                ),
+                                                                total_steps: None,
+                                                                wait_condition: record
+                                                                    .wait_condition,
+                                                                context: record.context,
+                                                                result: record.result,
+                                                                error: record.error,
+                                                                started_at: Some(
+                                                                    record.started_at as u64,
+                                                                ),
+                                                                updated_at: Some(
+                                                                    record.updated_at as u64,
+                                                                ),
+                                                                completed_at: record
+                                                                    .completed_at
+                                                                    .map(|c| c as u64),
+                                                                step_logs: None, // Not included in list mode
+                                                            }
+                                                        })
+                                                        .collect();
+
+                                                let count = executions.len();
+                                                let data = RobotWorkflowStatusListData {
+                                                    executions,
+                                                    pane_filter: pane,
+                                                    active_only: if active {
+                                                        Some(true)
+                                                    } else {
+                                                        None
+                                                    },
+                                                    count,
+                                                };
+
+                                                let response =
+                                                    RobotResponse::success(data, elapsed_ms(start));
+                                                println!(
+                                                    "{}",
+                                                    serde_json::to_string_pretty(&response)?
+                                                );
+                                            }
+                                            Err(e) => {
+                                                let response = RobotResponse::<
+                                                    RobotWorkflowStatusListData,
+                                                >::error_with_code(
+                                                    ROBOT_ERR_STORAGE,
+                                                    format!("Failed to query workflows: {e}"),
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
+                                                println!(
+                                                    "{}",
+                                                    serde_json::to_string_pretty(&response)?
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    // Clean shutdown of storage
+                                    if let Err(e) = storage.shutdown().await {
+                                        tracing::warn!("Failed to shutdown storage cleanly: {e}");
+                                    }
                                 }
                                 RobotWorkflowCommands::Abort {
                                     execution_id,
                                     reason,
                                 } => {
-                                    // Workflow abort is not yet implemented
-                                    // Return a not-implemented response for now
-                                    let _ = reason; // Will be used when abort is implemented
-                                    let response =
-                                        RobotResponse::<RobotWorkflowAbortData>::error_with_code(
-                                            "robot.not_implemented",
-                                            format!(
-                                                "Workflow abort not yet implemented \
-                                                 (execution_id: {execution_id})"
-                                            ),
-                                            Some(
-                                                "Workflow abort requires persistent execution \
-                                                 tracking. This feature is planned for a future \
-                                                 release."
-                                                    .to_string(),
-                                            ),
-                                            elapsed_ms(start),
-                                        );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    use wa_core::policy::{PolicyEngine, PolicyGatedInjector};
+                                    use wa_core::storage::StorageHandle;
+                                    use wa_core::workflows::{
+                                        PaneWorkflowLockManager, WorkflowEngine, WorkflowRunner,
+                                        WorkflowRunnerConfig,
+                                    };
+
+                                    // Set up storage
+                                    let db_path = &ctx.effective.paths.db_path;
+                                    let storage = match StorageHandle::new(db_path).await {
+                                        Ok(s) => Arc::new(s),
+                                        Err(e) => {
+                                            let response =
+                                                RobotResponse::<RobotWorkflowAbortData>::error_with_code(
+                                                    ROBOT_ERR_STORAGE,
+                                                    format!("Failed to open storage: {e}"),
+                                                    Some(
+                                                        "Check database path and permissions."
+                                                            .to_string(),
+                                                    ),
+                                                    elapsed_ms(start),
+                                                );
+                                            println!(
+                                                "{}",
+                                                serde_json::to_string_pretty(&response)?
+                                            );
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    // Set up minimal workflow infrastructure for abort
+                                    let engine = WorkflowEngine::new(10);
+                                    let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+                                    let policy_engine = PolicyEngine::new(
+                                        config.safety.rate_limit_per_pane,
+                                        config.safety.rate_limit_global,
+                                        false,
+                                    );
+                                    let wezterm_client = wa_core::wezterm::WeztermClient::new();
+                                    let injector = Arc::new(tokio::sync::Mutex::new(
+                                        PolicyGatedInjector::new(policy_engine, wezterm_client),
+                                    ));
+                                    let runner_config = WorkflowRunnerConfig::default();
+                                    let runner = WorkflowRunner::new(
+                                        engine,
+                                        lock_manager,
+                                        Arc::clone(&storage),
+                                        injector,
+                                        runner_config,
+                                    );
+
+                                    // Execute the abort
+                                    match runner
+                                        .abort_execution(
+                                            &execution_id,
+                                            reason.as_deref(),
+                                            false, // force
+                                        )
+                                        .await
+                                    {
+                                        Ok(result) => {
+                                            let data = RobotWorkflowAbortData {
+                                                execution_id: result.execution_id,
+                                                aborted: result.aborted,
+                                                workflow_name: Some(result.workflow_name),
+                                                previous_status: Some(result.previous_status),
+                                                reason: result.reason,
+                                                aborted_at: result.aborted_at,
+                                                error_reason: result.error_reason,
+                                            };
+                                            let response =
+                                                RobotResponse::success(data, elapsed_ms(start));
+                                            println!(
+                                                "{}",
+                                                serde_json::to_string_pretty(&response)?
+                                            );
+                                        }
+                                        Err(e) => {
+                                            let (code, hint) = match &e {
+                                                wa_core::Error::Workflow(
+                                                    wa_core::error::WorkflowError::NotFound(_),
+                                                ) => (
+                                                    "E_EXECUTION_NOT_FOUND",
+                                                    Some(
+                                                        "Check the execution ID is correct. Use \
+                                                         'wa robot workflow status --active' to \
+                                                         list running workflows."
+                                                            .to_string(),
+                                                    ),
+                                                ),
+                                                _ => (ROBOT_ERR_STORAGE, None),
+                                            };
+                                            let response =
+                                                RobotResponse::<RobotWorkflowAbortData>::error_with_code(
+                                                    code,
+                                                    format!("Failed to abort workflow: {e}"),
+                                                    hint,
+                                                    elapsed_ms(start),
+                                                );
+                                            println!(
+                                                "{}",
+                                                serde_json::to_string_pretty(&response)?
+                                            );
+                                        }
+                                    }
+
+                                    // Clean shutdown of storage
+                                    if let Err(e) = storage.shutdown().await {
+                                        tracing::warn!("Failed to shutdown storage cleanly: {e}");
+                                    }
                                 }
                             }
                         }
@@ -3801,7 +4347,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 println!("Diagnostics completed with errors. Fix issues above before using wa.");
                 std::process::exit(1);
             } else if has_warnings {
-                println!("Diagnostics completed with warnings. wa should work but performance may be affected.");
+                println!(
+                    "Diagnostics completed with warnings. wa should work but performance may be affected."
+                );
             } else {
                 println!("All checks passed! wa is ready to use.");
             }
@@ -3819,20 +4367,29 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         if lines >= RECOMMENDED_SCROLLBACK_LINES {
                             println!("✓ Your WezTerm scrollback is already configured!");
                             println!("  Current: {} lines in {}", lines, path.display());
-                            println!("  Recommended minimum: {} lines", RECOMMENDED_SCROLLBACK_LINES);
+                            println!(
+                                "  Recommended minimum: {} lines",
+                                RECOMMENDED_SCROLLBACK_LINES
+                            );
                             println!("\nNo changes needed.");
                         } else {
                             println!("⚠ Your WezTerm scrollback is below recommended minimum.");
                             println!("  Current: {} lines in {}", lines, path.display());
                             println!("  Recommended: {} lines\n", RECOMMENDED_SCROLLBACK_LINES);
                             println!("Add this line to your wezterm.lua:");
-                            println!("  config.scrollback_lines = {}", RECOMMENDED_SCROLLBACK_LINES);
+                            println!(
+                                "  config.scrollback_lines = {}",
+                                RECOMMENDED_SCROLLBACK_LINES
+                            );
                         }
                     }
                     Err(_) => {
                         println!("Could not find or parse WezTerm config.\n");
                         println!("Add the following to your ~/.config/wezterm/wezterm.lua:\n");
-                        println!("  config.scrollback_lines = {}\n", RECOMMENDED_SCROLLBACK_LINES);
+                        println!(
+                            "  config.scrollback_lines = {}\n",
+                            RECOMMENDED_SCROLLBACK_LINES
+                        );
                         println!("This ensures wa can capture all terminal output without gaps.");
                     }
                 }
@@ -3871,7 +4428,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 println!();
                 println!("-- Optional: Quick-access key for wa status");
                 println!("-- config.keys = {{");
-                println!("--   {{ key = 'w', mods = 'CTRL|SHIFT', action = wezterm.action.SpawnCommandInNewTab {{");
+                println!(
+                    "--   {{ key = 'w', mods = 'CTRL|SHIFT', action = wezterm.action.SpawnCommandInNewTab {{"
+                );
                 println!("--     args = {{ 'wa', 'status' }},");
                 println!("--   }} }},");
                 println!("-- }}");
@@ -3884,8 +4443,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         #[cfg(feature = "tui")]
         Some(Commands::Tui { debug, refresh }) => {
-            use wa_core::tui::{run_tui, AppConfig, ProductionQueryClient};
             use std::time::Duration;
+            use wa_core::tui::{AppConfig, ProductionQueryClient, run_tui};
 
             let query_client = ProductionQueryClient::new(layout.clone());
             let tui_config = AppConfig {
@@ -4325,17 +4884,16 @@ fn check_wezterm_scrollback() -> Result<(u64, std::path::PathBuf), String> {
                     ));
                 }
                 Err(e) => {
-                    return Err(format!(
-                        "Failed to read {}: {}",
-                        config_path.display(),
-                        e
-                    ));
+                    return Err(format!("Failed to read {}: {}", config_path.display(), e));
                 }
             }
         }
     }
 
-    Err("No WezTerm config file found (~/.config/wezterm/wezterm.lua or ~/.wezterm.lua)".to_string())
+    Err(
+        "No WezTerm config file found (~/.config/wezterm/wezterm.lua or ~/.wezterm.lua)"
+            .to_string(),
+    )
 }
 
 /// Diagnostic result for a single check
@@ -4372,7 +4930,11 @@ impl DiagnosticCheck {
         }
     }
 
-    fn warning(name: &'static str, detail: impl Into<String>, recommendation: impl Into<String>) -> Self {
+    fn warning(
+        name: &'static str,
+        detail: impl Into<String>,
+        recommendation: impl Into<String>,
+    ) -> Self {
         Self {
             name,
             status: DiagnosticStatus::Warning,
@@ -4381,7 +4943,11 @@ impl DiagnosticCheck {
         }
     }
 
-    fn error(name: &'static str, detail: impl Into<String>, recommendation: impl Into<String>) -> Self {
+    fn error(
+        name: &'static str,
+        detail: impl Into<String>,
+        recommendation: impl Into<String>,
+    ) -> Self {
         Self {
             name,
             status: DiagnosticStatus::Error,
@@ -4410,7 +4976,9 @@ impl DiagnosticCheck {
 }
 
 /// Run all diagnostic checks and return results
-fn run_diagnostics(permission_warnings: &[wa_core::config::PermissionWarning]) -> Vec<DiagnosticCheck> {
+fn run_diagnostics(
+    permission_warnings: &[wa_core::config::PermissionWarning],
+) -> Vec<DiagnosticCheck> {
     let mut checks = Vec::new();
 
     // Check 1: wa-core loaded
@@ -4453,7 +5021,10 @@ fn run_diagnostics(permission_warnings: &[wa_core::config::PermissionWarning]) -
             } else {
                 checks.push(DiagnosticCheck::warning(
                     "WezTerm scrollback",
-                    format!("{} lines (below {} recommended)", lines, RECOMMENDED_SCROLLBACK_LINES),
+                    format!(
+                        "{} lines (below {} recommended)",
+                        lines, RECOMMENDED_SCROLLBACK_LINES
+                    ),
                     format!(
                         "Add to wezterm.lua: config.scrollback_lines = {}",
                         RECOMMENDED_SCROLLBACK_LINES

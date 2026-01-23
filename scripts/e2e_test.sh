@@ -1651,15 +1651,45 @@ run_scenario_workspace_isolation() {
     wait "$wa_pid" 2>/dev/null || true
     wa_pid=""
 
-    # Step 12: Verify derived paths differ between workspaces
-    log_info "Step 12: Verifying workspace paths are distinct..."
+    # Step 12: Verify derived paths and workspace roots are distinct
+    log_info "Step 12: Verifying workspace roots and derived paths..."
     local db_a
     local db_b
+    local root_a
+    local root_b
+    local log_a
+    local log_b
+    local logs_dir_a
+    local logs_dir_b
     db_a=$(jq -r '.paths.db_path // empty' "$scenario_dir/config_effective_a.json" 2>/dev/null || echo "")
     db_b=$(jq -r '.paths.db_path // empty' "$scenario_dir/config_effective_b.json" 2>/dev/null || echo "")
+    root_a=$(jq -r '.paths.workspace_root // empty' "$scenario_dir/config_effective_a.json" 2>/dev/null || echo "")
+    root_b=$(jq -r '.paths.workspace_root // empty' "$scenario_dir/config_effective_b.json" 2>/dev/null || echo "")
+    log_a=$(jq -r '.paths.log_path // empty' "$scenario_dir/config_effective_a.json" 2>/dev/null || echo "")
+    log_b=$(jq -r '.paths.log_path // empty' "$scenario_dir/config_effective_b.json" 2>/dev/null || echo "")
+    logs_dir_a=$(jq -r '.paths.logs_dir // empty' "$scenario_dir/config_effective_a.json" 2>/dev/null || echo "")
+    logs_dir_b=$(jq -r '.paths.logs_dir // empty' "$scenario_dir/config_effective_b.json" 2>/dev/null || echo "")
 
+    echo "workspace_root_a: $root_a" >> "$scenario_dir/scenario.log"
+    echo "workspace_root_b: $root_b" >> "$scenario_dir/scenario.log"
     echo "db_path_a: $db_a" >> "$scenario_dir/scenario.log"
     echo "db_path_b: $db_b" >> "$scenario_dir/scenario.log"
+    echo "log_path_a: $log_a" >> "$scenario_dir/scenario.log"
+    echo "log_path_b: $log_b" >> "$scenario_dir/scenario.log"
+    echo "logs_dir_a: $logs_dir_a" >> "$scenario_dir/scenario.log"
+    echo "logs_dir_b: $logs_dir_b" >> "$scenario_dir/scenario.log"
+
+    if [[ -n "$root_a" && -n "$root_b" ]]; then
+        if [[ "$root_a" == "$workspace_a" && "$root_b" == "$workspace_b" ]]; then
+            log_pass "Workspace roots match expected paths"
+        else
+            log_fail "Workspace roots do not match expected paths"
+            result=1
+        fi
+    else
+        log_fail "Could not parse workspace roots from effective config"
+        result=1
+    fi
 
     if [[ -n "$db_a" && -n "$db_b" ]]; then
         if [[ "$db_a" != "$db_b" ]]; then
@@ -1670,6 +1700,30 @@ run_scenario_workspace_isolation() {
         fi
     else
         log_fail "Could not parse db paths from effective config"
+        result=1
+    fi
+
+    if [[ -n "$log_a" && -n "$log_b" ]]; then
+        if [[ "$log_a" != "$log_b" ]]; then
+            log_pass "Workspace log paths are distinct"
+        else
+            log_fail "Workspace log paths are identical (expected distinct)"
+            result=1
+        fi
+    else
+        log_fail "Could not parse log paths from effective config"
+        result=1
+    fi
+
+    if [[ -n "$logs_dir_a" && -n "$logs_dir_b" ]]; then
+        if [[ "$logs_dir_a" != "$logs_dir_b" ]]; then
+            log_pass "Workspace logs directories are distinct"
+        else
+            log_fail "Workspace logs directories are identical (expected distinct)"
+            result=1
+        fi
+    else
+        log_fail "Could not parse logs directories from effective config"
         result=1
     fi
 

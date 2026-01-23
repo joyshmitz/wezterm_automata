@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://wezterm-automata.dev/schemas/wa-robot-events.json",
   "title": "WA Robot Events Response",
-  "description": "Schema for the data field when calling 'wa robot events'. Returns recent detected events.",
+  "description": "Schema for the data field when calling 'wa robot events'. Returns recent detected events and optional workflow previews.",
   "type": "object",
   "required": ["events"],
   "properties": {
@@ -12,6 +12,11 @@
       "items": {
         "$ref": "#/$defs/event"
       }
+    },
+    "total_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of events returned"
     },
     "limit": {
       "type": "integer",
@@ -23,13 +28,34 @@
       "minimum": 0,
       "description": "If set, events were filtered to this pane_id"
     },
-    "type_filter": {
+    "rule_id_filter": {
+      "type": "string",
+      "description": "If set, events were filtered to this rule_id"
+    },
+    "event_type_filter": {
       "type": "string",
       "description": "If set, events were filtered to this event_type"
+    },
+    "type_filter": {
+      "type": "string",
+      "description": "Deprecated alias for event_type_filter"
     },
     "unhandled_only": {
       "type": "boolean",
       "description": "If true, only unhandled events were returned"
+    },
+    "since_filter": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "If set, events were filtered to those detected after this timestamp (ms)"
+    },
+    "would_handle": {
+      "type": "boolean",
+      "description": "If true, per-event workflow previews are included"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "If true, this was a dry-run preview (no workflows executed)"
     }
   },
   "additionalProperties": false,
@@ -37,7 +63,7 @@
     "event": {
       "type": "object",
       "description": "A detected event from pattern matching",
-      "required": ["id", "pane_id", "rule_id", "agent_type", "event_type", "severity", "detected_at"],
+      "required": ["id", "pane_id", "rule_id", "pack_id", "event_type", "severity", "confidence", "captured_at"],
       "properties": {
         "id": {
           "type": "integer",
@@ -52,6 +78,10 @@
         "rule_id": {
           "type": "string",
           "description": "Pattern rule that matched (e.g., 'core.codex:usage_warning_25')"
+        },
+        "pack_id": {
+          "type": "string",
+          "description": "Pattern pack identifier"
         },
         "agent_type": {
           "type": "string",
@@ -82,7 +112,7 @@
           "type": "string",
           "description": "The text that matched the pattern (may be redacted)"
         },
-        "detected_at": {
+        "captured_at": {
           "type": "integer",
           "minimum": 0,
           "description": "Unix timestamp (ms) when the event was detected"
@@ -92,13 +122,46 @@
           "minimum": 0,
           "description": "Unix timestamp (ms) when the event was handled (null if unhandled)"
         },
-        "handled_by_workflow_id": {
+        "workflow_id": {
           "type": ["string", "null"],
           "description": "ID of the workflow execution that handled this event"
         },
-        "suggested_action": {
+        "would_handle_with": {
+          "$ref": "#/$defs/would_handle_with",
+          "description": "Preview of the workflow that would handle this event (if requested)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "would_handle_with": {
+      "type": "object",
+      "description": "Workflow preview for an event",
+      "required": ["workflow"],
+      "properties": {
+        "workflow": {
           "type": "string",
-          "description": "Recommended action for this event type"
+          "description": "Workflow name"
+        },
+        "preview_command": {
+          "type": "string",
+          "description": "Preview command to run this workflow"
+        },
+        "first_step": {
+          "type": "string",
+          "description": "First step name in the workflow"
+        },
+        "estimated_duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Estimated total workflow duration (ms)"
+        },
+        "would_run": {
+          "type": "boolean",
+          "description": "Whether this workflow would auto-run given current config/state"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Reason the workflow would not run (if applicable)"
         }
       },
       "additionalProperties": false

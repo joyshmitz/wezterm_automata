@@ -8,10 +8,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget, Tabs},
+    widgets::{Block, Borders, Paragraph, Tabs, Widget},
 };
 
-use super::query::{HealthStatus, PaneView, EventView};
+use super::query::{EventView, HealthStatus, PaneView};
 
 /// Available views in the TUI
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -43,7 +43,13 @@ impl View {
 
     /// Get all views in tab order
     pub const fn all() -> &'static [View] {
-        &[View::Home, View::Panes, View::Events, View::Search, View::Help]
+        &[
+            View::Home,
+            View::Panes,
+            View::Events,
+            View::Search,
+            View::Help,
+        ]
     }
 
     /// Get the index of this view in the tab order
@@ -138,16 +144,20 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Title
-            Constraint::Length(6),  // Health status
-            Constraint::Min(5),     // Quick stats
-            Constraint::Length(3),  // Footer
+            Constraint::Length(3), // Title
+            Constraint::Length(6), // Health status
+            Constraint::Min(5),    // Quick stats
+            Constraint::Length(3), // Footer
         ])
         .split(area);
 
     // Title
     let title = Paragraph::new("WezTerm Automata")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .block(Block::default().borders(Borders::NONE));
     title.render(chunks[0], buf);
 
@@ -182,14 +192,20 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         ))]
     };
 
-    let health_block = Paragraph::new(health_text)
-        .block(Block::default().title("System Status").borders(Borders::ALL));
+    let health_block = Paragraph::new(health_text).block(
+        Block::default()
+            .title("System Status")
+            .borders(Borders::ALL),
+    );
     health_block.render(chunks[1], buf);
 
     // Instructions
     let instructions = Paragraph::new(vec![
         Line::from(""),
-        Line::from(Span::styled("Navigation:", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            "Navigation:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
         Line::from("  Tab / Shift+Tab: Switch views"),
         Line::from("  q: Quit"),
         Line::from("  r: Refresh data"),
@@ -227,7 +243,9 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     let mut lines: Vec<Line> = Vec::new();
     for (i, pane) in state.panes.iter().enumerate() {
         let style = if i == state.selected_index {
-            Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -283,7 +301,10 @@ pub fn render_events_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
                 format!("[{:8}]", truncate_str(&event.severity, 8)),
                 severity_style,
             ),
-            Span::raw(format!(" Pane {} | {} {}", event.pane_id, event.rule_id, handled_marker)),
+            Span::raw(format!(
+                " Pane {} | {} {}",
+                event.pane_id, event.rule_id, handled_marker
+            )),
         ]));
     }
 
@@ -296,14 +317,17 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Search input
-            Constraint::Min(5),     // Results
+            Constraint::Length(3), // Search input
+            Constraint::Min(5),    // Results
         ])
         .split(area);
 
     // Search input
-    let search_input = Paragraph::new(state.search_query.as_str())
-        .block(Block::default().title("Search (FTS5)").borders(Borders::ALL));
+    let search_input = Paragraph::new(state.search_query.as_str()).block(
+        Block::default()
+            .title("Search (FTS5)")
+            .borders(Borders::ALL),
+    );
     search_input.render(chunks[0], buf);
 
     // Placeholder for results
@@ -318,9 +342,15 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
 /// Render the help view
 pub fn render_help_view(area: Rect, buf: &mut Buffer) {
     let help_text = vec![
-        Line::from(Span::styled("WezTerm Automata TUI", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            "WezTerm Automata TUI",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
-        Line::from(Span::styled("Global Keybindings:", Style::default().add_modifier(Modifier::UNDERLINED))),
+        Line::from(Span::styled(
+            "Global Keybindings:",
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        )),
         Line::from("  q          Quit"),
         Line::from("  ?          Show this help"),
         Line::from("  r          Refresh current view"),
@@ -328,12 +358,18 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
         Line::from("  Shift+Tab  Previous view"),
         Line::from("  1-5        Jump to view by number"),
         Line::from(""),
-        Line::from(Span::styled("List Navigation:", Style::default().add_modifier(Modifier::UNDERLINED))),
+        Line::from(Span::styled(
+            "List Navigation:",
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        )),
         Line::from("  j / Down   Move selection down"),
         Line::from("  k / Up     Move selection up"),
         Line::from("  Enter      Select/inspect item"),
         Line::from(""),
-        Line::from(Span::styled("Views:", Style::default().add_modifier(Modifier::UNDERLINED))),
+        Line::from(Span::styled(
+            "Views:",
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        )),
         Line::from("  1. Home    System overview and health"),
         Line::from("  2. Panes   List all WezTerm panes"),
         Line::from("  3. Events  Recent detection events"),
@@ -341,8 +377,8 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
         Line::from("  5. Help    This screen"),
     ];
 
-    let help = Paragraph::new(help_text)
-        .block(Block::default().title("Help").borders(Borders::ALL));
+    let help =
+        Paragraph::new(help_text).block(Block::default().title("Help").borders(Borders::ALL));
     help.render(area, buf);
 }
 

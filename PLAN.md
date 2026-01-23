@@ -1411,6 +1411,46 @@ This makes it possible to:
 - Expose rules via robot mode (`wa rules list`, `wa rules test`)
 - Version rule packs independently
 
+#### 6.2.1 Explain-match trace (rules test)
+
+`wa rules test` / `wa robot rules test` can optionally return a per-detection
+`match_trace` payload intended for debugging. The trace is **bounded** and
+**redacted** by design: it never includes raw input or secret values.
+
+**Trace schema (v0, per detection):**
+
+```
+match_trace: {
+  rule_id: string,              // stable rule id
+  spans: [                      // where the match occurred (indices only)
+    { start: u64, end: u64, kind: "anchor|regex|context", capture_keys?: [string] }
+  ],
+  extracted_keys: [string],     // keys present in `extracted` (values omitted)
+  confidence?: f64,             // optional score (0..1)
+  eval_path: [                  // evaluation path / subpattern hits
+    { stage: string, matched: bool, hits?: [string] }
+  ],
+  bounds: {                     // boundedness + truncation metadata
+    max_spans: u32,
+    max_bytes: u32,
+    truncated: bool,
+    truncated_fields?: [string]
+  },
+  redaction: {                  // explicit safety contract
+    enabled: bool,
+    policy: string,             // e.g. "omit_values"
+    redacted_fields?: [string]
+  }
+}
+```
+
+**Safety / boundedness defaults:**
+- `max_spans`: 8 (cap per detection)
+- `max_bytes`: 4096 (cap total trace JSON size)
+- **No raw snippets**: spans are indices only; anchors/hits must be rule-defined labels,
+  not input substrings.
+- If truncation occurs, set `bounds.truncated=true` and list `truncated_fields`.
+
 ### 6.3 Agent-Specific Patterns
 
 ```rust
@@ -4352,6 +4392,9 @@ wa robot quick-start
 
 #### A.3 MCP Tools/Resources (via `fastmcp_rust`)
 
+MCP mirrors robot mode: tools use `wa.*`, resources use `wa://...`. The goal is
+token-efficient parity with `wa robot` and stable, versioned schemas.
+
 Tool naming (short and obvious):
 
 | Tool | Description |
@@ -4367,6 +4410,109 @@ Tool naming (short and obvious):
 | `wa.accounts_refresh` | Refresh account usage |
 | `wa.rules_list` | List detection rules |
 | `wa.rules_test` | Test pattern matching |
+| `wa.reservations` | List active reservations |
+| `wa.reserve` | Create a reservation |
+| `wa.release` | Release a reservation |
+
+##### A.3.1 Response envelope (v1)
+
+All MCP tools return the same envelope shape:
+
+```json
+{
+  "ok": true,
+  "data": { ... },
+  "error": "human readable message (when ok=false)",
+  "error_code": "WA-MCP-0001",
+  "hint": "optional remediation hint",
+  "elapsed_ms": 12,
+  "version": "0.1.0",
+  "now": 1700000000000,
+  "mcp_version": "v1"
+}
+```
+
+Notes:
+- `data` matches the corresponding robot `data` schema under `docs/json-schema/`.
+- `version` is the wa semver; `mcp_version` is the MCP surface version.
+- Fields are stable; additions are backward-compatible only.
+
+##### A.3.2 Error codes (stable)
+
+All MCP errors use stable codes prefixed with `WA-MCP-`:
+
+| Error code | Meaning | Robot equivalent |
+|------------|---------|------------------|
+| `WA-MCP-0001` | Invalid arguments | `robot.invalid_args` |
+| `WA-MCP-0002` | Unknown tool/resource | `robot.unknown_subcommand` |
+| `WA-MCP-0003` | Config error | `robot.config_error` |
+| `WA-MCP-0004` | WezTerm CLI error | `robot.wezterm_error` |
+| `WA-MCP-0005` | Storage error | `robot.storage_error` |
+| `WA-MCP-0006` | Policy denied | `robot.policy_denied` |
+| `WA-MCP-0007` | Pane not found | `robot.pane_not_found` |
+| `WA-MCP-0008` | Workflow error | `robot.workflow_error` |
+| `WA-MCP-0009` | Timeout | `robot.timeout` |
+| `WA-MCP-0010` | Not implemented | `robot.not_implemented` |
+
+##### A.3.3 Tool specs (v1)
+
+Each tool maps 1:1 to `wa robot` with the same data schema:
+
+- `wa.state`
+  - Params: `{ domain?: string, agent?: string, pane_id?: u64 }`
+  - Data: `docs/json-schema/wa-robot-state.json`
+
+- `wa.get_text`
+  - Params: `{ pane_id: u64, tail?: u64=50, escapes?: bool=false }`
+  - Data: `docs/json-schema/wa-robot-get-text.json`
+
+- `wa.send`
+  - Params: `{ pane_id: u64, text: string, dry_run?: bool=false, wait_for?: string, timeout_secs?: u64=30, wait_for_regex?: bool=false }`
+  - Data: `docs/json-schema/wa-robot-send.json`
+
+- `wa.wait_for`
+  - Params: `{ pane_id: u64, pattern: string, timeout_secs?: u64=30, tail?: u64=200, regex?: bool=false }`
+  - Data: `docs/json-schema/wa-robot-wait-for.json`
+
+- `wa.search`
+  - Params: `{ query: string, limit?: u64=20, pane?: u64, since?: i64, snippets?: bool=false }`
+  - Data: `docs/json-schema/wa-robot-search.json`
+
+- `wa.events`
+  - Params: `{ limit?: u64=20, pane?: u64, rule_id?: string, event_type?: string, unhandled?: bool=false, since?: i64, would_handle?: bool=false, dry_run?: bool=false }`
+  - Data: `docs/json-schema/wa-robot-events.json`
+
+- `wa.workflow_run`
+  - Params: `{ name: string, pane_id: u64, force?: bool=false, dry_run?: bool=false }`
+  - Data: `docs/json-schema/wa-robot-workflow-run.json`
+
+- `wa.accounts`
+  - Params: `{ service?: string }`
+  - Data: `docs/json-schema/wa-robot-accounts.json`
+
+- `wa.accounts_refresh`
+  - Params: `{ service?: string }`
+  - Data: `docs/json-schema/wa-robot-accounts-refresh.json`
+
+- `wa.rules_list`
+  - Params: `{ pack?: string }`
+  - Data: `docs/json-schema/wa-robot-rules-list.json`
+
+- `wa.rules_test`
+  - Params: `{ text: string, agent?: string }`
+  - Data: `docs/json-schema/wa-robot-rules-test.json`
+
+- `wa.reservations`
+  - Params: `{ pane_id?: u64 }`
+  - Data: `docs/json-schema/wa-robot-reservations.json`
+
+- `wa.reserve`
+  - Params: `{ pane_id: u64, owner?: string, ttl_secs?: u64 }`
+  - Data: `docs/json-schema/wa-robot-reserve.json`
+
+- `wa.release`
+  - Params: `{ reservation_id: string }`
+  - Data: `docs/json-schema/wa-robot-release.json`
 
 Resources:
 - `wa://panes` — Current pane registry
@@ -4374,6 +4520,12 @@ Resources:
 - `wa://accounts` — Account status
 - `wa://workflows` — Available workflows
 - `wa://rules` — Pattern rules
+- `wa://reservations` — Active reservations snapshot
+
+Resource semantics (v1):
+- Read-only snapshots, no side effects.
+- Default parameters mirror the tool defaults (e.g., `wa://events?limit=20`).
+- Payloads mirror the corresponding tool `data` schemas for parity.
 
 ---
 

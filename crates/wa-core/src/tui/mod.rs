@@ -38,5 +38,5 @@ mod query;
 mod views;
 
 pub use app::{App, AppConfig, run_tui};
-pub use query::{QueryClient, QueryError, ProductionQueryClient};
+pub use query::{ProductionQueryClient, QueryClient, QueryError};
 pub use views::{View, ViewState};

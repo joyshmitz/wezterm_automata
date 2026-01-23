@@ -448,7 +448,7 @@ impl PaneCursor {
 
         // Check for alt-screen changes before delta extraction
         let alt_screen_changes = detect_alt_screen_changes(current_snapshot);
-        
+
         // Determine if an actual state transition occurred relative to current state
         let mut simulated_state = self.in_alt_screen;
         let mut actual_transition_occurred = false;
@@ -458,13 +458,13 @@ impl PaneCursor {
                 AltScreenChange::Entered => true,
                 AltScreenChange::Exited => false,
             };
-            
+
             if new_state != simulated_state {
                 simulated_state = new_state;
                 actual_transition_occurred = true;
             }
         }
-        
+
         // Update final state
         self.in_alt_screen = simulated_state;
 

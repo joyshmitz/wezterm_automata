@@ -3,6 +3,7 @@
 //! Provides fast, reliable detection of agent state transitions.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use aho_corasick::AhoCorasick;
 use fancy_regex::Regex;
@@ -69,6 +70,114 @@ pub struct Detection {
     pub extracted: serde_json::Value,
     /// Original matched text
     pub matched_text: String,
+}
+
+/// Options for explain-match trace generation.
+#[derive(Debug, Clone)]
+pub struct TraceOptions {
+    /// Maximum number of evidence items per trace.
+    pub max_evidence_items: usize,
+    /// Maximum bytes per excerpt in evidence items.
+    pub max_excerpt_bytes: usize,
+    /// Maximum bytes per extracted capture value.
+    pub max_capture_bytes: usize,
+    /// Include traces for rules that did not fully match (e.g., regex miss).
+    pub include_non_matches: bool,
+}
+
+impl Default for TraceOptions {
+    fn default() -> Self {
+        Self {
+            max_evidence_items: 8,
+            max_excerpt_bytes: 160,
+            max_capture_bytes: 120,
+            include_non_matches: false,
+        }
+    }
+}
+
+/// Span information for trace evidence (byte offsets in the original text).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceSpan {
+    /// Start byte offset (inclusive)
+    pub start: usize,
+    /// End byte offset (exclusive)
+    pub end: usize,
+}
+
+/// Trace evidence item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceEvidence {
+    /// Evidence kind (anchor, match, capture)
+    pub kind: String,
+    /// Optional label (anchor text or capture name)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Optional span in the original text
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<TraceSpan>,
+    /// Redacted, bounded excerpt
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    /// Whether the excerpt was truncated to bounds
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+/// Gate evaluation trace for rule eligibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceGate {
+    /// Gate identifier (e.g., "agent_type", "dedupe")
+    pub gate: String,
+    /// Whether the gate passed
+    pub passed: bool,
+    /// Optional explanation for failures
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Boundedness metadata for a trace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceBounds {
+    /// Maximum evidence items allowed
+    pub max_evidence_items: usize,
+    /// Maximum bytes per excerpt
+    pub max_excerpt_bytes: usize,
+    /// Maximum bytes per capture value
+    pub max_capture_bytes: usize,
+    /// Total evidence items before truncation
+    pub evidence_total: usize,
+    /// Whether evidence list was truncated
+    pub evidence_truncated: bool,
+    /// Labels of fields that were truncated
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub truncated_fields: Vec<String>,
+}
+
+/// Explain-match trace for a single rule match.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MatchTrace {
+    /// Pack identifier (e.g., "builtin:codex")
+    pub pack_id: String,
+    /// Stable rule identifier
+    pub rule_id: String,
+    /// Optional extractor identifier (e.g., "regex")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extractor_id: Option<String>,
+    /// Redacted, bounded matched text (best-effort)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_text: Option<String>,
+    /// Optional confidence (mirrors detection confidence when available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    /// Whether the rule is eligible after state gates
+    pub eligible: bool,
+    /// Gate decisions
+    pub gates: Vec<TraceGate>,
+    /// Evidence list (anchors, matches, captures)
+    pub evidence: Vec<TraceEvidence>,
+    /// Boundedness metadata
+    pub bounds: TraceBounds,
 }
 
 impl Detection {
@@ -370,6 +479,7 @@ struct CompiledRule {
     regex: Option<Regex>,
 }
 
+#[derive(Debug)]
 struct EngineIndex {
     compiled_rules: Vec<CompiledRule>,
     anchor_list: Vec<String>,
@@ -1014,18 +1124,8 @@ fn builtin_wezterm_pack() -> PatternPack {
 pub struct PatternEngine {
     /// Merged rule library
     library: PatternLibrary,
-    /// Compiled rule cache
-    compiled_rules: Vec<CompiledRule>,
-    /// Anchor list aligned with Aho-Corasick pattern IDs
-    anchor_list: Vec<String>,
-    /// Anchor-to-rule index (anchor -> rule indices)
-    anchor_to_rules: HashMap<String, Vec<usize>>,
-    /// Aho-Corasick matcher for anchors
-    anchor_matcher: Option<AhoCorasick>,
-    /// Quick-reject byte set (first bytes of anchors)
-    quick_bytes: Vec<u8>,
-    /// Whether the engine is initialized
-    initialized: bool,
+    /// Lazily-initialized compiled index (first-use compilation)
+    index: OnceLock<EngineIndex>,
 }
 
 impl Default for PatternEngine {
@@ -1035,21 +1135,14 @@ impl Default for PatternEngine {
 }
 
 impl PatternEngine {
-    /// Create a new pattern engine with default packs
+    /// Create a new pattern engine with default packs (lazy-compiled on first use).
     #[must_use]
     pub fn new() -> Self {
         let library =
             PatternLibrary::new(builtin_packs()).expect("builtin pattern packs must be valid");
-        let index =
-            build_engine_index(library.rules()).expect("builtin pattern packs must compile");
         Self {
             library,
-            compiled_rules: index.compiled_rules,
-            anchor_list: index.anchor_list,
-            anchor_to_rules: index.anchor_to_rules,
-            anchor_matcher: index.anchor_matcher,
-            quick_bytes: index.quick_bytes,
-            initialized: true,
+            index: OnceLock::new(),
         }
     }
 
@@ -1057,21 +1150,29 @@ impl PatternEngine {
     pub fn with_packs(packs: Vec<PatternPack>) -> Result<Self> {
         let library = PatternLibrary::new(packs)?;
         let index = build_engine_index(library.rules())?;
-        Ok(Self {
+        let engine = Self {
             library,
-            compiled_rules: index.compiled_rules,
-            anchor_list: index.anchor_list,
-            anchor_to_rules: index.anchor_to_rules,
-            anchor_matcher: index.anchor_matcher,
-            quick_bytes: index.quick_bytes,
-            initialized: true,
-        })
+            index: OnceLock::new(),
+        };
+        engine
+            .index
+            .set(index)
+            .expect("pattern engine index should be uninitialized");
+        Ok(engine)
     }
 
-    /// Check if the engine is initialized
+    /// Check if the engine has been compiled yet.
     #[must_use]
     pub fn is_initialized(&self) -> bool {
-        self.initialized
+        self.index.get().is_some()
+    }
+
+    fn index(&self) -> &EngineIndex {
+        self.index.get_or_init(|| {
+            tracing::debug!("Compiling pattern engine (first use)");
+            build_engine_index(self.library.rules())
+                .expect("pattern engine must compile for builtin packs")
+        })
     }
 
     /// Detect patterns in text
@@ -1081,11 +1182,13 @@ impl PatternEngine {
             return Vec::new();
         }
 
-        if !self.quick_reject(text) {
+        let index = self.index();
+
+        if !Self::quick_reject_with_index(index, text) {
             return Vec::new();
         }
 
-        let Some(matcher) = self.anchor_matcher.as_ref() else {
+        let Some(matcher) = index.anchor_matcher.as_ref() else {
             return Vec::new();
         };
 
@@ -1108,7 +1211,7 @@ impl PatternEngine {
                 eprintln!("detect: matched pattern {pattern} at {span:?}");
             }
 
-            let Some(anchor) = self.anchor_list.get(matched.pattern().as_usize()) else {
+            let Some(anchor) = index.anchor_list.get(matched.pattern().as_usize()) else {
                 #[cfg(test)]
                 {
                     let pattern = matched.pattern().as_usize();
@@ -1117,7 +1220,7 @@ impl PatternEngine {
                 continue;
             };
 
-            if let Some(rule_indices) = self.anchor_to_rules.get(anchor) {
+            if let Some(rule_indices) = index.anchor_to_rules.get(anchor) {
                 for &idx in rule_indices {
                     candidate_rules.insert(idx);
                     matched_anchor_by_rule
@@ -1136,7 +1239,7 @@ impl PatternEngine {
 
         let mut detections = Vec::new();
         for idx in indices {
-            let compiled = &self.compiled_rules[idx];
+            let compiled = &index.compiled_rules[idx];
             let rule = &compiled.def;
             let fallback_anchor = matched_anchor_by_rule
                 .get(&idx)
@@ -1258,12 +1361,21 @@ impl PatternEngine {
     /// Quick reject check - returns false if text definitely has no matches
     #[must_use]
     pub fn quick_reject(&self, text: &str) -> bool {
-        if text.is_empty() || self.quick_bytes.is_empty() {
+        if text.is_empty() {
+            return false;
+        }
+        let index = self.index();
+        Self::quick_reject_with_index(index, text)
+    }
+
+    fn quick_reject_with_index(index: &EngineIndex, text: &str) -> bool {
+        if text.is_empty() || index.quick_bytes.is_empty() {
             return false;
         }
 
         let bytes = text.as_bytes();
-        self.quick_bytes
+        index
+            .quick_bytes
             .iter()
             .any(|byte| memchr(*byte, bytes).is_some())
     }
@@ -1286,6 +1398,8 @@ mod tests {
     #[test]
     fn engine_can_be_created() {
         let engine = PatternEngine::new();
+        assert!(!engine.is_initialized());
+        let _ = engine.detect("warmup");
         assert!(engine.is_initialized());
     }
 

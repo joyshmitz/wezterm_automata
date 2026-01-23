@@ -82,6 +82,7 @@ fn large_output(size_kb: usize) -> String {
 
 fn bench_quick_reject(c: &mut Criterion) {
     let engine = PatternEngine::new();
+    let _ = engine.detect("warmup");
 
     let mut group = c.benchmark_group("pattern_quick_reject");
 
@@ -110,6 +111,7 @@ fn bench_quick_reject(c: &mut Criterion) {
 
 fn bench_pattern_detection(c: &mut Criterion) {
     let engine = PatternEngine::new();
+    let _ = engine.detect("warmup");
 
     let mut group = c.benchmark_group("pattern_detection");
 

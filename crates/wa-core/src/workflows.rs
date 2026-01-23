@@ -593,6 +593,130 @@ pub trait Workflow: Send + Sync {
     fn step_count(&self) -> usize {
         self.steps().len()
     }
+
+    // ========================================================================
+    // Extended metadata for workflow listing (all with default implementations)
+    // ========================================================================
+
+    /// Event types that can trigger this workflow (e.g., "session.compaction").
+    /// Returns empty slice if not triggered by specific event types.
+    fn trigger_event_types(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Rule IDs that can trigger this workflow (e.g., "compaction.detected").
+    /// Returns empty slice if not triggered by specific rules.
+    fn trigger_rule_ids(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Agent types this workflow supports (e.g., ["codex", "claude_code"]).
+    /// Returns empty slice if supports all agent types.
+    fn supported_agent_types(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Whether this workflow requires a target pane to operate on.
+    fn requires_pane(&self) -> bool {
+        true
+    }
+
+    /// Whether this workflow requires approval before execution.
+    fn requires_approval(&self) -> bool {
+        false
+    }
+
+    /// Whether this workflow can be aborted while running.
+    fn can_abort(&self) -> bool {
+        true
+    }
+
+    /// Whether this workflow performs destructive operations.
+    fn is_destructive(&self) -> bool {
+        false
+    }
+
+    /// Names of workflows this one depends on (must complete first).
+    fn dependencies(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Whether this workflow is currently enabled.
+    fn is_enabled(&self) -> bool {
+        true
+    }
+}
+
+// ============================================================================
+// Workflow Info (for listing)
+// ============================================================================
+
+/// Information about a workflow for listing and discovery.
+///
+/// This struct captures the metadata exposed by the `Workflow` trait
+/// in a serializable form for robot mode and TUI display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowInfo {
+    /// Workflow name (unique identifier)
+    pub name: String,
+    /// Human-readable description
+    pub description: String,
+    /// Whether the workflow is enabled
+    pub enabled: bool,
+    /// Event types that can trigger this workflow
+    pub trigger_event_types: Vec<String>,
+    /// Rule IDs that can trigger this workflow
+    pub trigger_rule_ids: Vec<String>,
+    /// Agent types this workflow supports (empty = all)
+    pub agent_types: Vec<String>,
+    /// Number of steps in the workflow
+    pub step_count: usize,
+    /// Whether this workflow requires a target pane
+    pub requires_pane: bool,
+    /// Whether this workflow requires approval before execution
+    pub requires_approval: bool,
+    /// Whether this workflow can be aborted while running
+    pub can_abort: bool,
+    /// Whether this workflow performs destructive operations
+    pub destructive: bool,
+    /// Names of workflows this one depends on
+    pub dependencies: Vec<String>,
+}
+
+impl WorkflowInfo {
+    /// Create a WorkflowInfo from a workflow trait object.
+    pub fn from_workflow(workflow: &dyn Workflow) -> Self {
+        Self {
+            name: workflow.name().to_string(),
+            description: workflow.description().to_string(),
+            enabled: workflow.is_enabled(),
+            trigger_event_types: workflow
+                .trigger_event_types()
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            trigger_rule_ids: workflow
+                .trigger_rule_ids()
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            agent_types: workflow
+                .supported_agent_types()
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            step_count: workflow.step_count(),
+            requires_pane: workflow.requires_pane(),
+            requires_approval: workflow.requires_approval(),
+            can_abort: workflow.can_abort(),
+            destructive: workflow.is_destructive(),
+            dependencies: workflow
+                .dependencies()
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        }
+    }
 }
 
 // ============================================================================
@@ -820,6 +944,7 @@ impl WorkflowEngine {
         storage
             .insert_step_log(
                 execution_id,
+                None,
                 step_index,
                 step_name,
                 result_type,
@@ -1981,6 +2106,7 @@ impl WorkflowRunner {
                 .storage
                 .insert_step_log(
                     execution_id,
+                    None,
                     current_step,
                     step_name,
                     result_type,
@@ -2767,6 +2893,160 @@ impl WorkflowRunner {
 
         Ok(())
     }
+
+    /// Abort a running workflow execution.
+    ///
+    /// This is the external API for aborting workflows (e.g., from robot mode).
+    /// It differs from internal abort handling in that:
+    /// 1. It validates the execution state before aborting
+    /// 2. It releases the pane lock if held
+    /// 3. It returns detailed abort information
+    ///
+    /// # Arguments
+    /// * `execution_id` - The workflow execution ID to abort
+    /// * `reason` - Optional reason for the abort (recorded in audit)
+    /// * `force` - If true, skip cleanup steps
+    ///
+    /// # Returns
+    /// * `Ok(AbortResult)` - Details about the aborted workflow
+    /// * `Err` - If the workflow doesn't exist or is in invalid state
+    pub async fn abort_execution(
+        &self,
+        execution_id: &str,
+        reason: Option<&str>,
+        _force: bool, // Reserved for future cleanup skipping
+    ) -> crate::Result<AbortResult> {
+        // Load the workflow record
+        let record = self
+            .storage
+            .get_workflow(execution_id)
+            .await?
+            .ok_or_else(|| {
+                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
+                    execution_id.to_string(),
+                ))
+            })?;
+
+        // Check if already in terminal state
+        match record.status.as_str() {
+            "completed" => {
+                return Ok(AbortResult {
+                    aborted: false,
+                    execution_id: execution_id.to_string(),
+                    workflow_name: record.workflow_name,
+                    pane_id: record.pane_id,
+                    previous_status: record.status.clone(),
+                    aborted_at_step: record.current_step,
+                    reason: None,
+                    aborted_at: None,
+                    error_reason: Some("already_completed".to_string()),
+                });
+            }
+            "aborted" => {
+                return Ok(AbortResult {
+                    aborted: false,
+                    execution_id: execution_id.to_string(),
+                    workflow_name: record.workflow_name,
+                    pane_id: record.pane_id,
+                    previous_status: record.status.clone(),
+                    aborted_at_step: record.current_step,
+                    reason: None,
+                    aborted_at: None,
+                    error_reason: Some("already_aborted".to_string()),
+                });
+            }
+            "failed" => {
+                return Ok(AbortResult {
+                    aborted: false,
+                    execution_id: execution_id.to_string(),
+                    workflow_name: record.workflow_name,
+                    pane_id: record.pane_id,
+                    previous_status: record.status.clone(),
+                    aborted_at_step: record.current_step,
+                    reason: None,
+                    aborted_at: None,
+                    error_reason: Some("already_failed".to_string()),
+                });
+            }
+            _ => {} // running, waiting - proceed with abort
+        }
+
+        let previous_status = record.status.clone();
+        let workflow_name = record.workflow_name.clone();
+        let pane_id = record.pane_id;
+        let aborted_at_step = record.current_step;
+        let now = now_ms();
+
+        // Update the record to aborted status
+        let mut updated_record = record;
+        updated_record.status = "aborted".to_string();
+        updated_record.error = reason.map(|r| format!("Aborted: {r}"));
+        updated_record.updated_at = now;
+        updated_record.completed_at = Some(now);
+
+        self.storage.upsert_workflow(updated_record).await?;
+
+        // Release the pane lock if held
+        self.lock_manager.release(pane_id, execution_id);
+
+        // Mark trigger event as handled with aborted status
+        if let Err(e) = self
+            .mark_trigger_event_handled(execution_id, "aborted")
+            .await
+        {
+            tracing::warn!(
+                execution_id,
+                error = %e,
+                "Failed to mark trigger event as handled during abort"
+            );
+        }
+
+        tracing::info!(
+            execution_id,
+            workflow_name,
+            pane_id,
+            reason = reason.unwrap_or("no reason provided"),
+            "Workflow aborted"
+        );
+
+        Ok(AbortResult {
+            aborted: true,
+            execution_id: execution_id.to_string(),
+            workflow_name,
+            pane_id,
+            previous_status,
+            aborted_at_step,
+            reason: reason.map(|s| s.to_string()),
+            aborted_at: Some(now as u64),
+            error_reason: None,
+        })
+    }
+}
+
+/// Result of an abort operation
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AbortResult {
+    /// Whether the abort was successful
+    pub aborted: bool,
+    /// Execution ID
+    pub execution_id: String,
+    /// Workflow name
+    pub workflow_name: String,
+    /// Pane ID
+    pub pane_id: u64,
+    /// Status before abort
+    pub previous_status: String,
+    /// Step index where abort occurred
+    pub aborted_at_step: usize,
+    /// Reason for abort (if provided)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Timestamp of abort (epoch ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aborted_at: Option<u64>,
+    /// Error reason if abort failed (e.g., "already_completed")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_reason: Option<String>,
 }
 
 // ============================================================================
@@ -3903,6 +4183,7 @@ mod tests {
         let logs = vec![crate::storage::WorkflowStepLogRecord {
             id: 1,
             workflow_id: "test-123".to_string(),
+            audit_action_id: None,
             step_index: 0,
             step_name: "step_0".to_string(),
             result_type: "continue".to_string(),
@@ -3919,6 +4200,7 @@ mod tests {
         let logs = vec![crate::storage::WorkflowStepLogRecord {
             id: 1,
             workflow_id: "test-123".to_string(),
+            audit_action_id: None,
             step_index: 2,
             step_name: "step_2".to_string(),
             result_type: "done".to_string(),
@@ -3936,6 +4218,7 @@ mod tests {
         let logs = vec![crate::storage::WorkflowStepLogRecord {
             id: 1,
             workflow_id: "test-123".to_string(),
+            audit_action_id: None,
             step_index: 1,
             step_name: "step_1".to_string(),
             result_type: "retry".to_string(),
@@ -3954,6 +4237,7 @@ mod tests {
             crate::storage::WorkflowStepLogRecord {
                 id: 1,
                 workflow_id: "test-123".to_string(),
+                audit_action_id: None,
                 step_index: 0,
                 step_name: "step_0".to_string(),
                 result_type: "continue".to_string(),
@@ -3965,6 +4249,7 @@ mod tests {
             crate::storage::WorkflowStepLogRecord {
                 id: 2,
                 workflow_id: "test-123".to_string(),
+                audit_action_id: None,
                 step_index: 1,
                 step_name: "step_1".to_string(),
                 result_type: "continue".to_string(),
@@ -3976,6 +4261,7 @@ mod tests {
             crate::storage::WorkflowStepLogRecord {
                 id: 3,
                 workflow_id: "test-123".to_string(),
+                audit_action_id: None,
                 step_index: 2,
                 step_name: "step_2".to_string(),
                 result_type: "retry".to_string(),
@@ -3996,6 +4282,7 @@ mod tests {
             crate::storage::WorkflowStepLogRecord {
                 id: 3,
                 workflow_id: "test-123".to_string(),
+                audit_action_id: None,
                 step_index: 2,
                 step_name: "step_2".to_string(),
                 result_type: "continue".to_string(),
@@ -4007,6 +4294,7 @@ mod tests {
             crate::storage::WorkflowStepLogRecord {
                 id: 1,
                 workflow_id: "test-123".to_string(),
+                audit_action_id: None,
                 step_index: 0,
                 step_name: "step_0".to_string(),
                 result_type: "continue".to_string(),
@@ -5628,6 +5916,699 @@ mod tests {
                 panic!("Invalid step should abort, got: {:?}", other);
             }
         }
+
+        storage.shutdown().await.unwrap();
+    }
+
+    // ========================================================================
+    // Workflow Engine Tests (wa-nu4.1.1.7)
+    // Lock Behavior, Step Logging, and Resume Tests
+    // ========================================================================
+
+    /// Simple workflow that completes after one step (for testing lock release on success)
+    struct SimpleCompletingWorkflow;
+
+    impl Workflow for SimpleCompletingWorkflow {
+        fn name(&self) -> &'static str {
+            "simple_completing"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test workflow that completes immediately"
+        }
+
+        fn handles(&self, detection: &Detection) -> bool {
+            detection.rule_id.contains("simple_complete")
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("complete", "Complete immediately")]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move {
+                match step_idx {
+                    0 => StepResult::done(serde_json::json!({"completed": true})),
+                    _ => StepResult::abort("Unexpected step"),
+                }
+            })
+        }
+    }
+
+    /// Workflow that aborts after one step (for testing lock release on abort)
+    struct AbortingWorkflow {
+        abort_reason: String,
+    }
+
+    impl AbortingWorkflow {
+        fn new(reason: &str) -> Self {
+            Self {
+                abort_reason: reason.to_string(),
+            }
+        }
+    }
+
+    impl Workflow for AbortingWorkflow {
+        fn name(&self) -> &'static str {
+            "aborting_workflow"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test workflow that aborts"
+        }
+
+        fn handles(&self, detection: &Detection) -> bool {
+            detection.rule_id.contains("abort_test")
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("abort_step", "Abort immediately")]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            let reason = self.abort_reason.clone();
+            Box::pin(async move {
+                match step_idx {
+                    0 => StepResult::abort(&reason),
+                    _ => StepResult::abort("Unexpected step"),
+                }
+            })
+        }
+    }
+
+    /// Multi-step workflow for testing step logging and resume
+    struct MultiStepWorkflow {
+        fail_at_step: Option<usize>,
+    }
+
+    impl MultiStepWorkflow {
+        fn new() -> Self {
+            Self { fail_at_step: None }
+        }
+
+        fn failing_at(step: usize) -> Self {
+            Self {
+                fail_at_step: Some(step),
+            }
+        }
+    }
+
+    impl Workflow for MultiStepWorkflow {
+        fn name(&self) -> &'static str {
+            "multi_step"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test workflow with multiple steps"
+        }
+
+        fn handles(&self, detection: &Detection) -> bool {
+            detection.rule_id.contains("multi_step")
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![
+                WorkflowStep::new("step_0", "First step"),
+                WorkflowStep::new("step_1", "Second step"),
+                WorkflowStep::new("step_2", "Third step"),
+                WorkflowStep::new("step_3", "Final step"),
+            ]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            let fail_at = self.fail_at_step;
+            Box::pin(async move {
+                if Some(step_idx) == fail_at {
+                    return StepResult::abort("Simulated failure");
+                }
+                match step_idx {
+                    0 | 1 | 2 => StepResult::cont(),
+                    3 => StepResult::done(serde_json::json!({"steps_completed": 4})),
+                    _ => StepResult::abort("Unexpected step index"),
+                }
+            })
+        }
+    }
+
+    /// Helper to create a test WorkflowRunner with storage
+    async fn create_test_runner(
+        db_path: &str,
+    ) -> (
+        WorkflowRunner,
+        Arc<crate::storage::StorageHandle>,
+        Arc<PaneWorkflowLockManager>,
+    ) {
+        let engine = WorkflowEngine::default();
+        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+        let storage = Arc::new(crate::storage::StorageHandle::new(db_path).await.unwrap());
+        let injector = Arc::new(tokio::sync::Mutex::new(
+            crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                crate::wezterm::WeztermClient::new(),
+            ),
+        ));
+
+        let runner = WorkflowRunner::new(
+            engine,
+            Arc::clone(&lock_manager),
+            Arc::clone(&storage),
+            injector,
+            WorkflowRunnerConfig::default(),
+        );
+
+        (runner, storage, lock_manager)
+    }
+
+    /// Helper to create a test pane in storage
+    async fn create_test_pane(storage: &crate::storage::StorageHandle, pane_id: u64) {
+        let pane = crate::storage::PaneRecord {
+            pane_id,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: Some(1),
+            tab_id: Some(1),
+            title: Some("test".to_string()),
+            cwd: Some("/tmp".to_string()),
+            tty_name: None,
+            first_seen_at: now_ms(),
+            last_seen_at: now_ms(),
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane(pane).await.unwrap();
+    }
+
+    // ------------------------------------------------------------------------
+    // Lock Release Tests (wa-nu4.1.1.7)
+    // ------------------------------------------------------------------------
+
+    /// Test: Lock is released when workflow completes successfully (Done)
+    #[tokio::test]
+    async fn lock_released_on_workflow_completion() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_lock_complete.db")
+            .to_string_lossy()
+            .to_string();
+
+        let (runner, storage, lock_manager) = create_test_runner(&db_path).await;
+        let pane_id = 42u64;
+
+        create_test_pane(&storage, pane_id).await;
+        runner.register_workflow(Arc::new(SimpleCompletingWorkflow));
+
+        // Start workflow - acquires lock
+        let detection = make_test_detection("simple_complete.test");
+        let start_result = runner.handle_detection(pane_id, &detection, None).await;
+        assert!(start_result.is_started(), "Workflow should start");
+
+        // Lock should be held
+        assert!(
+            lock_manager.is_locked(pane_id).is_some(),
+            "Lock should be held after starting workflow"
+        );
+
+        // Run the workflow to completion
+        let workflow = runner.find_workflow_by_name("simple_completing").unwrap();
+        let execution_id = start_result.execution_id().unwrap();
+        let exec_result = runner
+            .run_workflow(pane_id, workflow, execution_id, 0)
+            .await;
+
+        // Verify workflow completed
+        assert!(
+            exec_result.is_completed(),
+            "Workflow should complete successfully"
+        );
+
+        // Lock should be released after completion
+        assert!(
+            lock_manager.is_locked(pane_id).is_none(),
+            "Lock should be released after workflow completion"
+        );
+
+        storage.shutdown().await.unwrap();
+    }
+
+    /// Test: Lock is released when workflow aborts
+    #[tokio::test]
+    async fn lock_released_on_workflow_abort() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_lock_abort.db")
+            .to_string_lossy()
+            .to_string();
+
+        let (runner, storage, lock_manager) = create_test_runner(&db_path).await;
+        let pane_id = 43u64;
+
+        create_test_pane(&storage, pane_id).await;
+        runner.register_workflow(Arc::new(AbortingWorkflow::new("Test abort reason")));
+
+        // Start workflow - acquires lock
+        let detection = make_test_detection("abort_test.trigger");
+        let start_result = runner.handle_detection(pane_id, &detection, None).await;
+        assert!(start_result.is_started(), "Workflow should start");
+
+        // Lock should be held
+        assert!(
+            lock_manager.is_locked(pane_id).is_some(),
+            "Lock should be held after starting workflow"
+        );
+
+        // Run the workflow (will abort)
+        let workflow = runner.find_workflow_by_name("aborting_workflow").unwrap();
+        let execution_id = start_result.execution_id().unwrap();
+        let exec_result = runner
+            .run_workflow(pane_id, workflow, execution_id, 0)
+            .await;
+
+        // Verify workflow aborted
+        assert!(exec_result.is_aborted(), "Workflow should abort");
+        if let WorkflowExecutionResult::Aborted { reason, .. } = &exec_result {
+            assert!(
+                reason.contains("Test abort reason"),
+                "Abort should have expected reason"
+            );
+        }
+
+        // Lock should be released after abort
+        assert!(
+            lock_manager.is_locked(pane_id).is_none(),
+            "Lock should be released after workflow abort"
+        );
+
+        storage.shutdown().await.unwrap();
+    }
+
+    /// Test: Per-pane lock prevents concurrent workflow execution
+    #[tokio::test]
+    async fn per_pane_lock_prevents_concurrent_workflows() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_lock_concurrent.db")
+            .to_string_lossy()
+            .to_string();
+
+        let (runner, storage, lock_manager) = create_test_runner(&db_path).await;
+        let pane_id = 44u64;
+
+        create_test_pane(&storage, pane_id).await;
+        runner.register_workflow(Arc::new(MultiStepWorkflow::new()));
+
+        // Start first workflow
+        let detection1 = make_test_detection("multi_step.first");
+        let start_result1 = runner.handle_detection(pane_id, &detection1, None).await;
+        assert!(start_result1.is_started(), "First workflow should start");
+
+        // Verify lock is held by first workflow
+        let lock_info = lock_manager.is_locked(pane_id);
+        assert!(lock_info.is_some(), "Lock should be held");
+        let info = lock_info.unwrap();
+        assert_eq!(info.workflow_name, "multi_step");
+
+        // Try to start second workflow on same pane
+        let detection2 = make_test_detection("multi_step.second");
+        let start_result2 = runner.handle_detection(pane_id, &detection2, None).await;
+
+        // Second workflow should be blocked
+        assert!(
+            start_result2.is_locked(),
+            "Second workflow should be blocked by lock"
+        );
+        if let WorkflowStartResult::PaneLocked {
+            held_by_workflow, ..
+        } = start_result2
+        {
+            assert_eq!(
+                held_by_workflow, "multi_step",
+                "Lock should be held by first workflow"
+            );
+        }
+
+        // Complete first workflow to release lock
+        let workflow = runner.find_workflow_by_name("multi_step").unwrap();
+        let exec_id = start_result1.execution_id().unwrap();
+        let _ = runner
+            .run_workflow(pane_id, workflow.clone(), exec_id, 0)
+            .await;
+
+        // Now second workflow can start
+        let start_result3 = runner.handle_detection(pane_id, &detection2, None).await;
+        assert!(
+            start_result3.is_started(),
+            "Workflow should start after lock released"
+        );
+
+        storage.shutdown().await.unwrap();
+    }
+
+    // ------------------------------------------------------------------------
+    // Step Logging Tests (wa-nu4.1.1.7)
+    // ------------------------------------------------------------------------
+
+    /// Test: Step logs are written correctly during workflow execution
+    #[tokio::test]
+    async fn step_logs_written_correctly() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_step_logs.db")
+            .to_string_lossy()
+            .to_string();
+
+        let (runner, storage, _lock_manager) = create_test_runner(&db_path).await;
+        let pane_id = 45u64;
+
+        create_test_pane(&storage, pane_id).await;
+        runner.register_workflow(Arc::new(MultiStepWorkflow::new()));
+
+        // Start and run workflow
+        let detection = make_test_detection("multi_step.log_test");
+        let start_result = runner.handle_detection(pane_id, &detection, None).await;
+        assert!(start_result.is_started());
+
+        let workflow = runner.find_workflow_by_name("multi_step").unwrap();
+        let execution_id = start_result.execution_id().unwrap();
+        let exec_result = runner
+            .run_workflow(pane_id, workflow, execution_id, 0)
+            .await;
+
+        assert!(exec_result.is_completed(), "Workflow should complete");
+
+        // Verify step logs were written
+        let step_logs = storage.get_step_logs(execution_id).await.unwrap();
+
+        // Multi-step workflow has 4 steps (0, 1, 2, 3)
+        assert_eq!(step_logs.len(), 4, "Should have 4 step log entries");
+
+        // Verify each step log
+        for (i, log) in step_logs.iter().enumerate() {
+            assert_eq!(log.workflow_id, execution_id);
+            assert_eq!(log.step_index, i);
+            assert_eq!(log.step_name, format!("step_{i}"));
+            assert!(log.started_at > 0, "Started timestamp should be set");
+            assert!(log.completed_at >= log.started_at, "Completed >= started");
+            assert!(log.duration_ms >= 0, "Duration should be non-negative");
+        }
+
+        // First 3 steps should be "continue", last should be "done"
+        assert_eq!(step_logs[0].result_type, "continue");
+        assert_eq!(step_logs[1].result_type, "continue");
+        assert_eq!(step_logs[2].result_type, "continue");
+        assert_eq!(step_logs[3].result_type, "done");
+
+        storage.shutdown().await.unwrap();
+    }
+
+    /// Test: Step logs record abort correctly
+    #[tokio::test]
+    async fn step_logs_record_abort() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_step_logs_abort.db")
+            .to_string_lossy()
+            .to_string();
+
+        let (runner, storage, _lock_manager) = create_test_runner(&db_path).await;
+        let pane_id = 46u64;
+
+        create_test_pane(&storage, pane_id).await;
+        // Workflow that fails at step 2
+        runner.register_workflow(Arc::new(MultiStepWorkflow::failing_at(2)));
+
+        // Start and run workflow
+        let detection = make_test_detection("multi_step.abort_log_test");
+        let start_result = runner.handle_detection(pane_id, &detection, None).await;
+        assert!(start_result.is_started());
+
+        let workflow = runner.find_workflow_by_name("multi_step").unwrap();
+        let execution_id = start_result.execution_id().unwrap();
+        let exec_result = runner
+            .run_workflow(pane_id, workflow, execution_id, 0)
+            .await;
+
+        assert!(exec_result.is_aborted(), "Workflow should abort");
+
+        // Verify step logs
+        let step_logs = storage.get_step_logs(execution_id).await.unwrap();
+
+        // Should have 3 step logs (steps 0, 1, 2 where 2 aborts)
+        assert_eq!(step_logs.len(), 3, "Should have 3 step log entries");
+
+        // Steps 0 and 1 should be "continue"
+        assert_eq!(step_logs[0].result_type, "continue");
+        assert_eq!(step_logs[1].result_type, "continue");
+        // Step 2 should be "abort"
+        assert_eq!(step_logs[2].result_type, "abort");
+
+        storage.shutdown().await.unwrap();
+    }
+
+    // ------------------------------------------------------------------------
+    // Resume Tests (wa-nu4.1.1.7)
+    // ------------------------------------------------------------------------
+
+    /// Test: WorkflowEngine.resume computes correct next step from logs
+    #[tokio::test]
+    async fn engine_resume_finds_correct_step() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_resume.db")
+            .to_string_lossy()
+            .to_string();
+
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+        let engine = WorkflowEngine::new(3);
+
+        // Create a test pane
+        create_test_pane(&storage, 50).await;
+
+        // Start a workflow
+        let execution = engine
+            .start(&storage, "test_workflow", 50, None, None)
+            .await
+            .unwrap();
+
+        // Manually insert step logs to simulate partial execution
+        // Steps 0 and 1 completed, step 2 was in progress
+        storage
+            .insert_step_log(&execution.id, None, 0, "step_0", "continue", None, 1000, 1100)
+            .await
+            .unwrap();
+        storage
+            .insert_step_log(&execution.id, None, 1, "step_1", "continue", None, 1100, 1200)
+            .await
+            .unwrap();
+
+        // Resume should find next step is 2
+        let resume_result = engine.resume(&storage, &execution.id).await.unwrap();
+        assert!(resume_result.is_some(), "Should find incomplete workflow");
+
+        let (resumed_exec, next_step) = resume_result.unwrap();
+        assert_eq!(resumed_exec.id, execution.id);
+        assert_eq!(next_step, 2, "Next step should be 2 (after steps 0, 1)");
+
+        storage.shutdown().await.unwrap();
+    }
+
+    /// Test: find_incomplete_workflows returns workflows with running/waiting status
+    #[tokio::test]
+    async fn find_incomplete_workflows_returns_running_and_waiting() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_find_incomplete.db")
+            .to_string_lossy()
+            .to_string();
+
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+        let engine = WorkflowEngine::new(3);
+
+        // Create test panes
+        create_test_pane(&storage, 51).await;
+        create_test_pane(&storage, 52).await;
+        create_test_pane(&storage, 53).await;
+
+        // Start multiple workflows in different states
+        let exec1 = engine
+            .start(&storage, "workflow_1", 51, None, None)
+            .await
+            .unwrap();
+        let exec2 = engine
+            .start(&storage, "workflow_2", 52, None, None)
+            .await
+            .unwrap();
+        let exec3 = engine
+            .start(&storage, "workflow_3", 53, None, None)
+            .await
+            .unwrap();
+
+        // Mark exec2 as waiting
+        engine
+            .update_status(
+                &storage,
+                &exec2.id,
+                ExecutionStatus::Waiting,
+                1,
+                Some(&WaitCondition::pane_idle(1000)),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Mark exec3 as completed (should not be returned)
+        engine
+            .update_status(
+                &storage,
+                &exec3.id,
+                ExecutionStatus::Completed,
+                2,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Find incomplete workflows
+        let incomplete = storage.find_incomplete_workflows().await.unwrap();
+
+        // Should find exec1 (running) and exec2 (waiting), not exec3 (completed)
+        assert_eq!(incomplete.len(), 2, "Should find 2 incomplete workflows");
+
+        let incomplete_ids: std::collections::HashSet<_> =
+            incomplete.iter().map(|w| w.id.as_str()).collect();
+        assert!(incomplete_ids.contains(exec1.id.as_str()));
+        assert!(incomplete_ids.contains(exec2.id.as_str()));
+        assert!(!incomplete_ids.contains(exec3.id.as_str()));
+
+        storage.shutdown().await.unwrap();
+    }
+
+    /// Test: resume_incomplete resumes workflows from last completed step
+    #[tokio::test]
+    async fn resume_incomplete_resumes_from_last_step() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_resume_incomplete.db")
+            .to_string_lossy()
+            .to_string();
+
+        let (runner, storage, lock_manager) = create_test_runner(&db_path).await;
+        let pane_id = 54u64;
+
+        create_test_pane(&storage, pane_id).await;
+        runner.register_workflow(Arc::new(MultiStepWorkflow::new()));
+
+        // Start workflow and simulate partial execution
+        let detection = make_test_detection("multi_step.resume_test");
+        let start_result = runner.handle_detection(pane_id, &detection, None).await;
+        assert!(start_result.is_started());
+        let execution_id = start_result.execution_id().unwrap().to_string();
+
+        // Insert step logs for steps 0 and 1 (completed)
+        storage
+            .insert_step_log(&execution_id, None, 0, "step_0", "continue", None, 1000, 1100)
+            .await
+            .unwrap();
+        storage
+            .insert_step_log(&execution_id, None, 1, "step_1", "continue", None, 1100, 1200)
+            .await
+            .unwrap();
+
+        // Release the lock to simulate a restart scenario
+        lock_manager.force_release(pane_id);
+
+        // Call resume_incomplete
+        let results = runner.resume_incomplete().await;
+
+        // Should have resumed and completed the workflow
+        assert_eq!(results.len(), 1, "Should resume 1 workflow");
+        assert!(
+            results[0].is_completed(),
+            "Resumed workflow should complete"
+        );
+
+        // Verify step logs show resumed execution (steps 2 and 3)
+        let step_logs = storage.get_step_logs(&execution_id).await.unwrap();
+
+        // Should have 4 step logs total now
+        assert_eq!(step_logs.len(), 4, "Should have 4 step logs after resume");
+
+        // Steps 0, 1 were from before, steps 2, 3 from resume
+        assert_eq!(step_logs[2].step_index, 2);
+        assert_eq!(step_logs[3].step_index, 3);
+        assert_eq!(step_logs[3].result_type, "done");
+
+        storage.shutdown().await.unwrap();
+    }
+
+    /// Test: Aborted workflows are not resumed
+    #[tokio::test]
+    async fn aborted_workflows_not_resumed() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("test_aborted_not_resumed.db")
+            .to_string_lossy()
+            .to_string();
+
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+        let engine = WorkflowEngine::new(3);
+
+        // Create test pane
+        create_test_pane(&storage, 55).await;
+
+        // Start a workflow and mark it aborted
+        let execution = engine
+            .start(&storage, "test_workflow", 55, None, None)
+            .await
+            .unwrap();
+
+        engine
+            .update_status(
+                &storage,
+                &execution.id,
+                ExecutionStatus::Aborted,
+                1,
+                None,
+                Some("Test abort"),
+            )
+            .await
+            .unwrap();
+
+        // Find incomplete - should not include aborted workflow
+        let incomplete = storage.find_incomplete_workflows().await.unwrap();
+        assert!(
+            incomplete.is_empty(),
+            "Aborted workflow should not be in incomplete list"
+        );
+
+        // Resume should return None
+        let resume_result = engine.resume(&storage, &execution.id).await.unwrap();
+        assert!(
+            resume_result.is_none(),
+            "Aborted workflow should not be resumable"
+        );
 
         storage.shutdown().await.unwrap();
     }

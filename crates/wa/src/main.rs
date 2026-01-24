@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use wa_core::logging::{LogConfig, LogError, init_logging};
 
 /// WezTerm Automata - Terminal hypervisor for AI agents
@@ -57,8 +57,16 @@ enum Commands {
         dangerous_disable_lock: bool,
     },
 
-    /// Robot mode commands (JSON I/O)
+    /// Robot mode commands (machine-readable I/O)
     Robot {
+        /// Output format for robot responses
+        #[arg(long, short = 'f', value_enum)]
+        format: Option<RobotOutputFormat>,
+
+        /// Show token statistics on stderr (JSON vs TOON)
+        #[arg(long)]
+        stats: bool,
+
         #[command(subcommand)]
         command: Option<RobotCommands>,
     },
@@ -563,6 +571,60 @@ const ROBOT_ERR_CONFIG: &str = "robot.config_error";
 const ROBOT_ERR_FTS_QUERY: &str = "robot.fts_query_error";
 const ROBOT_ERR_STORAGE: &str = "robot.storage_error";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RobotOutputFormat {
+    Json,
+    Toon,
+}
+
+fn parse_robot_output_format(s: &str) -> Option<RobotOutputFormat> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "json" => Some(RobotOutputFormat::Json),
+        "toon" => Some(RobotOutputFormat::Toon),
+        _ => None,
+    }
+}
+
+fn resolve_robot_output_format(cli: Option<RobotOutputFormat>) -> RobotOutputFormat {
+    if let Some(format) = cli {
+        return format;
+    }
+
+    if let Ok(val) = std::env::var("WA_OUTPUT_FORMAT") {
+        if let Some(format) = parse_robot_output_format(&val) {
+            return format;
+        }
+    }
+
+    if let Ok(val) = std::env::var("TOON_DEFAULT_FORMAT") {
+        if let Some(format) = parse_robot_output_format(&val) {
+            return format;
+        }
+    }
+
+    RobotOutputFormat::Json
+}
+
+fn sniff_robot_output_format_from_args() -> Option<RobotOutputFormat> {
+    let mut args = std::env::args();
+    while let Some(arg) = args.next() {
+        if let Some(rest) = arg.strip_prefix("--format=") {
+            return parse_robot_output_format(rest);
+        }
+
+        if arg == "--format" || arg == "-f" {
+            if let Some(val) = args.next() {
+                return parse_robot_output_format(&val);
+            }
+        }
+    }
+    None
+}
+
+fn should_show_toon_stats(cli_stats: bool) -> bool {
+    cli_stats || std::env::var("TOON_STATS").is_ok()
+}
+
 /// JSON envelope for robot mode responses
 #[derive(serde::Serialize)]
 struct RobotResponse<T> {
@@ -611,6 +673,59 @@ impl<T> RobotResponse<T> {
             now: now_ms(),
         }
     }
+}
+
+fn estimate_tokens(s: &str) -> usize {
+    let chars = s.len();
+    let words = s.split_whitespace().count();
+    std::cmp::max(chars / 4, words)
+}
+
+fn emit_toon_stats(json: &str, toon: &str) {
+    let json_tokens = estimate_tokens(json);
+    let toon_tokens = estimate_tokens(toon);
+    let savings_pct = if json_tokens > 0 {
+        100 - (toon_tokens * 100 / json_tokens)
+    } else {
+        0
+    };
+
+    eprintln!(
+        "[stats] JSON: {json_tokens} tokens, TOON: {toon_tokens} tokens ({savings_pct}% savings)"
+    );
+}
+
+fn print_robot_response<T: serde::Serialize>(
+    response: &RobotResponse<T>,
+    format: RobotOutputFormat,
+    cli_stats: bool,
+) -> anyhow::Result<()> {
+    let show_stats = should_show_toon_stats(cli_stats);
+
+    match format {
+        RobotOutputFormat::Json => {
+            if show_stats {
+                // Use compact JSON for stats to avoid counting whitespace.
+                let json_compact = serde_json::to_string(response)?;
+                let toon = toon_rust::encode(serde_json::to_value(response)?, None);
+                emit_toon_stats(&json_compact, &toon);
+            }
+
+            println!("{}", serde_json::to_string_pretty(response)?);
+        }
+        RobotOutputFormat::Toon => {
+            let toon = toon_rust::encode(serde_json::to_value(response)?, None);
+
+            if show_stats {
+                let json_compact = serde_json::to_string(response)?;
+                emit_toon_stats(&json_compact, &toon);
+            }
+
+            println!("{toon}");
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -1468,7 +1583,13 @@ fn build_robot_help() -> RobotHelp {
                 description: "Submit an approval code for a pending action",
             },
         ],
-        global_flags: vec!["--workspace <path>", "--config <path>", "--verbose"],
+        global_flags: vec![
+            "--workspace <path>",
+            "--config <path>",
+            "--verbose",
+            "--format <json|toon>",
+            "--stats",
+        ],
     }
 }
 
@@ -1485,6 +1606,16 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 flag: "--config <path>",
                 env_var: None,
                 description: "Override config file location",
+            },
+            QuickStartGlobalFlag {
+                flag: "--format <json|toon>",
+                env_var: Some("WA_OUTPUT_FORMAT"),
+                description: "Robot stdout format (default: json); also consults TOON_DEFAULT_FORMAT",
+            },
+            QuickStartGlobalFlag {
+                flag: "--stats",
+                env_var: Some("TOON_STATS"),
+                description: "Emit token comparison stats to stderr (JSON vs TOON)",
             },
         ],
         core_loop: vec![
@@ -1630,6 +1761,7 @@ fn build_robot_quick_start() -> RobotQuickStartData {
             "Check 'error_code' field for programmatic error handling",
             "Use 'now' timestamp in responses to track freshness",
             "Pane IDs are stable within a WezTerm session but may change across restarts",
+            "Use --format toon for compact output when piping robot results between agents",
         ],
         error_handling: QuickStartErrorHandling {
             common_codes: vec![
@@ -2079,11 +2211,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         Err(err) => {
             if robot_mode {
                 let elapsed = elapsed_ms(start);
+                let format = resolve_robot_output_format(sniff_robot_output_format_from_args());
                 match err.kind() {
                     clap::error::ErrorKind::DisplayHelp
                     | clap::error::ErrorKind::DisplayVersion => {
                         let response = RobotResponse::success(build_robot_help(), elapsed);
-                        println!("{}", serde_json::to_string_pretty(&response)?);
+                        print_robot_response(&response, format, false)?;
                     }
                     clap::error::ErrorKind::InvalidSubcommand => {
                         let response = RobotResponse::<()>::error_with_code(
@@ -2092,7 +2225,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             Some("Use `wa robot help` for available commands.".to_string()),
                             elapsed,
                         );
-                        println!("{}", serde_json::to_string_pretty(&response)?);
+                        print_robot_response(&response, format, false)?;
                     }
                     _ => {
                         let response = RobotResponse::<()>::error_with_code(
@@ -2101,7 +2234,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             Some("Use `wa robot help` for usage.".to_string()),
                             elapsed,
                         );
-                        println!("{}", serde_json::to_string_pretty(&response)?);
+                        print_robot_response(&response, format, false)?;
                     }
                 }
                 return Ok(());
@@ -2131,13 +2264,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         Ok(config) => config,
         Err(err) => {
             if robot_mode {
+                let (format, stats) = match command.as_ref() {
+                    Some(Commands::Robot { format, stats, .. }) => {
+                        (resolve_robot_output_format(*format), *stats)
+                    }
+                    _ => (
+                        resolve_robot_output_format(sniff_robot_output_format_from_args()),
+                        false,
+                    ),
+                };
                 let response = RobotResponse::<()>::error_with_code(
                     ROBOT_ERR_CONFIG,
                     format!("Failed to load config: {err}"),
                     Some("Check --config/--workspace or WA_WORKSPACE.".to_string()),
                     elapsed_ms(start),
                 );
-                println!("{}", serde_json::to_string_pretty(&response)?);
+                print_robot_response(&response, format, stats)?;
                 return Ok(());
             }
             return Err(err.into());
@@ -2184,19 +2326,24 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             .await?;
         }
 
-        Some(Commands::Robot { command }) => {
+        Some(Commands::Robot {
+            format,
+            stats,
+            command,
+        }) => {
             let start = std::time::Instant::now();
             let command = command.unwrap_or(RobotCommands::QuickStart);
+            let format = resolve_robot_output_format(format);
 
             match command {
                 RobotCommands::Help => {
                     let response = RobotResponse::success(build_robot_help(), elapsed_ms(start));
-                    println!("{}", serde_json::to_string_pretty(&response)?);
+                    print_robot_response(&response, format, stats)?;
                 }
                 RobotCommands::QuickStart => {
                     let response =
                         RobotResponse::success(build_robot_quick_start(), elapsed_ms(start));
-                    println!("{}", serde_json::to_string_pretty(&response)?);
+                    print_robot_response(&response, format, stats)?;
                 }
                 other => {
                     let ctx = match build_robot_context(&config, &workspace_root) {
@@ -2208,7 +2355,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 Some("Check --config/--workspace or WA_WORKSPACE.".to_string()),
                                 elapsed_ms(start),
                             );
-                            println!("{}", serde_json::to_string_pretty(&response)?);
+                            print_robot_response(&response, format, stats)?;
                             return Ok(());
                         }
                     };
@@ -2225,7 +2372,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         .collect();
                                     let response =
                                         RobotResponse::success(states, elapsed_ms(start));
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                 }
                                 Err(e) => {
                                     let response = RobotResponse::<Vec<PaneState>>::error_with_code(
@@ -2234,7 +2381,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         Some("Is WezTerm running?".to_string()),
                                         elapsed_ms(start),
                                     );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                 }
                             }
                         }
@@ -2259,7 +2406,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         truncation_info,
                                     };
                                     let response = RobotResponse::success(data, elapsed_ms(start));
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                 }
                                 Err(e) => {
                                     // Map errors to stable codes
@@ -2271,7 +2418,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             hint,
                                             elapsed_ms(start),
                                         );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                 }
                             }
                         }
@@ -2317,7 +2464,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 );
                                 let response =
                                     RobotResponse::success(report.redacted(), elapsed_ms(start));
-                                println!("{}", serde_json::to_string_pretty(&response)?);
+                                print_robot_response(&response, format, stats)?;
                             } else {
                                 use wa_core::approval::ApprovalStore;
                                 use wa_core::policy::{
@@ -2342,7 +2489,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     ),
                                                     elapsed_ms(start),
                                                 );
-                                        println!("{}", serde_json::to_string_pretty(&response)?);
+                                        print_robot_response(&response, format, stats)?;
                                         return Ok(());
                                     }
                                 };
@@ -2359,7 +2506,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 hint,
                                                 elapsed_ms(start),
                                             );
-                                        println!("{}", serde_json::to_string_pretty(&response)?);
+                                        print_robot_response(&response, format, stats)?;
                                         return Ok(());
                                     }
                                 };
@@ -2405,10 +2552,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     None,
                                                     elapsed_ms(start),
                                                 );
-                                            println!(
-                                                "{}",
-                                                serde_json::to_string_pretty(&response)?
-                                            );
+                                            print_robot_response(&response, format, stats)?;
                                             return Ok(());
                                         }
                                     };
@@ -2534,7 +2678,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     verification_error,
                                 };
                                 let response = RobotResponse::success(data, elapsed_ms(start));
-                                println!("{}", serde_json::to_string_pretty(&response)?);
+                                print_robot_response(&response, format, stats)?;
                             }
                         }
                         RobotCommands::WaitFor {
@@ -2561,7 +2705,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 Some("Check the regex syntax".to_string()),
                                                 elapsed_ms(start),
                                             );
-                                        println!("{}", serde_json::to_string_pretty(&response)?);
+                                        print_robot_response(&response, format, stats)?;
                                         return Ok(());
                                     }
                                 }
@@ -2586,7 +2730,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 ),
                                                 elapsed_ms(start),
                                             );
-                                        println!("{}", serde_json::to_string_pretty(&response)?);
+                                        print_robot_response(&response, format, stats)?;
                                         return Ok(());
                                     }
                                 }
@@ -2598,7 +2742,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             None,
                                             elapsed_ms(start),
                                         );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                     return Ok(());
                                 }
                             }
@@ -2636,7 +2780,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         is_regex: regex,
                                     };
                                     let response = RobotResponse::success(data, elapsed_ms(start));
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                 }
                                 Ok(WaitResult::TimedOut {
                                     elapsed_ms: elapsed,
@@ -2651,7 +2795,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         Some("Increase --timeout-secs or check if the pattern is correct".to_string()),
                                         elapsed_ms(start),
                                     );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                 }
                                 Err(e) => {
                                     let response =
@@ -2661,7 +2805,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             None,
                                             elapsed_ms(start),
                                         );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                 }
                             }
                         }
@@ -2683,7 +2827,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             Some("Check --workspace or WA_WORKSPACE".to_string()),
                                             elapsed_ms(start),
                                         );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                     return Ok(());
                                 }
                             };
@@ -2700,7 +2844,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         Some("Is the database initialized? Run 'wa watch' first.".to_string()),
                                         elapsed_ms(start),
                                     );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                     return Ok(());
                                 }
                             };
@@ -2747,7 +2891,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         since_filter: since,
                                     };
                                     let response = RobotResponse::success(data, elapsed_ms(start));
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                 }
                                 Err(e) => {
                                     // Map storage errors to robot error codes
@@ -2767,7 +2911,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             hint,
                                             elapsed_ms(start),
                                         );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                 }
                             }
                         }
@@ -2792,7 +2936,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             Some("Check --workspace or WA_WORKSPACE".to_string()),
                                             elapsed_ms(start),
                                         );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                     return Ok(());
                                 }
                             };
@@ -2809,7 +2953,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         Some("Is the database initialized? Run 'wa watch' first.".to_string()),
                                         elapsed_ms(start),
                                     );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                     return Ok(());
                                 }
                             };
@@ -2886,7 +3030,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         dry_run,
                                     };
                                     let response = RobotResponse::success(data, elapsed_ms(start));
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                 }
                                 Err(e) => {
                                     let response =
@@ -2896,7 +3040,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             None,
                                             elapsed_ms(start),
                                         );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                 }
                             }
                         }
@@ -2930,7 +3074,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         );
                                         let response =
                                             RobotResponse::success(report, elapsed_ms(start));
-                                        println!("{}", serde_json::to_string_pretty(&response)?);
+                                        print_robot_response(&response, format, stats)?;
                                         return Ok(());
                                     }
 
@@ -2949,10 +3093,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                         ),
                                                         elapsed_ms(start),
                                                     );
-                                                println!(
-                                                    "{}",
-                                                    serde_json::to_string_pretty(&response)?
-                                                );
+                                                print_robot_response(&response, format, stats)?;
                                                 return Ok(());
                                             }
                                         }
@@ -2965,10 +3106,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     hint,
                                                     elapsed_ms(start),
                                                 );
-                                            println!(
-                                                "{}",
-                                                serde_json::to_string_pretty(&response)?
-                                            );
+                                            print_robot_response(&response, format, stats)?;
                                             return Ok(());
                                         }
                                     }
@@ -2988,10 +3126,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     ),
                                                     elapsed_ms(start),
                                                 );
-                                            println!(
-                                                "{}",
-                                                serde_json::to_string_pretty(&response)?
-                                            );
+                                            print_robot_response(&response, format, stats)?;
                                             return Ok(());
                                         }
                                     };
@@ -3121,7 +3256,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 workflow_elapsed,
                                             )
                                         };
-                                        println!("{}", serde_json::to_string_pretty(&response)?);
+                                        print_robot_response(&response, format, stats)?;
                                     } else {
                                         // No workflow registered with this name
                                         let response =
@@ -3140,7 +3275,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             pane_id,
                                             "Workflow not found"
                                         );
-                                        println!("{}", serde_json::to_string_pretty(&response)?);
+                                        print_robot_response(&response, format, stats)?;
                                     }
 
                                     // Clean shutdown of storage
@@ -3186,7 +3321,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         enabled_count: Some(total),
                                     };
                                     let response = RobotResponse::success(data, elapsed_ms(start));
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                 }
                                 RobotWorkflowCommands::Status {
                                     execution_id,
@@ -3207,10 +3342,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     None,
                                                     elapsed_ms(start),
                                                 );
-                                                println!(
-                                                    "{}",
-                                                    serde_json::to_string_pretty(&response)?
-                                                );
+                                                print_robot_response(&response, format, stats)?;
                                                 return Ok(());
                                             }
                                         };
@@ -3235,10 +3367,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     ),
                                                     elapsed_ms(start),
                                                 );
-                                            println!(
-                                                "{}",
-                                                serde_json::to_string_pretty(&response)?
-                                            );
+                                            print_robot_response(&response, format, stats)?;
                                             return Ok(());
                                         }
                                     };
@@ -3257,7 +3386,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             ),
                                             elapsed_ms(start),
                                         );
-                                        println!("{}", serde_json::to_string_pretty(&response)?);
+                                        print_robot_response(&response, format, stats)?;
                                         return Ok(());
                                     }
 
@@ -3335,10 +3464,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                                 let response =
                                                     RobotResponse::success(data, elapsed_ms(start));
-                                                println!(
-                                                    "{}",
-                                                    serde_json::to_string_pretty(&response)?
-                                                );
+                                                print_robot_response(&response, format, stats)?;
                                             }
                                             Ok(None) => {
                                                 let response = RobotResponse::<
@@ -3354,10 +3480,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     ),
                                                     elapsed_ms(start),
                                                 );
-                                                println!(
-                                                    "{}",
-                                                    serde_json::to_string_pretty(&response)?
-                                                );
+                                                print_robot_response(&response, format, stats)?;
                                             }
                                             Err(e) => {
                                                 let response = RobotResponse::<
@@ -3368,10 +3491,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     None,
                                                     elapsed_ms(start),
                                                 );
-                                                println!(
-                                                    "{}",
-                                                    serde_json::to_string_pretty(&response)?
-                                                );
+                                                print_robot_response(&response, format, stats)?;
                                             }
                                         }
                                     } else {
@@ -3462,10 +3582,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                                 let response =
                                                     RobotResponse::success(data, elapsed_ms(start));
-                                                println!(
-                                                    "{}",
-                                                    serde_json::to_string_pretty(&response)?
-                                                );
+                                                print_robot_response(&response, format, stats)?;
                                             }
                                             Err(e) => {
                                                 let response = RobotResponse::<
@@ -3476,10 +3593,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     None,
                                                     elapsed_ms(start),
                                                 );
-                                                println!(
-                                                    "{}",
-                                                    serde_json::to_string_pretty(&response)?
-                                                );
+                                                print_robot_response(&response, format, stats)?;
                                             }
                                         }
                                     }
@@ -3515,10 +3629,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     ),
                                                     elapsed_ms(start),
                                                 );
-                                            println!(
-                                                "{}",
-                                                serde_json::to_string_pretty(&response)?
-                                            );
+                                            print_robot_response(&response, format, stats)?;
                                             return Ok(());
                                         }
                                     };
@@ -3565,10 +3676,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             };
                                             let response =
                                                 RobotResponse::success(data, elapsed_ms(start));
-                                            println!(
-                                                "{}",
-                                                serde_json::to_string_pretty(&response)?
-                                            );
+                                            print_robot_response(&response, format, stats)?;
                                         }
                                         Err(e) => {
                                             let (code, hint) = match &e {
@@ -3592,10 +3700,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     hint,
                                                     elapsed_ms(start),
                                                 );
-                                            println!(
-                                                "{}",
-                                                serde_json::to_string_pretty(&response)?
-                                            );
+                                            print_robot_response(&response, format, stats)?;
                                         }
                                     }
 
@@ -3642,7 +3747,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     },
                                 };
                                 let response = RobotResponse::success(data, elapsed_ms(start));
-                                println!("{}", serde_json::to_string_pretty(&response)?);
+                                print_robot_response(&response, format, stats)?;
                             } else {
                                 // Code not found - list available codes as hint
                                 let available = list_template_ids();
@@ -3660,7 +3765,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     Some(hint),
                                     elapsed_ms(start),
                                 );
-                                println!("{}", serde_json::to_string_pretty(&response)?);
+                                print_robot_response(&response, format, stats)?;
                             }
                         }
                         RobotCommands::Approve {
@@ -3680,7 +3785,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             Some("Check --workspace or WA_WORKSPACE".to_string()),
                                             elapsed_ms(start),
                                         );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                     return Ok(());
                                 }
                             };
@@ -3701,7 +3806,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             ),
                                             elapsed_ms(start),
                                         );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                     return Ok(());
                                 }
                             };
@@ -3721,7 +3826,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             {
                                 Ok(data) => {
                                     let response = RobotResponse::success(data, elapsed_ms(start));
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                 }
                                 Err(err) => {
                                     let response =
@@ -3731,7 +3836,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             err.hint,
                                             elapsed_ms(start),
                                         );
-                                    println!("{}", serde_json::to_string_pretty(&response)?);
+                                    print_robot_response(&response, format, stats)?;
                                 }
                             }
                         }
@@ -4366,25 +4471,19 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     if lines >= RECOMMENDED_SCROLLBACK_LINES {
                         println!("✓ Your WezTerm scrollback is already configured!");
                         println!("  Current: {} lines in {}", lines, path.display());
-                        println!(
-                            "  Recommended minimum: {RECOMMENDED_SCROLLBACK_LINES} lines"
-                        );
+                        println!("  Recommended minimum: {RECOMMENDED_SCROLLBACK_LINES} lines");
                         println!("\nNo changes needed.");
                     } else {
                         println!("⚠ Your WezTerm scrollback is below recommended minimum.");
                         println!("  Current: {} lines in {}", lines, path.display());
                         println!("  Recommended: {RECOMMENDED_SCROLLBACK_LINES} lines\n");
                         println!("Add this line to your wezterm.lua:");
-                        println!(
-                            "  config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}"
-                        );
+                        println!("  config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}");
                     }
                 } else {
                     println!("Could not find or parse WezTerm config.\n");
                     println!("Add the following to your ~/.config/wezterm/wezterm.lua:\n");
-                    println!(
-                        "  config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}\n"
-                    );
+                    println!("  config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}\n");
                     println!("This ensures wa can capture all terminal output without gaps.");
                 }
 
@@ -4542,7 +4641,9 @@ async fn handle_config_command(
             // Find config
             let config_path = if let Some(p) = path {
                 Some(std::path::PathBuf::from(p))
-            } else { cli_config.map(std::path::PathBuf::from) };
+            } else {
+                cli_config.map(std::path::PathBuf::from)
+            };
 
             let config = Config::load_with_overrides(
                 config_path.as_deref(),
@@ -4554,7 +4655,8 @@ async fn handle_config_command(
             config.validate()?;
 
             let path_display = config_path
-                .as_ref().map_or_else(|| "(default)".to_string(), |p| p.display().to_string());
+                .as_ref()
+                .map_or_else(|| "(default)".to_string(), |p| p.display().to_string());
 
             println!("✓ Config is valid: {path_display}");
 
@@ -4580,7 +4682,9 @@ async fn handle_config_command(
             // Find config
             let config_path = if let Some(p) = path {
                 Some(std::path::PathBuf::from(p))
-            } else { cli_config.map(std::path::PathBuf::from) };
+            } else {
+                cli_config.map(std::path::PathBuf::from)
+            };
 
             let config = Config::load_with_overrides(
                 config_path.as_deref(),
@@ -5115,7 +5219,7 @@ fn parse_toml_value(value: &str) -> toml_edit::Item {
 mod tests {
     use super::*;
     use wa_core::approval::hash_allow_once_code;
-    use wa_core::storage::{ApprovalTokenRecord, StorageHandle};
+    use wa_core::storage::{ApprovalTokenRecord, PaneRecord, StorageHandle};
 
     fn now_ms() -> i64 {
         std::time::SystemTime::now()
@@ -5153,6 +5257,27 @@ mod tests {
         used_at: Option<i64>,
         fingerprint: &str,
     ) {
+        // approval_tokens.pane_id has a FK to panes(pane_id).
+        if let Some(pid) = pane_id {
+            let now = now_ms();
+            let pane = PaneRecord {
+                pane_id: pid,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: now,
+                last_seen_at: now,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            };
+            storage.upsert_pane(pane).await.unwrap();
+        }
+
         let token = ApprovalTokenRecord {
             id: 0,
             code_hash: hash_allow_once_code(code),
@@ -5173,6 +5298,48 @@ mod tests {
         assert!(is_structured_uservar_name("wa-foo"));
         assert!(is_structured_uservar_name("WA_FOO"));
         assert!(!is_structured_uservar_name("other_event"));
+    }
+
+    #[test]
+    fn robot_help_toon_roundtrip() {
+        fn normalize_numbers_to_int(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        normalize_numbers_to_int(item);
+                    }
+                }
+                serde_json::Value::Object(map) => {
+                    for (_, value) in map.iter_mut() {
+                        normalize_numbers_to_int(value);
+                    }
+                }
+                serde_json::Value::Number(n) => {
+                    // toon_rust currently decodes numbers as floats; normalize integral floats back
+                    // to integers so comparisons against serde_json::to_value(...) are stable.
+                    if let Some(f) = n.as_f64() {
+                        if f.fract() == 0.0 && f >= 0.0 && f <= (u64::MAX as f64) {
+                            *v = serde_json::Value::Number(serde_json::Number::from(f as u64));
+                        }
+                    }
+                }
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::String(_) => {}
+            }
+        }
+
+        let resp = RobotResponse::success(build_robot_help(), 0);
+        let toon = toon_rust::encode(serde_json::to_value(&resp).unwrap(), None);
+
+        let decoded = toon_rust::try_decode(&toon, None).unwrap();
+        let json = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+
+        let mut decoded_value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        normalize_numbers_to_int(&mut decoded_value);
+        let expected_value: serde_json::Value = serde_json::to_value(&resp).unwrap();
+
+        assert_eq!(decoded_value, expected_value);
     }
 
     #[test]

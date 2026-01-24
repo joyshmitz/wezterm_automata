@@ -793,8 +793,31 @@ impl WorkflowEngine {
         trigger_event_id: Option<i64>,
         context: Option<serde_json::Value>,
     ) -> crate::Result<WorkflowExecution> {
-        let now = now_ms();
         let execution_id = generate_workflow_id(workflow_name);
+        self.start_with_id(
+            storage,
+            execution_id,
+            workflow_name,
+            pane_id,
+            trigger_event_id,
+            context,
+        )
+        .await
+    }
+
+    /// Start a workflow execution using a caller-provided execution_id.
+    ///
+    /// This is used by `WorkflowRunner` so the lock execution_id matches the persisted DB id.
+    pub async fn start_with_id(
+        &self,
+        storage: &crate::storage::StorageHandle,
+        execution_id: String,
+        workflow_name: &str,
+        pane_id: u64,
+        trigger_event_id: Option<i64>,
+        context: Option<serde_json::Value>,
+    ) -> crate::Result<WorkflowExecution> {
+        let now = now_ms();
 
         let record = crate::storage::WorkflowRecord {
             id: execution_id.clone(),
@@ -2029,8 +2052,9 @@ impl WorkflowRunner {
 
         match self
             .engine
-            .start(
+            .start_with_id(
                 &self.storage,
+                execution_id.clone(),
                 &workflow_name,
                 pane_id,
                 event_id,

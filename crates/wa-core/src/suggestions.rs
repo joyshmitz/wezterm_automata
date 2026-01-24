@@ -181,7 +181,7 @@ impl Platform {
     }
 
     /// Get install command prefix for a package.
-    #[must_use] 
+    #[must_use]
     pub fn install_command(&self, package: &str) -> Option<String> {
         let pm = self.package_manager()?;
         let cmd = match pm {
@@ -233,7 +233,7 @@ impl Default for Platform {
 
 impl SuggestionContext {
     /// Create a new empty context.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             platform: Platform::detect(),
@@ -262,7 +262,7 @@ impl SuggestionContext {
     }
 
     /// Find closest matching pane ID.
-    #[must_use] 
+    #[must_use]
     pub fn suggest_pane(&self, input: u64) -> Option<&PaneInfo> {
         if self.available_panes.is_empty() {
             return None;
@@ -284,19 +284,19 @@ impl SuggestionContext {
     }
 
     /// Find closest matching workflow name.
-    #[must_use] 
+    #[must_use]
     pub fn suggest_workflow(&self, input: &str) -> Option<&str> {
         suggest_closest(input, &self.available_workflows)
     }
 
     /// Find closest matching rule ID.
-    #[must_use] 
+    #[must_use]
     pub fn suggest_rule(&self, input: &str) -> Option<&str> {
         suggest_closest(input, &self.available_rules)
     }
 
     /// Get recent state changes for a pane.
-    #[must_use] 
+    #[must_use]
     pub fn recent_state_for_pane(&self, pane_id: u64) -> Vec<&StateChange> {
         self.recent_state
             .iter()
@@ -305,7 +305,7 @@ impl SuggestionContext {
     }
 
     /// Format available panes as a string.
-    #[must_use] 
+    #[must_use]
     pub fn format_available_panes(&self) -> String {
         if self.available_panes.is_empty() {
             return "No panes available".to_string();
@@ -314,7 +314,7 @@ impl SuggestionContext {
     }
 
     /// Format available workflows as a string.
-    #[must_use] 
+    #[must_use]
     pub fn format_available_workflows(&self) -> String {
         if self.available_workflows.is_empty() {
             return "No workflows available".to_string();
@@ -323,7 +323,7 @@ impl SuggestionContext {
     }
 
     /// Format available rules as a string.
-    #[must_use] 
+    #[must_use]
     pub fn format_available_rules(&self) -> String {
         if self.available_rules.is_empty() {
             return "No rules available".to_string();
@@ -345,7 +345,7 @@ impl SuggestionContext {
 ///
 /// This is the minimum number of single-character edits (insertions,
 /// deletions, or substitutions) required to change one string into the other.
-#[must_use] 
+#[must_use]
 pub fn levenshtein_distance(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
@@ -469,7 +469,7 @@ pub fn format_available<T: fmt::Display>(items: &[T]) -> String {
 }
 
 /// Generate a "Did you mean?" suggestion for a pane not found error.
-#[must_use] 
+#[must_use]
 pub fn pane_not_found_suggestion(requested: u64, ctx: &SuggestionContext) -> Option<String> {
     let closest = ctx.suggest_pane(requested)?;
 
@@ -484,7 +484,7 @@ pub fn pane_not_found_suggestion(requested: u64, ctx: &SuggestionContext) -> Opt
 }
 
 /// Generate a suggestion for a workflow not found error.
-#[must_use] 
+#[must_use]
 pub fn workflow_not_found_suggestion(requested: &str, ctx: &SuggestionContext) -> Option<String> {
     let mut suggestion = String::new();
 
@@ -507,7 +507,7 @@ pub fn workflow_not_found_suggestion(requested: &str, ctx: &SuggestionContext) -
 }
 
 /// Generate a suggestion for a rule not found error.
-#[must_use] 
+#[must_use]
 pub fn rule_not_found_suggestion(requested: &str, ctx: &SuggestionContext) -> Option<String> {
     let mut suggestion = String::new();
 
@@ -530,7 +530,7 @@ pub fn rule_not_found_suggestion(requested: &str, ctx: &SuggestionContext) -> Op
 }
 
 /// Generate state hint for a pane operation that was blocked.
-#[must_use] 
+#[must_use]
 pub fn state_hint_for_pane(pane_id: u64, ctx: &SuggestionContext) -> Option<String> {
     let recent = ctx.recent_state_for_pane(pane_id);
     if recent.is_empty() {
@@ -557,7 +557,7 @@ use crate::error::Remediation;
 /// Enhance a remediation with context-aware suggestions for pane not found.
 ///
 /// Adds "Did you mean?" suggestions and lists available panes.
-#[must_use] 
+#[must_use]
 pub fn enhance_pane_not_found(
     mut remediation: Remediation,
     requested: u64,
@@ -584,7 +584,7 @@ pub fn enhance_pane_not_found(
 }
 
 /// Enhance a remediation with context-aware suggestions for workflow not found.
-#[must_use] 
+#[must_use]
 pub fn enhance_workflow_not_found(
     mut remediation: Remediation,
     requested: &str,
@@ -606,7 +606,7 @@ pub fn enhance_workflow_not_found(
 }
 
 /// Enhance a remediation with context-aware suggestions for rule not found.
-#[must_use] 
+#[must_use]
 pub fn enhance_rule_not_found(
     mut remediation: Remediation,
     requested: &str,
@@ -628,7 +628,7 @@ pub fn enhance_rule_not_found(
 }
 
 /// Enhance a remediation with platform-specific install commands.
-#[must_use] 
+#[must_use]
 pub fn enhance_with_platform_commands(
     mut remediation: Remediation,
     package: &str,

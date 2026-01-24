@@ -62,6 +62,12 @@ $ wa robot state
   }
 }
 
+# Compact TOON output (token-optimized)
+$ wa robot --format toon state
+
+# Token stats (printed to stderr so stdout stays data-only)
+$ wa robot --format toon --stats state
+
 # Get recent output from a specific pane
 $ wa robot get-text 0 --lines 50
 

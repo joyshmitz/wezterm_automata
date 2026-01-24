@@ -372,7 +372,6 @@ static MIGRATIONS: &[Migration] = &[
         version: 4,
         description: "Add action_undo + action_history view + audit_action_id on step logs",
         up_sql: r"
-            ALTER TABLE workflow_step_logs ADD COLUMN audit_action_id INTEGER REFERENCES audit_actions(id);
             CREATE INDEX IF NOT EXISTS idx_step_logs_audit_action ON workflow_step_logs(audit_action_id);
 
             CREATE TABLE IF NOT EXISTS action_undo (
@@ -901,6 +900,55 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| StorageError::Database(e.to_string()))?
+    {
+        let name: String = row
+            .get(1)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn ensure_workflow_step_logs_audit_action_id(conn: &Connection) -> Result<()> {
+    let table_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='workflow_step_logs'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+    if table_exists == 0 {
+        // Will be created via SCHEMA_SQL; nothing to do here.
+        return Ok(());
+    }
+
+    if table_has_column(conn, "workflow_step_logs", "audit_action_id")? {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "ALTER TABLE workflow_step_logs ADD COLUMN audit_action_id INTEGER REFERENCES audit_actions(id) ON DELETE SET NULL;",
+    )
+    .map_err(|e| StorageError::MigrationFailed(format!("Failed to add audit_action_id to workflow_step_logs: {e}")))?;
+
+    Ok(())
+}
+
 /// Apply all pending migrations from the current version to SCHEMA_VERSION.
 ///
 /// Each migration is applied in order, and the user_version is updated after
@@ -912,6 +960,10 @@ fn run_migrations(conn: &Connection, from_version: i32) -> Result<()> {
         if migration.version <= from_version {
             // Already applied
             continue;
+        }
+
+        if migration.version == 4 {
+            ensure_workflow_step_logs_audit_action_id(conn)?;
         }
 
         // Apply migration SQL if non-empty

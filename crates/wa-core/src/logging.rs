@@ -170,6 +170,7 @@ pub fn init_logging(config: &LogConfig) -> Result<(), LogError> {
         LogFormat::Pretty => {
             let subscriber = tracing_subscriber::registry().with(env_filter).with(
                 fmt::layer()
+                    .with_writer(std::io::stderr)
                     .with_target(true)
                     .with_thread_ids(false)
                     .with_thread_names(false)
@@ -195,6 +196,7 @@ pub fn init_logging(config: &LogConfig) -> Result<(), LogError> {
                 fmt::layer()
                     .json()
                     .with_timer(SystemTime)
+                    .with_writer(std::io::stderr)
                     .with_target(true)
                     .with_current_span(true)
                     .with_span_list(false)

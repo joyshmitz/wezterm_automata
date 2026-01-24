@@ -4362,39 +4362,33 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 println!("Without sufficient scrollback, wa may miss terminal output.\n");
 
                 // Check current state
-                match check_wezterm_scrollback() {
-                    Ok((lines, path)) => {
-                        if lines >= RECOMMENDED_SCROLLBACK_LINES {
-                            println!("✓ Your WezTerm scrollback is already configured!");
-                            println!("  Current: {} lines in {}", lines, path.display());
-                            println!(
-                                "  Recommended minimum: {} lines",
-                                RECOMMENDED_SCROLLBACK_LINES
-                            );
-                            println!("\nNo changes needed.");
-                        } else {
-                            println!("⚠ Your WezTerm scrollback is below recommended minimum.");
-                            println!("  Current: {} lines in {}", lines, path.display());
-                            println!("  Recommended: {} lines\n", RECOMMENDED_SCROLLBACK_LINES);
-                            println!("Add this line to your wezterm.lua:");
-                            println!(
-                                "  config.scrollback_lines = {}",
-                                RECOMMENDED_SCROLLBACK_LINES
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        println!("Could not find or parse WezTerm config.\n");
-                        println!("Add the following to your ~/.config/wezterm/wezterm.lua:\n");
+                if let Ok((lines, path)) = check_wezterm_scrollback() {
+                    if lines >= RECOMMENDED_SCROLLBACK_LINES {
+                        println!("✓ Your WezTerm scrollback is already configured!");
+                        println!("  Current: {} lines in {}", lines, path.display());
                         println!(
-                            "  config.scrollback_lines = {}\n",
-                            RECOMMENDED_SCROLLBACK_LINES
+                            "  Recommended minimum: {RECOMMENDED_SCROLLBACK_LINES} lines"
                         );
-                        println!("This ensures wa can capture all terminal output without gaps.");
+                        println!("\nNo changes needed.");
+                    } else {
+                        println!("⚠ Your WezTerm scrollback is below recommended minimum.");
+                        println!("  Current: {} lines in {}", lines, path.display());
+                        println!("  Recommended: {RECOMMENDED_SCROLLBACK_LINES} lines\n");
+                        println!("Add this line to your wezterm.lua:");
+                        println!(
+                            "  config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}"
+                        );
                     }
+                } else {
+                    println!("Could not find or parse WezTerm config.\n");
+                    println!("Add the following to your ~/.config/wezterm/wezterm.lua:\n");
+                    println!(
+                        "  config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}\n"
+                    );
+                    println!("This ensures wa can capture all terminal output without gaps.");
                 }
 
-                println!("\n--- Why {} lines? ---", RECOMMENDED_SCROLLBACK_LINES);
+                println!("\n--- Why {RECOMMENDED_SCROLLBACK_LINES} lines? ---");
                 println!("• AI coding agents can produce substantial output");
                 println!("• wa uses delta extraction to capture only new content");
                 println!("• Insufficient scrollback causes capture gaps (EVENT_GAP_DETECTED)");
@@ -4410,8 +4404,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 println!("\nExample SSH domain configuration:");
                 println!("  config.ssh_domains = {{");
                 println!("    {{");
-                println!("      name = '{}',", host);
-                println!("      remote_address = '{}.example.com',", host);
+                println!("      name = '{host}',");
+                println!("      remote_address = '{host}.example.com',");
                 println!("      username = 'your_user',");
                 println!("    }},");
                 println!("  }}");
@@ -4421,7 +4415,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 println!("Add the following to your ~/.config/wezterm/wezterm.lua:\n");
                 println!("-- wa (WezTerm Automata) recommended settings");
                 println!("-- Ensure adequate scrollback for terminal capture");
-                println!("config.scrollback_lines = {}", RECOMMENDED_SCROLLBACK_LINES);
+                println!("config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}");
                 println!();
                 println!("-- Optional: Enable hyperlinks for file navigation");
                 println!("config.hyperlink_rules = wezterm.default_hyperlink_rules()");
@@ -4548,11 +4542,7 @@ async fn handle_config_command(
             // Find config
             let config_path = if let Some(p) = path {
                 Some(std::path::PathBuf::from(p))
-            } else if let Some(p) = cli_config {
-                Some(std::path::PathBuf::from(p))
-            } else {
-                None
-            };
+            } else { cli_config.map(std::path::PathBuf::from) };
 
             let config = Config::load_with_overrides(
                 config_path.as_deref(),
@@ -4564,9 +4554,7 @@ async fn handle_config_command(
             config.validate()?;
 
             let path_display = config_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(default)".to_string());
+                .as_ref().map_or_else(|| "(default)".to_string(), |p| p.display().to_string());
 
             println!("✓ Config is valid: {path_display}");
 
@@ -4592,11 +4580,7 @@ async fn handle_config_command(
             // Find config
             let config_path = if let Some(p) = path {
                 Some(std::path::PathBuf::from(p))
-            } else if let Some(p) = cli_config {
-                Some(std::path::PathBuf::from(p))
-            } else {
-                None
-            };
+            } else { cli_config.map(std::path::PathBuf::from) };
 
             let config = Config::load_with_overrides(
                 config_path.as_deref(),
@@ -4822,7 +4806,7 @@ fn set_toml_value(
         } else {
             // Intermediate element - navigate or create table
             if let Some(table) = current.as_table_mut() {
-                if !table.contains_key(*part) {
+                if !table.contains_key(part) {
                     table[*part] = toml_edit::Item::Table(toml_edit::Table::new());
                 }
                 current = &mut table[*part];
@@ -4970,7 +4954,7 @@ impl DiagnosticCheck {
         }
 
         if let Some(rec) = &self.recommendation {
-            println!("       → {}", rec);
+            println!("       → {rec}");
         }
     }
 }
@@ -5022,12 +5006,10 @@ fn run_diagnostics(
                 checks.push(DiagnosticCheck::warning(
                     "WezTerm scrollback",
                     format!(
-                        "{} lines (below {} recommended)",
-                        lines, RECOMMENDED_SCROLLBACK_LINES
+                        "{lines} lines (below {RECOMMENDED_SCROLLBACK_LINES} recommended)"
                     ),
                     format!(
-                        "Add to wezterm.lua: config.scrollback_lines = {}",
-                        RECOMMENDED_SCROLLBACK_LINES
+                        "Add to wezterm.lua: config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}"
                     ),
                 ));
             }
@@ -5037,8 +5019,7 @@ fn run_diagnostics(
                 "WezTerm scrollback",
                 msg,
                 format!(
-                    "Add to wezterm.lua: config.scrollback_lines = {}",
-                    RECOMMENDED_SCROLLBACK_LINES
+                    "Add to wezterm.lua: config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}"
                 ),
             ));
         }
@@ -5098,7 +5079,7 @@ fn run_diagnostics(
         Err(e) => {
             checks.push(DiagnosticCheck::error(
                 "WezTerm connection",
-                format!("CLI error: {}", e),
+                format!("CLI error: {e}"),
                 "Ensure WezTerm is installed and running",
             ));
         }

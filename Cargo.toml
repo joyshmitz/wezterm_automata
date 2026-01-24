@@ -42,6 +42,28 @@ collection_is_never_read = "allow"
 missing_const_for_fn = "allow"
 # Cargo lints - we don't have full metadata yet
 multiple_crate_versions = "allow"
+# Style lints that conflict with panic!/assert! macros in tests
+uninlined_format_args = "allow"
+# Range patterns lint that's too strict
+manual_range_patterns = "allow"
+# Safe sign casts for timestamps
+cast_sign_loss = "allow"
+# Same arms are acceptable for clarity
+match_same_arms = "allow"
+# Doc link style
+doc_link_with_quotes = "allow"
+# Structs with bools for configuration
+struct_excessive_bools = "allow"
+# String formatting style - push_str is fine
+format_push_string = "allow"
+# if let/else with Options is clearer than map_or_else for complex cases
+option_if_let_else = "allow"
+# Truncation is acceptable for timestamps
+cast_possible_truncation = "allow"
+# Many args are acceptable for CLI commands
+too_many_arguments = "allow"
+# Branches sharing code is fine for clarity
+branches_sharing_code = "allow"
 
 [workspace.dependencies]
 # Core dependencies

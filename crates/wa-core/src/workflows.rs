@@ -3016,7 +3016,7 @@ impl WorkflowRunner {
             pane_id,
             previous_status,
             aborted_at_step,
-            reason: reason.map(|s| s.to_string()),
+            reason: reason.map(std::string::ToString::to_string),
             aborted_at: Some(now as u64),
             error_reason: None,
         })

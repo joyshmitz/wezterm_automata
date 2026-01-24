@@ -131,6 +131,7 @@ pub struct ProductionQueryClient {
 
 impl ProductionQueryClient {
     /// Create a new production query client
+    #[must_use]
     pub fn new(workspace_layout: WorkspaceLayout) -> Self {
         Self {
             workspace_layout,
@@ -140,6 +141,7 @@ impl ProductionQueryClient {
     }
 
     /// Create with an existing storage handle
+    #[must_use]
     pub fn with_storage(workspace_layout: WorkspaceLayout, storage: StorageHandle) -> Self {
         Self {
             workspace_layout,

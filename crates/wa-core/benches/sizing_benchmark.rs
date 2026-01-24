@@ -164,7 +164,9 @@ fn generate_content(pane_id: u64, seq: u64) -> String {
 /// Calculate average content size.
 fn avg_content_size() -> f64 {
     let total: usize = (0..1000).map(|i| generate_content(0, i).len()).sum();
-    total as f64 / 1000.0
+    #[allow(clippy::cast_precision_loss)]
+    let result = total as f64 / 1000.0;
+    result
 }
 
 /// Runtime for async benchmarks.
@@ -245,6 +247,7 @@ fn bench_insert_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+#[allow(clippy::significant_drop_tightening)]
 fn bench_db_growth(c: &mut Criterion) {
     let rt = runtime();
     let mut group = c.benchmark_group("sizing_growth");
@@ -274,6 +277,7 @@ fn bench_db_growth(c: &mut Criterion) {
                     storage.vacuum().await.ok();
 
                     let db_size = get_db_size(&db_path);
+                    #[allow(clippy::cast_precision_loss)]
                     let bytes_per_segment = db_size as f64 / total_segments as f64;
 
                     storage.shutdown().await.expect("shutdown");

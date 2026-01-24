@@ -1,5 +1,16 @@
 [
   {
+    "rule_id": "codex.session.resume_hint",
+    "agent_type": "codex",
+    "event_type": "session.resume_hint",
+    "severity": "info",
+    "confidence": 0.95,
+    "extracted": {
+      "session_id": "abc12345-def6-7890-abcd-0123456789ab"
+    },
+    "matched_text": "codex resume abc12345-def6-7890-abcd-0123456789ab"
+  },
+  {
     "rule_id": "codex.session.token_usage",
     "agent_type": "codex",
     "event_type": "session.summary",
@@ -13,16 +24,5 @@
       "reasoning": "150"
     },
     "matched_text": "total=15,000 input=8,500 (+ 2,000 cached) output=4,500 (reasoning 150)"
-  },
-  {
-    "rule_id": "codex.session.resume_hint",
-    "agent_type": "codex",
-    "event_type": "session.resume_hint",
-    "severity": "info",
-    "confidence": 0.95,
-    "extracted": {
-      "session_id": "abc12345-def6-7890-ghij-klmnopqrstuv"
-    },
-    "matched_text": "codex resume abc12345-def6-7890-ghij-klmnopqrstuv"
   }
 ]

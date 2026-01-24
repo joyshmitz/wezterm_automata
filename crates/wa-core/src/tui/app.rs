@@ -87,7 +87,9 @@ impl<Q: QueryClient> App<Q> {
             current_view: View::default(),
             view_state: ViewState::default(),
             should_quit: false,
-            last_refresh: Instant::now() - Duration::from_secs(60), // Force initial refresh
+            last_refresh: Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .unwrap_or_else(Instant::now), // Force initial refresh
         }
     }
 

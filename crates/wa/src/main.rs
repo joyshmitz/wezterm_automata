@@ -752,8 +752,10 @@ fn estimate_tokens(s: &str) -> usize {
 fn emit_toon_stats(json: &str, toon: &str) {
     let json_tokens = estimate_tokens(json);
     let toon_tokens = estimate_tokens(toon);
+    #[allow(clippy::cast_possible_wrap)]
     let savings_pct = if json_tokens > 0 {
         // TOON can be larger than JSON for very small payloads; use signed math so we don't underflow.
+        // Token counts are small enough that wrap is impossible in practice.
         100_i64 - ((toon_tokens as i64) * 100 / (json_tokens as i64))
     } else {
         0
@@ -5387,8 +5389,12 @@ mod tests {
                     // toon_rust currently decodes numbers as floats; normalize integral floats back
                     // to integers so comparisons against serde_json::to_value(...) are stable.
                     if let Some(f) = n.as_f64() {
-                        if f.fract() == 0.0 && f >= 0.0 && f <= (u64::MAX as f64) {
-                            *v = serde_json::Value::Number(serde_json::Number::from(f as u64));
+                        #[allow(clippy::cast_precision_loss)]
+                        let max_u64 = u64::MAX as f64;
+                        if f.fract() == 0.0 && f >= 0.0 && f <= max_u64 {
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            let as_u64 = f as u64;
+                            *v = serde_json::Value::Number(serde_json::Number::from(as_u64));
                         }
                     }
                 }

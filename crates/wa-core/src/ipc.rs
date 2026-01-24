@@ -974,6 +974,8 @@ mod tests {
 
     #[tokio::test]
     async fn ipc_handles_invalid_json_request() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
         let temp_dir = TempDir::new().unwrap();
         let socket_path = temp_dir.path().join("test.sock");
 
@@ -990,7 +992,6 @@ mod tests {
 
         // Send invalid JSON directly via raw socket
         let mut stream = UnixStream::connect(&socket_path).await.unwrap();
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         stream.write_all(b"not valid json\n").await.unwrap();
         stream.flush().await.unwrap();
 
@@ -1011,6 +1012,8 @@ mod tests {
 
     #[tokio::test]
     async fn ipc_rejects_oversized_messages() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
         let temp_dir = TempDir::new().unwrap();
         let socket_path = temp_dir.path().join("test.sock");
 
@@ -1036,7 +1039,6 @@ mod tests {
 
         // Send directly
         let mut stream = UnixStream::connect(&socket_path).await.unwrap();
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         stream.write_all(request_json.as_bytes()).await.unwrap();
         stream.write_all(b"\n").await.unwrap();
         stream.flush().await.unwrap();
@@ -1392,6 +1394,8 @@ mod tests {
 
     #[tokio::test]
     async fn status_update_via_ipc_validates_payload() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
         let temp_dir = TempDir::new().unwrap();
         let socket_path = temp_dir.path().join("test.sock");
 
@@ -1414,7 +1418,6 @@ mod tests {
         let request_json = serde_json::to_string(&request).unwrap();
 
         let mut stream = UnixStream::connect(&socket_path).await.unwrap();
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         stream.write_all(request_json.as_bytes()).await.unwrap();
         stream.write_all(b"\n").await.unwrap();
         stream.flush().await.unwrap();
@@ -1440,6 +1443,8 @@ mod tests {
 
     #[tokio::test]
     async fn status_update_via_ipc_emits_event() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
         let temp_dir = TempDir::new().unwrap();
         let socket_path = temp_dir.path().join("test.sock");
 
@@ -1463,7 +1468,6 @@ mod tests {
         let request_json = serde_json::to_string(&request).unwrap();
 
         let mut stream = UnixStream::connect(&socket_path).await.unwrap();
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         stream.write_all(request_json.as_bytes()).await.unwrap();
         stream.write_all(b"\n").await.unwrap();
         stream.flush().await.unwrap();
@@ -1579,16 +1583,13 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         // Verify registry was updated
-        let (title, is_alt_screen, rows, cols) = {
-            let reg = registry.read().await;
-            let entry = reg.get_entry(42).expect("Pane should exist");
-            (
-                entry.info.title.clone(),
-                entry.is_alt_screen,
-                entry.info.rows,
-                entry.info.cols,
-            )
-        };
+        let reg = registry.read().await;
+        let entry = reg.get_entry(42).expect("Pane should exist");
+        let title = entry.info.title.clone();
+        let is_alt_screen = entry.is_alt_screen;
+        let rows = entry.info.rows;
+        let cols = entry.info.cols;
+        drop(reg);
         assert_eq!(title.as_deref(), Some("new title"));
         assert!(is_alt_screen);
         assert_eq!(rows, Some(50));

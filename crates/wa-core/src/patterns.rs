@@ -621,7 +621,10 @@ fn builtin_codex_pack() -> PatternPack {
                 agent_type: AgentType::Codex,
                 event_type: "usage.reached".to_string(),
                 severity: Severity::Critical,
-                anchors: vec!["You've hit your usage limit".to_string()],
+                anchors: vec![
+                    "You've hit your usage limit".to_string(),
+                    "You've reached your usage limit".to_string(),
+                ],
                 regex: Some(r"try again at (?P<reset_time>[^.]+)".to_string()),
                 description: "Codex usage limit reached".to_string(),
                 remediation: Some("Wait for reset or switch account".to_string()),
@@ -670,7 +673,10 @@ fn builtin_codex_pack() -> PatternPack {
                 agent_type: AgentType::Codex,
                 event_type: "auth.device_code".to_string(),
                 severity: Severity::Info,
-                anchors: vec!["Enter this one-time code".to_string()],
+                anchors: vec![
+                    "Enter this one-time code".to_string(),
+                    "enter this one-time code".to_string(),
+                ],
                 regex: Some(r"(?P<code>[A-Z0-9]{4}-[A-Z0-9]{5})".to_string()),
                 description: "Codex device authentication code prompt".to_string(),
                 remediation: Some("User needs to enter the code in browser".to_string()),

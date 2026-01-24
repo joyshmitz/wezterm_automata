@@ -609,8 +609,7 @@ mod tests {
         // Epoch millis won't overflow i64 until year 292 million
         let captured_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_millis() as i64);
 
         let seg = CapturedSegment {
             pane_id: 42,

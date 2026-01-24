@@ -31,6 +31,7 @@ pub enum View {
 
 impl View {
     /// Get the display name for this view
+    #[must_use]
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Home => "Home",
@@ -42,6 +43,7 @@ impl View {
     }
 
     /// Get all views in tab order
+    #[must_use]
     pub const fn all() -> &'static [Self] {
         &[
             Self::Home,

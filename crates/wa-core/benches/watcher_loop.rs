@@ -161,7 +161,7 @@ fn bench_pane_check_combined(c: &mut Criterion) {
     });
 
     // Multiple panes (simulate checking 10 panes)
-    let panes: Vec<_> = (0..10).map(|i| test_pane(i)).collect();
+    let panes: Vec<_> = (0..10).map(test_pane).collect();
     group.bench_function("check_10_panes", |b| {
         b.iter(|| {
             for pane in &panes {
@@ -176,7 +176,7 @@ fn bench_pane_check_combined(c: &mut Criterion) {
     });
 
     // Stress test: 50 panes
-    let many_panes: Vec<_> = (0..50).map(|i| test_pane(i)).collect();
+    let many_panes: Vec<_> = (0..50).map(test_pane).collect();
     group.bench_with_input(
         BenchmarkId::new("check_many_panes", 50),
         &many_panes,

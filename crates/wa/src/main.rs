@@ -621,6 +621,74 @@ fn sniff_robot_output_format_from_args() -> Option<RobotOutputFormat> {
     None
 }
 
+fn sniff_robot_mode_from_args() -> bool {
+    let mut args = std::env::args();
+    // Skip argv[0]
+    let _ = args.next();
+
+    let mut skip_next_value = false;
+
+    while let Some(arg) = args.next() {
+        if skip_next_value {
+            skip_next_value = false;
+            continue;
+        }
+
+        if arg == "--" {
+            return args.next().is_some_and(|sub| sub == "robot");
+        }
+
+        // Known global options that take values.
+        if arg == "--config" || arg == "-c" || arg == "--workspace" {
+            skip_next_value = true;
+            continue;
+        }
+        if arg.starts_with("--config=") || arg.starts_with("--workspace=") {
+            continue;
+        }
+
+        // Any other long option (including clap-provided --help/--version).
+        if arg.starts_with("--") {
+            continue;
+        }
+
+        // Handle short option clusters like `-vc foo robot` and attached values like `-cfoo`.
+        if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 1 {
+            if arg == "-v" {
+                continue;
+            }
+            if let Some(rest) = arg.strip_prefix("-c") {
+                // `-cVALUE` consumes the rest of the arg as the value.
+                if rest.is_empty() {
+                    skip_next_value = true;
+                }
+                continue;
+            }
+
+            let mut chars = arg[1..].chars().peekable();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    'v' => {}
+                    'c' => {
+                        // `-cVALUE` (attached) or `-c VALUE` (next token).
+                        if chars.peek().is_none() {
+                            skip_next_value = true;
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        // First positional token is the subcommand.
+        return arg == "robot";
+    }
+
+    false
+}
+
 fn should_show_toon_stats(cli_stats: bool) -> bool {
     cli_stats || std::env::var("TOON_STATS").is_ok()
 }
@@ -685,7 +753,8 @@ fn emit_toon_stats(json: &str, toon: &str) {
     let json_tokens = estimate_tokens(json);
     let toon_tokens = estimate_tokens(toon);
     let savings_pct = if json_tokens > 0 {
-        100 - (toon_tokens * 100 / json_tokens)
+        // TOON can be larger than JSON for very small payloads; use signed math so we don't underflow.
+        100_i64 - ((toon_tokens as i64) * 100 / (json_tokens as i64))
     } else {
         0
     };
@@ -2196,7 +2265,7 @@ async fn run_watcher(
 }
 #[tokio::main]
 async fn main() {
-    let robot_mode = std::env::args().nth(1).is_some_and(|arg| arg == "robot");
+    let robot_mode = sniff_robot_mode_from_args();
     if let Err(err) = run(robot_mode).await {
         handle_fatal_error(&err, robot_mode);
         std::process::exit(1);

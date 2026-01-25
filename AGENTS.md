@@ -239,22 +239,8 @@ cargo test
 # Run with output
 cargo test -- --nocapture
 
-# Run specific test
-cargo test robot_help_toon_roundtrip
-```
-
-### TOON Round-Trip Test
-
-The codebase includes verification that TOON encoding/decoding preserves all data:
-
-```rust
-#[test]
-fn robot_help_toon_roundtrip() {
-    let resp = RobotResponse::Help { ... };
-    let toon = toon_rust::encode(serde_json::to_value(&resp).unwrap(), None);
-    let decoded = toon_rust::try_decode(&toon, None).unwrap();
-    // Verify JSON equivalence
-}
+# Run specific test by name pattern
+cargo test pattern_matching
 ```
 
 ---

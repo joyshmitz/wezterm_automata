@@ -315,10 +315,12 @@ Robot mode returns structured errors:
 ```
 
 Error codes:
-- `PANE_NOT_FOUND` - Invalid pane ID
-- `PATTERN_TIMEOUT` - Wait-for pattern not matched
-- `DAEMON_NOT_RUNNING` - wa watch not started
-- `POLICY_DENIED` - Action blocked by policy
+- `robot.pane_not_found` - Invalid pane ID
+- `robot.timeout` - Wait-for pattern not matched in time
+- `robot.wezterm_not_running` - WezTerm not detected
+- `robot.policy_denied` - Action blocked by safety policy
+- `robot.require_approval` - Action requires human approval
+- `robot.storage_error` - Database operation failed
 
 ---
 
@@ -327,21 +329,29 @@ Error codes:
 Config file: `~/.config/wa/wa.toml` or `$WA_WORKSPACE/.wa/config.toml`
 
 ```toml
-[daemon]
-poll_interval_ms = 5000
-auto_handle = false
+[general]
+log_level = "info"
+log_format = "pretty"
 
-[capture]
-max_lines_per_pane = 10000
-delta_batch_size = 1000
+[ingest]
+poll_interval_ms = 200
+min_poll_interval_ms = 50
+max_concurrent_captures = 10
+
+[storage]
+db_path = "wa.db"
+retention_days = 30
 
 [patterns]
-enabled = true
-rules_dir = "rules/"
+enabled_packs = ["builtin:core"]
 
-[policy]
-allow_send = true
-require_dry_run_first = false
+[workflows]
+enabled = true
+max_concurrent = 3
+
+[safety]
+require_prompt_active = true
+block_alt_screen = true
 ```
 
 ---
@@ -351,19 +361,19 @@ require_dry_run_first = false
 ```
 wezterm_automata/
 ├── crates/
-│   ├── wa/           # CLI binary
-│   │   └── src/
-│   │       └── main.rs
-│   └── wa-core/      # Business logic (no UI deps)
+│   ├── wa/           # CLI binary (main.rs ~5000 lines)
+│   └── wa-core/      # Core library
 │       └── src/
-│           ├── capture/    # Pane output capture
-│           ├── patterns/   # Pattern detection engine
-│           ├── workflows/  # Workflow execution
-│           └── policy/     # Access control
+│           ├── config.rs      # Configuration parsing
+│           ├── ingest.rs      # Pane output capture
+│           ├── patterns.rs    # Pattern detection engine
+│           ├── workflows.rs   # Workflow execution
+│           ├── policy.rs      # Safety/access control
+│           ├── storage.rs     # SQLite + FTS5
+│           └── wezterm.rs     # WezTerm IPC
 ├── fuzz/             # Fuzzing targets
 ├── docs/             # Documentation
-├── rules/            # Pattern rule definitions
-└── scripts/          # Development utilities
+└── fixtures/         # Test fixtures
 ```
 
 ---

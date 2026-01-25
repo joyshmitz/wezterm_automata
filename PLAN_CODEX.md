@@ -963,42 +963,56 @@ Failure modes:
 
 Preconditions:
 - inferred agent = `codex`
-- event `usage.reached` OR operator invoked workflow manually
+- trigger event `usage.reached` OR operator invoked workflow manually
+- **before every send**: pane is not `AltScreen`, no recent `OutputGap`, and `PolicyEngine` authorizes `SendText` / `BrowserAuth`
 
-Steps (each step is `Observe → Act → Verify`):
+Steps (each step is **Observe → Act → Verify**):
 1. Acquire per-pane lock.
-2. Exit Codex cleanly:
-   - send Ctrl-C twice (`\u{3}`), with small spacing
-   - verify that a session summary/resume hint appears
-3. Parse:
-   - token usage stats
+2. Exit Codex cleanly (avoid fixed sleeps):
+   - Act: send Ctrl-C once (`\u{3}`).
+   - Verify: wait for session summary / resume hint markers.
+   - If not seen within a short grace window: Act: send Ctrl-C again.
+   - Verify: continue waiting (bounded by overall timeout) until summary/resume markers appear.
+3. Verify session summary/resume hint appears (bounded tail; timeout).
+4. Parse:
+   - token usage stats (total/input/output/reasoning/cached where available)
    - resume session id
-4. Refresh account usage via `caut refresh --service openai --format json`.
-5. Select account:
+5. Refresh account usage via `caut refresh --service openai --format json`.
+6. Select account:
    - highest `percent_remaining` above threshold (configurable)
    - tie-breaker: least recently used
-6. Initiate device auth:
-   - send `cod login --device-auth\n`
-   - parse device code (and URL if present)
-7. Playwright:
+   - if none above threshold **or failover disabled**, branch to **Safe Pause** (below)
+7. Initiate device auth:
+   - Act: send `cod login --device-auth\n`
+   - Verify: device-code prompt appears
+8. Parse device code (and URL if present) from the tail.
+9. Playwright:
    - open device auth URL
    - ensure logged into chosen account (profile)
    - submit device code
    - verify success marker
-8. Resume:
-   - send `cod resume <session_id>\n`
-   - optionally wait for a “ready” marker (banner/prompt)
-9. Continue:
-   - send `proceed.\n`
-10. Persist:
+10. Resume:
+   - Act: send `cod resume <session_id>\n`
+   - Verify: “ready” marker / prompt appears
+11. Continue:
+   - Act: send `proceed.\n`
+   - Verify: Codex begins responding (or agreed marker appears)
+12. Persist:
    - event handled + action summary
-   - session token usage and resume id in `agent_sessions`
-   - mark account as used
+   - session token usage + resume id in `agent_sessions`
+   - account rotation record + step logs
+
+Safe Pause (failover disabled / no eligible accounts):
+- Do **not** attempt `cod login`.
+- Persist a redacted next-step plan with try-again time (if provided), resume id (redacted/hashed), and recommended human actions.
+- Mark workflow `paused` so it does not reappear as “unhandled spam.”
 
 Failure modes + recoveries:
-- device code not found → retry step 6 once; if still missing, abort with hint
-- Playwright cannot proceed due to MFA → open non-headless browser and request human/agent completion; then continue
-- resume fails (session id invalid) → surface error; do not loop endlessly
+- device code not found → retry step 7 once; if still missing, **pause** with next-step plan
+- Playwright cannot proceed due to MFA/unexpected wall → open non-headless browser and request human/agent completion; **pause** with recovery instructions
+- resume fails (session id invalid / resume rejected) → surface error; **do not loop**
+- pane becomes unsafe (AltScreen/OutputGap/CommandRunning) → abort or pause with reason
+- policy denies send/auth → record denial and abort safely; never inject input
 
 ### D.3 `handle_usage_limits` (Gemini path)
 

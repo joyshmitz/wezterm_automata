@@ -20,6 +20,7 @@
 //! - `ingest`: Pane output capture and delta extraction
 //! - `patterns`: Pattern detection engine
 //! - `events`: Event bus for detections and signals
+//! - `event_templates`: Human-readable event summary templates
 //! - `explanations`: Reusable explanation templates for wa why and errors
 //! - `suggestions`: Context-aware suggestion system for actionable errors
 //! - `workflows`: Durable workflow execution
@@ -40,6 +41,8 @@ pub mod config;
 pub mod crash;
 pub mod dry_run;
 pub mod error;
+pub mod error_codes;
+pub mod event_templates;
 pub mod events;
 pub mod explanations;
 pub mod ingest;

@@ -13,7 +13,7 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, trace, warn};
 
-use crate::ingest::{CapturedSegment, PaneCursor};
+use crate::ingest::{CapturedSegment, PaneCursor, PaneRegistry};
 use crate::wezterm::{PaneInfo, PaneTextSource};
 
 /// Configuration for the tailer supervisor.
@@ -130,6 +130,8 @@ where
     tx: mpsc::Sender<CaptureEvent>,
     /// Per-pane cursors (shared with runtime)
     cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
+    /// Pane registry (for authoritative state like alt-screen)
+    registry: Arc<RwLock<PaneRegistry>>,
     /// Shutdown flag
     shutdown_flag: Arc<AtomicBool>,
     /// Pane text source (WezTerm client or test double)
@@ -153,6 +155,7 @@ where
         config: TailerConfig,
         tx: mpsc::Sender<CaptureEvent>,
         cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
+        registry: Arc<RwLock<PaneRegistry>>,
         shutdown_flag: Arc<AtomicBool>,
         source: Arc<S>,
     ) -> Self {
@@ -161,6 +164,7 @@ where
             config,
             tx,
             cursors,
+            registry,
             shutdown_flag,
             source,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
@@ -230,6 +234,7 @@ where
         for pane_id in ready_panes {
             let tx = self.tx.clone();
             let cursors = Arc::clone(&self.cursors);
+            let registry = Arc::clone(&self.registry);
             let source = Arc::clone(&self.source);
             let semaphore = Arc::clone(&self.semaphore);
             let overlap_size = self.config.overlap_size;
@@ -263,11 +268,17 @@ where
                     }
                 };
 
+                // Fetch external alt-screen state from registry if available
+                let external_alt_screen = {
+                    let reg = registry.read().await;
+                    reg.is_alt_screen(pane_id)
+                };
+
                 let captured = {
                     let mut cursors = cursors.write().await;
-                    cursors
-                        .get_mut(&pane_id)
-                        .and_then(|cursor| cursor.capture_snapshot(&text, overlap_size))
+                    cursors.get_mut(&pane_id).and_then(|cursor| {
+                        cursor.capture_snapshot(&text, overlap_size, external_alt_screen)
+                    })
                 };
 
                 if let Some(segment) = captured {
@@ -502,10 +513,11 @@ mod tests {
         let config = TailerConfig::default();
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let source = Arc::new(StaticSource);
 
-        let mut supervisor = TailerSupervisor::new(config, tx, cursors, shutdown, source);
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
         assert_eq!(supervisor.active_count(), 0);
 
@@ -543,6 +555,7 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel(10);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         {
@@ -552,7 +565,7 @@ mod tests {
             }
         }
 
-        let mut supervisor = TailerSupervisor::new(config, tx, cursors, shutdown, source);
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
         let mut panes = HashMap::new();
         for pane_id in 1..=4 {
@@ -580,6 +593,7 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel(1);
         let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         {
@@ -588,7 +602,7 @@ mod tests {
             cursor_guard.insert(2, PaneCursor::new(2));
         }
 
-        let mut supervisor = TailerSupervisor::new(config, tx, cursors, shutdown, source);
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
         let mut panes = HashMap::new();
         panes.insert(1, make_pane(1));

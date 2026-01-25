@@ -212,12 +212,10 @@ impl std::fmt::Display for CodexSessionParseError {
 impl std::error::Error for CodexSessionParseError {}
 
 static CODEX_RESUME_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)codex resume\s+(?P<session_id>[0-9a-fA-F-]{8,})")
-        .expect("codex resume regex")
+    Regex::new(r"(?i)codex resume\s+(?P<session_id>[0-9a-fA-F-]{8,})").expect("codex resume regex")
 });
 static CODEX_RESET_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)try again at\s+(?P<reset_time>[^.\n]+)")
-        .expect("codex reset time regex")
+    Regex::new(r"(?i)try again at\s+(?P<reset_time>[^.\n]+)").expect("codex reset time regex")
 });
 static CODEX_TOTAL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)total\s*=\s*([\d,]+)").expect("total regex"));
@@ -225,12 +223,10 @@ static CODEX_INPUT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)input\s*=\s*([\d,]+)").expect("input regex"));
 static CODEX_OUTPUT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)output\s*=\s*([\d,]+)").expect("output regex"));
-static CODEX_CACHED_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\(\+\s*([\d,]+)\s+cached\)").expect("cached regex")
-});
-static CODEX_REASONING_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\(reasoning\s+([\d,]+)\)").expect("reasoning regex")
-});
+static CODEX_CACHED_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\(\+\s*([\d,]+)\s+cached\)").expect("cached regex"));
+static CODEX_REASONING_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\(reasoning\s+([\d,]+)\)").expect("reasoning regex"));
 
 fn stable_hash(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64; // FNV-1a offset basis
@@ -264,7 +260,9 @@ fn extract_token_usage(line: &str) -> CodexTokenUsage {
 }
 
 fn find_token_usage_line(tail: &str) -> Option<&str> {
-    tail.lines().filter(|line| line.contains("Token usage:")).last()
+    tail.lines()
+        .filter(|line| line.contains("Token usage:"))
+        .last()
 }
 
 fn find_session_id(tail: &str) -> Option<String> {
@@ -277,7 +275,10 @@ fn find_session_id(tail: &str) -> Option<String> {
 fn find_reset_time(tail: &str) -> Option<String> {
     CODEX_RESET_RE
         .captures_iter(tail)
-        .filter_map(|caps| caps.name("reset_time").map(|m| m.as_str().trim().to_string()))
+        .filter_map(|caps| {
+            caps.name("reset_time")
+                .map(|m| m.as_str().trim().to_string())
+        })
         .last()
 }
 

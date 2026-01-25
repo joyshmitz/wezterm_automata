@@ -121,6 +121,28 @@ CREATE TABLE IF NOT EXISTS output_gaps (
 CREATE INDEX IF NOT EXISTS idx_gaps_pane ON output_gaps(pane_id);
 CREATE INDEX IF NOT EXISTS idx_gaps_detected ON output_gaps(detected_at);
 
+-- FTS5 virtual table for full-text search over segments
+CREATE VIRTUAL TABLE IF NOT EXISTS output_segments_fts USING fts5(
+    content,
+    content='output_segments',
+    content_rowid='id',
+    tokenize='porter unicode61'
+);
+
+-- Triggers to keep FTS index in sync
+CREATE TRIGGER IF NOT EXISTS output_segments_ai AFTER INSERT ON output_segments BEGIN
+    INSERT INTO output_segments_fts(rowid, content) VALUES (new.id, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS output_segments_ad AFTER DELETE ON output_segments BEGIN
+    INSERT INTO output_segments_fts(output_segments_fts, rowid, content) VALUES('delete', old.id, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS output_segments_au AFTER UPDATE ON output_segments BEGIN
+    INSERT INTO output_segments_fts(output_segments_fts, rowid, content) VALUES('delete', old.id, old.content);
+    INSERT INTO output_segments_fts(rowid, content) VALUES (new.id, new.content);
+END;
+
 -- Events: pattern detections with lifecycle tracking
 -- Supports: unhandled queries, workflow linkage, idempotency
 CREATE TABLE IF NOT EXISTS events (
@@ -152,6 +174,32 @@ CREATE INDEX IF NOT EXISTS idx_events_rule ON events(rule_id);
 CREATE INDEX IF NOT EXISTS idx_events_unhandled ON events(handled_at) WHERE handled_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_events_detected ON events(detected_at);
 CREATE INDEX IF NOT EXISTS idx_events_severity ON events(severity, detected_at);
+
+-- Agent sessions: per-agent session timeline with token tracking
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    id INTEGER PRIMARY KEY,
+    pane_id INTEGER NOT NULL REFERENCES panes(pane_id) ON DELETE CASCADE,
+    agent_type TEXT NOT NULL,         -- codex, claude_code, gemini, unknown
+    session_id TEXT,                  -- Agent's internal session ID if available
+    external_id TEXT,                 -- Correlation with cass, etc.
+    started_at INTEGER NOT NULL,      -- epoch ms
+    ended_at INTEGER,                 -- epoch ms (NULL = still active)
+    end_reason TEXT,                  -- completed, limit_reached, error, manual
+    -- Token tracking
+    total_tokens INTEGER,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cached_tokens INTEGER,
+    reasoning_tokens INTEGER,
+    -- Model info
+    model_name TEXT,
+    -- Cost tracking
+    estimated_cost_usd REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_pane ON agent_sessions(pane_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_external ON agent_sessions(external_id) WHERE external_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sessions_active ON agent_sessions(ended_at) WHERE ended_at IS NULL;
 
 -- Workflow executions: durable FSM state for resumability
 CREATE TABLE IF NOT EXISTS workflow_executions (
@@ -265,54 +313,6 @@ CREATE TABLE IF NOT EXISTS maintenance_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_maintenance_timestamp ON maintenance_log(timestamp);
-
--- Agent sessions: per-agent session timeline with token tracking
-CREATE TABLE IF NOT EXISTS agent_sessions (
-    id INTEGER PRIMARY KEY,
-    pane_id INTEGER NOT NULL REFERENCES panes(pane_id) ON DELETE CASCADE,
-    agent_type TEXT NOT NULL,         -- codex, claude_code, gemini, unknown
-    session_id TEXT,                  -- Agent's internal session ID if available
-    external_id TEXT,                 -- Correlation with cass, etc.
-    started_at INTEGER NOT NULL,      -- epoch ms
-    ended_at INTEGER,                 -- epoch ms (NULL = still active)
-    end_reason TEXT,                  -- completed, limit_reached, error, manual
-    -- Token tracking
-    total_tokens INTEGER,
-    input_tokens INTEGER,
-    output_tokens INTEGER,
-    cached_tokens INTEGER,
-    reasoning_tokens INTEGER,
-    -- Model info
-    model_name TEXT,
-    -- Cost tracking
-    estimated_cost_usd REAL
-);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_pane ON agent_sessions(pane_id, started_at);
-CREATE INDEX IF NOT EXISTS idx_sessions_external ON agent_sessions(external_id) WHERE external_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_sessions_active ON agent_sessions(ended_at) WHERE ended_at IS NULL;
-
--- FTS5 virtual table for full-text search over segments
-CREATE VIRTUAL TABLE IF NOT EXISTS output_segments_fts USING fts5(
-    content,
-    content='output_segments',
-    content_rowid='id',
-    tokenize='porter unicode61'
-);
-
--- Triggers to keep FTS index in sync
-CREATE TRIGGER IF NOT EXISTS output_segments_ai AFTER INSERT ON output_segments BEGIN
-    INSERT INTO output_segments_fts(rowid, content) VALUES (new.id, new.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS output_segments_ad AFTER DELETE ON output_segments BEGIN
-    INSERT INTO output_segments_fts(output_segments_fts, rowid, content) VALUES('delete', old.id, old.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS output_segments_au AFTER UPDATE ON output_segments BEGIN
-    INSERT INTO output_segments_fts(output_segments_fts, rowid, content) VALUES('delete', old.id, old.content);
-    INSERT INTO output_segments_fts(rowid, content) VALUES (new.id, new.content);
-END;
 
 -- Action history view (audit + undo + workflow step info)
 CREATE VIEW IF NOT EXISTS action_history AS

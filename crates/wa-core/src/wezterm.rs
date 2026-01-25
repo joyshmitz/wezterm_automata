@@ -871,6 +871,37 @@ pub enum WaitResult {
     },
 }
 
+/// Marker presence snapshot for Codex session summary detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodexSummaryMarkers {
+    /// Whether "Token usage:" marker is present.
+    pub token_usage: bool,
+    /// Whether "codex resume" marker is present.
+    pub resume_hint: bool,
+}
+
+impl CodexSummaryMarkers {
+    #[must_use]
+    pub fn complete(self) -> bool {
+        self.token_usage && self.resume_hint
+    }
+}
+
+/// Outcome of waiting for Codex session summary markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSummaryWaitResult {
+    /// Whether both markers were observed.
+    pub matched: bool,
+    /// Elapsed time in milliseconds.
+    pub elapsed_ms: u64,
+    /// Number of polls performed.
+    pub polls: usize,
+    /// Hash of the last tail observed (for safe debugging).
+    pub last_tail_hash: Option<u64>,
+    /// Marker snapshot from the last poll.
+    pub last_markers: CodexSummaryMarkers,
+}
+
 /// Shared waiter for polling pane text until a matcher succeeds.
 pub struct PaneWaiter<'a, S: PaneTextSource + Sync + ?Sized> {
     source: &'a S,
@@ -960,6 +991,88 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
             if interval > self.options.poll_max {
                 interval = self.options.poll_max;
             }
+        }
+    }
+}
+
+/// Wait for Codex session summary markers to appear in the pane tail.
+///
+/// This requires both:
+/// - "Token usage:" (summary header)
+/// - "codex resume" (resume hint)
+///
+/// It returns a bounded result with only hashes and marker booleans (no raw text).
+pub async fn wait_for_codex_session_summary<S: PaneTextSource + Sync + ?Sized>(
+    source: &S,
+    pane_id: u64,
+    timeout: Duration,
+    options: WaitOptions,
+) -> Result<CodexSummaryWaitResult> {
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut polls = 0usize;
+    let mut interval = options.poll_initial;
+    let mut last_tail_hash = None;
+    let mut last_markers = CodexSummaryMarkers {
+        token_usage: false,
+        resume_hint: false,
+    };
+
+    tracing::info!(
+        pane_id,
+        timeout_ms = ms_u64(timeout),
+        "codex_summary_wait start"
+    );
+
+    loop {
+        polls += 1;
+        let text = source.get_text(pane_id, options.escapes).await?;
+        let tail = tail_text(&text, options.tail_lines);
+        last_tail_hash = Some(stable_hash(tail.as_bytes()));
+
+        let markers = CodexSummaryMarkers {
+            token_usage: tail.contains("Token usage:"),
+            resume_hint: tail.contains("codex resume"),
+        };
+        last_markers = markers;
+
+        if markers.complete() {
+            let elapsed_ms = elapsed_ms(start);
+            tracing::info!(pane_id, elapsed_ms, polls, "codex_summary_wait matched");
+            return Ok(CodexSummaryWaitResult {
+                matched: true,
+                elapsed_ms,
+                polls,
+                last_tail_hash,
+                last_markers,
+            });
+        }
+
+        let now = Instant::now();
+        if now >= deadline || polls >= options.max_polls {
+            let elapsed_ms = elapsed_ms(start);
+            tracing::info!(pane_id, elapsed_ms, polls, "codex_summary_wait timeout");
+            return Ok(CodexSummaryWaitResult {
+                matched: false,
+                elapsed_ms,
+                polls,
+                last_tail_hash,
+                last_markers,
+            });
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        let sleep_duration = if interval > remaining {
+            remaining
+        } else {
+            interval
+        };
+        if !sleep_duration.is_zero() {
+            sleep(sleep_duration).await;
+        }
+        interval = interval.saturating_mul(2);
+        if interval > options.poll_max {
+            interval = options.poll_max;
         }
     }
 }

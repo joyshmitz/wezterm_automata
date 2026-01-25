@@ -96,7 +96,7 @@ toml = "0.8"
 toml_edit = "0.22"
 
 # Serialization
-toon_rust = { git = "https://github.com/Dicklesworthstone/toon_rust" }
+toon_rust = { git = "https://github.com/Dicklesworthstone/toon_rust", branch = "master" }
 
 # File locking
 fs2 = "0.4"

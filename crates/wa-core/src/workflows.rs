@@ -15,15 +15,347 @@
 //! - Deterministic step logic testing
 //! - Shared runner across agent-specific workflows
 
-use crate::policy::PaneCapabilities;
+use crate::policy::{InjectionResult, PaneCapabilities};
 use crate::storage::StorageHandle;
+use crate::wezterm::{
+    CodexSummaryWaitResult, PaneTextSource, WaitOptions, wait_for_codex_session_summary,
+};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::time::Duration;
 
 /// Type alias for a boxed future used in dyn-compatible traits.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+// ============================================================================
+// Codex Usage-Limit Helpers (wa-nu4.1.3.2)
+// ============================================================================
+
+/// Options for exiting Codex and waiting for the session summary markers.
+#[derive(Debug, Clone)]
+pub struct CodexExitOptions {
+    /// Timeout for the first (single Ctrl-C) attempt, in milliseconds.
+    pub grace_timeout_ms: u64,
+    /// Timeout for the second attempt, in milliseconds.
+    pub summary_timeout_ms: u64,
+    /// Polling options for summary detection.
+    pub wait_options: WaitOptions,
+}
+
+impl Default for CodexExitOptions {
+    fn default() -> Self {
+        Self {
+            grace_timeout_ms: 2_000,
+            summary_timeout_ms: 20_000,
+            wait_options: WaitOptions::default(),
+        }
+    }
+}
+
+/// Outcome of the Codex exit + summary wait step.
+#[derive(Debug, Clone)]
+pub struct CodexExitOutcome {
+    /// Number of Ctrl-C injections performed (1 or 2).
+    pub ctrl_c_count: u8,
+    /// Summary wait result (matched or timed out).
+    pub summary: CodexSummaryWaitResult,
+}
+
+/// Convert an injection result into a success/error for Ctrl-C handling.
+fn ctrl_c_injection_ok(result: InjectionResult) -> Result<(), String> {
+    match result {
+        InjectionResult::Allowed { .. } => Ok(()),
+        InjectionResult::Denied { decision, .. } => match decision {
+            crate::policy::PolicyDecision::Deny { reason, .. } => {
+                Err(format!("Ctrl-C denied by policy: {reason}"))
+            }
+            _ => Err("Ctrl-C denied by policy".to_string()),
+        },
+        InjectionResult::RequiresApproval { decision, .. } => match decision {
+            crate::policy::PolicyDecision::RequireApproval { reason, .. } => {
+                Err(format!("Ctrl-C requires approval: {reason}"))
+            }
+            _ => Err("Ctrl-C requires approval".to_string()),
+        },
+        InjectionResult::Error { error, .. } => Err(format!("Ctrl-C failed: {error}")),
+    }
+}
+
+/// Exit Codex by sending Ctrl-C (once or twice) and wait for session summary markers.
+///
+/// This function:
+/// 1) Sends Ctrl-C once and waits for summary markers within a grace window.
+/// 2) If not seen, sends Ctrl-C again and waits up to `summary_timeout_ms`.
+///
+/// Returns the number of Ctrl-C injections performed and the summary wait result.
+pub(crate) async fn codex_exit_and_wait_for_summary<S, F, Fut>(
+    pane_id: u64,
+    source: &S,
+    mut send_ctrl_c: F,
+    options: &CodexExitOptions,
+) -> Result<CodexExitOutcome, String>
+where
+    S: PaneTextSource + Sync + ?Sized,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<InjectionResult, String>> + Send,
+{
+    let grace_timeout = Duration::from_millis(options.grace_timeout_ms);
+    let summary_timeout = Duration::from_millis(options.summary_timeout_ms);
+
+    // First Ctrl-C attempt.
+    let first = send_ctrl_c().await?;
+    ctrl_c_injection_ok(first)?;
+
+    let first_wait = wait_for_codex_session_summary(
+        source,
+        pane_id,
+        grace_timeout,
+        options.wait_options.clone(),
+    )
+    .await
+    .map_err(|e| format!("Codex summary wait failed: {e}"))?;
+
+    if first_wait.matched {
+        return Ok(CodexExitOutcome {
+            ctrl_c_count: 1,
+            summary: first_wait,
+        });
+    }
+
+    // Second Ctrl-C attempt if summary not observed.
+    let second = send_ctrl_c().await?;
+    ctrl_c_injection_ok(second)?;
+
+    let second_wait = wait_for_codex_session_summary(
+        source,
+        pane_id,
+        summary_timeout,
+        options.wait_options.clone(),
+    )
+    .await
+    .map_err(|e| format!("Codex summary wait failed: {e}"))?;
+
+    if second_wait.matched {
+        return Ok(CodexExitOutcome {
+            ctrl_c_count: 2,
+            summary: second_wait,
+        });
+    }
+
+    let last_hash = second_wait
+        .last_tail_hash
+        .map(|value| format!("{value:016x}"))
+        .unwrap_or_else(|| "none".to_string());
+    Err(format!(
+        "Session summary not found after Ctrl-C x2 (token_usage={}, resume_hint={}, elapsed_ms={}, last_tail_hash={})",
+        second_wait.last_markers.token_usage,
+        second_wait.last_markers.resume_hint,
+        second_wait.elapsed_ms,
+        last_hash
+    ))
+}
+
+// ============================================================================
+// Codex Usage-Limit Helpers (wa-nu4.1.3.3)
+// ============================================================================
+
+/// Parsed token usage summary from Codex session output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexTokenUsage {
+    pub total: Option<i64>,
+    pub input: Option<i64>,
+    pub output: Option<i64>,
+    pub cached: Option<i64>,
+    pub reasoning: Option<i64>,
+}
+
+impl CodexTokenUsage {
+    fn has_any(&self) -> bool {
+        self.total.is_some()
+            || self.input.is_some()
+            || self.output.is_some()
+            || self.cached.is_some()
+            || self.reasoning.is_some()
+    }
+}
+
+/// Parsed Codex session summary details needed for resume + accounting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSessionSummary {
+    pub session_id: String,
+    pub token_usage: CodexTokenUsage,
+    pub reset_time: Option<String>,
+}
+
+/// Structured error for Codex session summary parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSessionParseError {
+    pub missing: Vec<&'static str>,
+    pub tail_hash: u64,
+    pub tail_len: usize,
+}
+
+impl std::fmt::Display for CodexSessionParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Missing Codex session fields: {:?} (tail_hash={:016x}, tail_len={})",
+            self.missing, self.tail_hash, self.tail_len
+        )
+    }
+}
+
+impl std::error::Error for CodexSessionParseError {}
+
+static CODEX_RESUME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)codex resume\s+(?P<session_id>[0-9a-fA-F-]{8,})")
+        .expect("codex resume regex")
+});
+static CODEX_RESET_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)try again at\s+(?P<reset_time>[^.\n]+)")
+        .expect("codex reset time regex")
+});
+static CODEX_TOTAL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)total\s*=\s*([\d,]+)").expect("total regex"));
+static CODEX_INPUT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)input\s*=\s*([\d,]+)").expect("input regex"));
+static CODEX_OUTPUT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)output\s*=\s*([\d,]+)").expect("output regex"));
+static CODEX_CACHED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\(\+\s*([\d,]+)\s+cached\)").expect("cached regex")
+});
+static CODEX_REASONING_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\(reasoning\s+([\d,]+)\)").expect("reasoning regex")
+});
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64; // FNV-1a offset basis
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+fn parse_number(raw: &str) -> Option<i64> {
+    let cleaned = raw.replace(',', "");
+    cleaned.parse::<i64>().ok()
+}
+
+fn capture_number(regex: &Regex, text: &str) -> Option<i64> {
+    regex
+        .captures(text)
+        .and_then(|caps| caps.get(1).map(|m| m.as_str()))
+        .and_then(parse_number)
+}
+
+fn extract_token_usage(line: &str) -> CodexTokenUsage {
+    CodexTokenUsage {
+        total: capture_number(&CODEX_TOTAL_RE, line),
+        input: capture_number(&CODEX_INPUT_RE, line),
+        output: capture_number(&CODEX_OUTPUT_RE, line),
+        cached: capture_number(&CODEX_CACHED_RE, line),
+        reasoning: capture_number(&CODEX_REASONING_RE, line),
+    }
+}
+
+fn find_token_usage_line(tail: &str) -> Option<&str> {
+    tail.lines().filter(|line| line.contains("Token usage:")).last()
+}
+
+fn find_session_id(tail: &str) -> Option<String> {
+    CODEX_RESUME_RE
+        .captures_iter(tail)
+        .filter_map(|caps| caps.name("session_id").map(|m| m.as_str().to_string()))
+        .last()
+}
+
+fn find_reset_time(tail: &str) -> Option<String> {
+    CODEX_RESET_RE
+        .captures_iter(tail)
+        .filter_map(|caps| caps.name("reset_time").map(|m| m.as_str().trim().to_string()))
+        .last()
+}
+
+/// Parse Codex session summary from pane tail text.
+///
+/// Required fields:
+/// - session_id (from "codex resume ...")
+/// - token usage line (from "Token usage:")
+///
+/// Optional fields:
+/// - reset_time ("try again at ...")
+pub(crate) fn parse_codex_session_summary(
+    tail: &str,
+) -> Result<CodexSessionSummary, CodexSessionParseError> {
+    let tail_hash = stable_hash(tail.as_bytes());
+    let tail_len = tail.len();
+
+    let session_id = find_session_id(tail);
+    let token_usage_line = find_token_usage_line(tail);
+    let token_usage = token_usage_line.map(extract_token_usage);
+    let reset_time = find_reset_time(tail);
+
+    let mut missing = Vec::new();
+    if session_id.is_none() {
+        missing.push("session_id");
+    }
+    if token_usage_line.is_none()
+        || token_usage
+            .as_ref()
+            .map(|usage| usage.has_any())
+            .unwrap_or(false)
+            == false
+    {
+        missing.push("token_usage");
+    }
+
+    if !missing.is_empty() {
+        return Err(CodexSessionParseError {
+            missing,
+            tail_hash,
+            tail_len,
+        });
+    }
+
+    Ok(CodexSessionSummary {
+        session_id: session_id.expect("session_id checked"),
+        token_usage: token_usage.expect("token_usage checked"),
+        reset_time,
+    })
+}
+
+/// Build an agent session record from a parsed Codex summary.
+pub(crate) fn codex_session_record_from_summary(
+    pane_id: u64,
+    summary: &CodexSessionSummary,
+) -> crate::storage::AgentSessionRecord {
+    let mut record = crate::storage::AgentSessionRecord::new_start(pane_id, "codex");
+    record.session_id = Some(summary.session_id.clone());
+    record.total_tokens = summary.token_usage.total;
+    record.input_tokens = summary.token_usage.input;
+    record.output_tokens = summary.token_usage.output;
+    record.cached_tokens = summary.token_usage.cached;
+    record.reasoning_tokens = summary.token_usage.reasoning;
+    record
+}
+
+/// Persist parsed Codex summary data into agent_sessions.
+pub(crate) async fn persist_codex_session_summary(
+    storage: &StorageHandle,
+    pane_id: u64,
+    summary: &CodexSessionSummary,
+) -> Result<i64, String> {
+    let record = codex_session_record_from_summary(pane_id, summary);
+    storage
+        .upsert_agent_session(record)
+        .await
+        .map_err(|e| format!("Failed to persist Codex session summary: {e}"))
+}
 
 // ============================================================================
 // Step Results
@@ -1299,8 +1631,6 @@ impl Drop for PaneWorkflowLockGuard<'_> {
 
 use crate::ingest::Osc133State;
 use crate::patterns::PatternEngine;
-use crate::wezterm::PaneTextSource;
-use std::time::Duration;
 use tokio::time::{Instant, sleep};
 
 /// Result of waiting for a condition.
@@ -2583,7 +2913,33 @@ impl WorkflowRunner {
     ///
     /// This spawns workflow executions for matching detections. The loop
     /// runs until the event bus channel is closed.
+    ///
+    /// On startup, resumes any incomplete workflows that were interrupted
+    /// (e.g., by a previous watcher crash or restart).
     pub async fn run(&self, event_bus: &crate::events::EventBus) {
+        // Resume any incomplete workflows from a previous run
+        let resumed = self.resume_incomplete().await;
+        if !resumed.is_empty() {
+            tracing::info!(
+                count = resumed.len(),
+                "Resumed incomplete workflows from previous run"
+            );
+            for result in &resumed {
+                match result {
+                    WorkflowExecutionResult::Completed { execution_id, .. } => {
+                        tracing::info!(execution_id, "Resumed workflow completed");
+                    }
+                    WorkflowExecutionResult::Error {
+                        execution_id,
+                        error,
+                    } => {
+                        tracing::warn!(?execution_id, error, "Resumed workflow errored");
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let mut subscriber = event_bus.subscribe_detections();
 
         loop {
@@ -6671,5 +7027,178 @@ mod tests {
         );
 
         storage.shutdown().await.unwrap();
+    }
+
+    // ====================================================================
+    // Codex Exit Step Tests (wa-nu4.1.3.2)
+    // ====================================================================
+
+    #[derive(Clone)]
+    struct TestTextSource {
+        sequence: Arc<Vec<String>>,
+        index: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TestTextSource {
+        fn new(sequence: Vec<&str>) -> Self {
+            Self {
+                sequence: Arc::new(sequence.into_iter().map(str::to_string).collect()),
+                index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl PaneTextSource for TestTextSource {
+        type Fut<'a> = Pin<Box<dyn Future<Output = crate::Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            let idx = self.index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let text = self
+                .sequence
+                .get(idx)
+                .cloned()
+                .or_else(|| self.sequence.last().cloned())
+                .unwrap_or_default();
+            Box::pin(async move { Ok(text) })
+        }
+    }
+
+    fn allowed_ctrl_c_result() -> InjectionResult {
+        InjectionResult::Allowed {
+            decision: crate::policy::PolicyDecision::allow(),
+            summary: "ctrl-c".to_string(),
+            pane_id: 1,
+            action: crate::policy::ActionKind::SendCtrlC,
+        }
+    }
+
+    fn wait_options_single_poll() -> WaitOptions {
+        WaitOptions {
+            tail_lines: 200,
+            escapes: false,
+            poll_initial: Duration::from_millis(0),
+            poll_max: Duration::from_millis(0),
+            max_polls: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_exit_sends_one_ctrl_c_when_summary_present() {
+        let source = TestTextSource::new(vec![
+            "Token usage: total=10 input=5 (+ 0 cached) output=5\nTo resume, run: codex resume 123e4567-e89b-12d3-a456-426614174000",
+        ]);
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        let send_ctrl_c = move || {
+            let counter = Arc::clone(&counter_clone);
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(allowed_ctrl_c_result())
+            }
+        };
+
+        let options = CodexExitOptions {
+            grace_timeout_ms: 0,
+            summary_timeout_ms: 0,
+            wait_options: wait_options_single_poll(),
+        };
+
+        let result = codex_exit_and_wait_for_summary(1, &source, send_ctrl_c, &options)
+            .await
+            .expect("exit should succeed");
+
+        assert_eq!(result.ctrl_c_count, 1);
+        assert!(result.summary.matched);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn codex_exit_sends_second_ctrl_c_when_grace_times_out() {
+        let source = TestTextSource::new(vec![
+            "still running...",
+            "Token usage: total=10 input=5 (+ 0 cached) output=5\nTo resume, run: codex resume 123e4567-e89b-12d3-a456-426614174000",
+        ]);
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        let send_ctrl_c = move || {
+            let counter = Arc::clone(&counter_clone);
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(allowed_ctrl_c_result())
+            }
+        };
+
+        let options = CodexExitOptions {
+            grace_timeout_ms: 0,
+            summary_timeout_ms: 0,
+            wait_options: wait_options_single_poll(),
+        };
+
+        let result = codex_exit_and_wait_for_summary(1, &source, send_ctrl_c, &options)
+            .await
+            .expect("exit should succeed");
+
+        assert_eq!(result.ctrl_c_count, 2);
+        assert!(result.summary.matched);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn codex_exit_errors_when_summary_never_appears() {
+        let source = TestTextSource::new(vec!["no summary", "still no summary"]);
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        let send_ctrl_c = move || {
+            let counter = Arc::clone(&counter_clone);
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(allowed_ctrl_c_result())
+            }
+        };
+
+        let options = CodexExitOptions {
+            grace_timeout_ms: 0,
+            summary_timeout_ms: 0,
+            wait_options: wait_options_single_poll(),
+        };
+
+        let err = codex_exit_and_wait_for_summary(1, &source, send_ctrl_c, &options)
+            .await
+            .expect_err("expected failure");
+        assert!(err.contains("Session summary not found"));
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn codex_exit_aborts_on_policy_denial() {
+        let source = TestTextSource::new(vec![
+            "Token usage: total=1 input=1 (+ 0 cached) output=0 codex resume 123e4567-e89b-12d3-a456-426614174000",
+        ]);
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        let send_ctrl_c = move || {
+            let counter = Arc::clone(&counter_clone);
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(InjectionResult::Denied {
+                    decision: crate::policy::PolicyDecision::deny("blocked"),
+                    summary: "ctrl-c".to_string(),
+                    pane_id: 1,
+                    action: crate::policy::ActionKind::SendCtrlC,
+                })
+            }
+        };
+
+        let options = CodexExitOptions {
+            grace_timeout_ms: 0,
+            summary_timeout_ms: 0,
+            wait_options: wait_options_single_poll(),
+        };
+
+        let err = codex_exit_and_wait_for_summary(1, &source, send_ctrl_c, &options)
+            .await
+            .expect_err("expected denial");
+        assert!(err.contains("denied"));
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

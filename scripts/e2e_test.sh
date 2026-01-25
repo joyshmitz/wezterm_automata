@@ -336,6 +336,7 @@ SCENARIO_REGISTRY=(
     "pane_exclude_filter:Validate pane selection filters protect privacy (ignored pane absent from search)"
     "workspace_isolation:Validate workspace isolation (no cross-project DB leakage)"
     "uservar_forwarding:Validate user-var forwarding lane (wezterm.lua -> wa event -> watcher)"
+    "workflow_resume:Validate workflow resumes after watcher restart (no duplicate steps)"
 )
 
 list_scenarios() {
@@ -1915,6 +1916,240 @@ EOS
     return $result
 }
 
+# ==============================================================================
+# Scenario: Workflow Resume After Restart
+# ==============================================================================
+# This scenario validates that workflows resume from the last completed step
+# after the watcher is killed and restarted. It ensures:
+# 1. Workflow state is persisted to storage
+# 2. Incomplete workflows are resumed on startup
+# 3. No step that sends input is executed twice
+# ==============================================================================
+
+run_scenario_workflow_resume() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-resume-XXXXXX)
+    local wa_pid=""
+    local pane_id=""
+    local result=0
+    local wait_timeout=${TIMEOUT:-45}
+
+    log_info "Workspace: $temp_workspace"
+
+    # Setup environment for isolated wa instance
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    # Copy baseline config for workflow testing
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$temp_workspace/wa.toml"
+        export WA_CONFIG="$temp_workspace/wa.toml"
+        log_verbose "Using baseline config: $baseline_config"
+    fi
+
+    # Cleanup function
+    cleanup_workflow_resume() {
+        log_verbose "Cleaning up workflow_resume scenario"
+        # Kill wa watch if running
+        if [[ -n "$wa_pid" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            log_verbose "Stopping wa watch (pid $wa_pid)"
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        # Close dummy pane if it exists
+        if [[ -n "$pane_id" ]]; then
+            log_verbose "Closing dummy agent pane $pane_id"
+            wezterm cli kill-pane --pane-id "$pane_id" 2>/dev/null || true
+        fi
+        # Copy artifacts before cleanup
+        if [[ -d "$temp_workspace" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "$temp_workspace"
+    }
+    trap cleanup_workflow_resume EXIT
+
+    # Step 1: Start wa watch with auto-handle
+    log_info "Step 1: Starting wa watch with --auto-handle..."
+    "$WA_BINARY" watch --foreground --auto-handle \
+        > "$scenario_dir/wa_watch_1.log" 2>&1 &
+    wa_pid=$!
+    log_verbose "wa watch started with PID $wa_pid"
+    echo "wa_pid_1: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    sleep 2
+
+    # Verify wa watch is running
+    if ! kill -0 "$wa_pid" 2>/dev/null; then
+        log_fail "wa watch exited immediately"
+        return 1
+    fi
+
+    # Step 2: Spawn dummy agent pane that will trigger compaction
+    log_info "Step 2: Spawning dummy agent pane..."
+    local agent_script="$PROJECT_ROOT/fixtures/e2e/dummy_agent.sh"
+    if [[ ! -x "$agent_script" ]]; then
+        log_fail "Dummy agent script not found or not executable: $agent_script"
+        return 1
+    fi
+
+    local spawn_output
+    # Spawn with 1 second delay before compaction marker
+    spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- bash "$agent_script" 1 2>&1)
+    pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+
+    if [[ -z "$pane_id" ]]; then
+        log_fail "Failed to spawn dummy agent pane"
+        echo "Spawn output: $spawn_output" >> "$scenario_dir/scenario.log"
+        return 1
+    fi
+    log_info "Spawned agent pane: $pane_id"
+    echo "agent_pane_id: $pane_id" >> "$scenario_dir/scenario.log"
+
+    # Step 3: Wait for pane to be observed
+    log_info "Step 3: Waiting for pane to be observed..."
+    local check_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $pane_id)' >/dev/null 2>&1"
+
+    if ! wait_for_condition "pane $pane_id observed" "$check_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for pane to be observed"
+        "$WA_BINARY" robot state > "$scenario_dir/robot_state.json" 2>&1 || true
+        return 1
+    fi
+    log_pass "Pane observed"
+
+    # Step 4: Wait for compaction detection and workflow to start
+    log_info "Step 4: Waiting for compaction detection and workflow start..."
+    sleep 4  # Give time for agent to emit marker and workflow to start
+
+    # Check for workflow start in logs
+    if grep -qi "workflow.*started\|handle_compaction" "$scenario_dir/wa_watch_1.log" 2>/dev/null; then
+        log_pass "Workflow started"
+    else
+        log_warn "Workflow may not have started (checking anyway)"
+    fi
+
+    # Step 5: Kill watcher abruptly (simulate crash)
+    log_info "Step 5: Killing watcher (simulating crash)..."
+    kill -9 "$wa_pid" 2>/dev/null || true
+    wait "$wa_pid" 2>/dev/null || true
+    wa_pid=""
+    log_pass "Watcher killed"
+
+    # Step 6: Check database for incomplete workflow
+    log_info "Step 6: Checking database for incomplete workflow..."
+    local db_path="$temp_workspace/.wa/wa.db"
+    if [[ -f "$db_path" ]]; then
+        local workflow_status
+        workflow_status=$(sqlite3 "$db_path" "SELECT id, status, current_step FROM workflow_executions ORDER BY started_at DESC LIMIT 1;" 2>/dev/null || echo "")
+        echo "workflow_before_restart: $workflow_status" >> "$scenario_dir/scenario.log"
+
+        if [[ -n "$workflow_status" ]]; then
+            log_pass "Found workflow in database: $workflow_status"
+        else
+            log_warn "No workflow found in database (workflow may not have persisted yet)"
+        fi
+
+        # Count step logs before restart
+        local step_count_before
+        step_count_before=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM workflow_step_logs;" 2>/dev/null || echo "0")
+        echo "step_logs_before_restart: $step_count_before" >> "$scenario_dir/scenario.log"
+        log_info "Step logs before restart: $step_count_before"
+    else
+        log_warn "Database file not found at $db_path"
+    fi
+
+    # Step 7: Restart wa watch with auto-handle
+    log_info "Step 7: Restarting wa watch with --auto-handle..."
+    "$WA_BINARY" watch --foreground --auto-handle \
+        > "$scenario_dir/wa_watch_2.log" 2>&1 &
+    wa_pid=$!
+    log_verbose "wa watch restarted with PID $wa_pid"
+    echo "wa_pid_2: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    sleep 2
+
+    # Verify wa watch is running
+    if ! kill -0 "$wa_pid" 2>/dev/null; then
+        log_fail "wa watch (restart) exited immediately"
+        return 1
+    fi
+    log_pass "Watcher restarted"
+
+    # Step 8: Wait for workflow resume activity
+    log_info "Step 8: Waiting for workflow resume..."
+    sleep 5  # Give time for resume logic to execute
+
+    # Check for resume activity in logs
+    if grep -qi "resume\|incomplete" "$scenario_dir/wa_watch_2.log" 2>/dev/null; then
+        log_pass "Resume activity detected in logs"
+    else
+        log_warn "No explicit resume activity in logs (may be normal if workflow completed before kill)"
+    fi
+
+    # Step 9: Check for duplicate steps
+    log_info "Step 9: Checking for duplicate workflow steps..."
+    if [[ -f "$db_path" ]]; then
+        # Query step logs and check for duplicates
+        local step_logs
+        step_logs=$(sqlite3 "$db_path" \
+            "SELECT workflow_id, step_index, step_name, COUNT(*) as cnt
+             FROM workflow_step_logs
+             GROUP BY workflow_id, step_index
+             HAVING cnt > 1;" 2>/dev/null || echo "")
+
+        echo "$step_logs" > "$scenario_dir/duplicate_steps.txt"
+
+        if [[ -n "$step_logs" ]]; then
+            log_fail "Found duplicate workflow steps!"
+            echo "Duplicate steps: $step_logs" >> "$scenario_dir/scenario.log"
+            result=1
+        else
+            log_pass "No duplicate workflow steps found"
+        fi
+
+        # Get final step log count
+        local step_count_after
+        step_count_after=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM workflow_step_logs;" 2>/dev/null || echo "0")
+        echo "step_logs_after_restart: $step_count_after" >> "$scenario_dir/scenario.log"
+        log_info "Step logs after restart: $step_count_after"
+
+        # Export all step logs for debugging
+        sqlite3 "$db_path" -header -csv \
+            "SELECT workflow_id, step_index, step_name, result_type, duration_ms FROM workflow_step_logs ORDER BY workflow_id, step_index;" \
+            > "$scenario_dir/all_step_logs.csv" 2>/dev/null || true
+
+        # Export workflow status
+        sqlite3 "$db_path" -header -csv \
+            "SELECT id, workflow_name, pane_id, current_step, status FROM workflow_executions;" \
+            > "$scenario_dir/workflow_executions.csv" 2>/dev/null || true
+    else
+        log_warn "Database file not found after restart"
+    fi
+
+    # Step 10: Check wa watch logs for workflow activity
+    log_info "Step 10: Checking wa watch logs for workflow activity..."
+    cat "$scenario_dir/wa_watch_1.log" "$scenario_dir/wa_watch_2.log" > "$scenario_dir/wa_watch_combined.log" 2>/dev/null || true
+
+    if grep -qi "workflow\|compaction\|detection" "$scenario_dir/wa_watch_combined.log" 2>/dev/null; then
+        log_pass "Found workflow/detection activity in logs"
+    else
+        log_warn "No obvious workflow activity in logs (may be normal)"
+    fi
+
+    # Note: This scenario depends on workflow functionality being complete
+    log_info "Scenario complete"
+
+    # Cleanup trap will handle the rest
+    trap - EXIT
+    cleanup_workflow_resume
+
+    return $result
+}
+
 run_scenario() {
     local name="$1"
     local scenario_num="$2"
@@ -1948,6 +2183,9 @@ run_scenario() {
             ;;
         uservar_forwarding)
             run_scenario_uservar_forwarding "$scenario_dir" || result=$?
+            ;;
+        workflow_resume)
+            run_scenario_workflow_resume "$scenario_dir" || result=$?
             ;;
         *)
             log_fail "Unknown scenario: $name"

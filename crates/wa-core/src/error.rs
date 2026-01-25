@@ -287,6 +287,9 @@ pub enum StorageError {
 
     #[error("FTS query error: {0}")]
     FtsQueryError(String),
+
+    #[error("Database corruption detected: {details}")]
+    Corruption { details: String },
 }
 
 impl StorageError {
@@ -311,6 +314,11 @@ impl StorageError {
             Self::FtsQueryError(_) => Remediation::new("Invalid FTS query syntax.")
                 .command("Example search", "wa search \"term\"")
                 .alternative("Review FTS5 query syntax and try again."),
+            Self::Corruption { .. } => Remediation::new(
+                "Database corruption detected. Automatic recovery is not possible.",
+            )
+            .command("Run diagnostics", "wa doctor")
+            .alternative("Delete the database file and restart with fresh data."),
         }
     }
 }

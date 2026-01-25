@@ -46,6 +46,7 @@ impl ErrorRenderer {
                 StorageError::SequenceDiscontinuity { .. } => "WA-2010",
                 StorageError::MigrationFailed(_) => "WA-2002",
                 StorageError::FtsQueryError(_) => "WA-2020",
+                StorageError::Corruption { .. } => "WA-2030",
             },
             Error::Pattern(e) => match e {
                 PatternError::InvalidRule(_) => "WA-3001",

@@ -2814,11 +2814,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 summary: summary.clone(),
                                                 pane_id,
                                                 action: ActionKind::SendText,
+                                                audit_action_id: None,
                                             },
                                             Err(e) => InjectionResult::Error {
                                                 error: e.to_string(),
                                                 pane_id,
                                                 action: ActionKind::SendText,
+                                                audit_action_id: None,
                                             },
                                         }
                                     }
@@ -2827,6 +2829,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         summary: summary.clone(),
                                         pane_id,
                                         action: ActionKind::SendText,
+                                        audit_action_id: None,
                                     },
                                     PolicyDecision::RequireApproval { .. } => {
                                         InjectionResult::RequiresApproval {
@@ -2834,6 +2837,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             summary: summary.clone(),
                                             pane_id,
                                             action: ActionKind::SendText,
+                                            audit_action_id: None,
                                         }
                                     }
                                 };

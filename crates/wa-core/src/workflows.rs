@@ -2470,28 +2470,31 @@ impl WorkflowRunner {
             let step_started_at = now_ms();
             let step_completed_at = now_ms();
 
-            // Persist step log
-            if let Err(e) = self
-                .storage
-                .insert_step_log(
-                    execution_id,
-                    None,
-                    current_step,
-                    step_name,
-                    result_type,
-                    result_data,
-                    step_started_at,
-                    step_completed_at,
-                )
-                .await
-            {
-                tracing::warn!(
-                    workflow = %workflow_name,
-                    execution_id,
-                    step = current_step,
-                    error = %e,
-                    "Failed to log step"
-                );
+            // Persist step log for non-SendText steps
+            // SendText steps are logged after injection to capture the audit_action_id (wa-nu4.1.1.11)
+            if !matches!(&step_result, StepResult::SendText { .. }) {
+                if let Err(e) = self
+                    .storage
+                    .insert_step_log(
+                        execution_id,
+                        None,
+                        current_step,
+                        step_name,
+                        result_type,
+                        result_data.clone(),
+                        step_started_at,
+                        step_completed_at,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        workflow = %workflow_name,
+                        execution_id,
+                        step = current_step,
+                        error = %e,
+                        "Failed to log step"
+                    );
+                }
             }
 
             // Handle step result
@@ -2704,6 +2707,32 @@ impl WorkflowRunner {
                             )
                             .await
                     };
+
+                    // Log the SendText step with audit_action_id (wa-nu4.1.1.11)
+                    let audit_action_id = send_result.audit_action_id();
+                    if let Err(e) = self
+                        .storage
+                        .insert_step_log(
+                            execution_id,
+                            audit_action_id,
+                            current_step,
+                            step_name,
+                            "send_text",
+                            result_data.clone(),
+                            step_started_at,
+                            now_ms(), // Use current time as completion
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            workflow = %workflow_name,
+                            execution_id,
+                            step = current_step,
+                            ?audit_action_id,
+                            error = %e,
+                            "Failed to log SendText step"
+                        );
+                    }
 
                     match send_result {
                         crate::policy::InjectionResult::Allowed { .. } => {
@@ -7084,6 +7113,7 @@ mod tests {
             summary: "ctrl-c".to_string(),
             pane_id: 1,
             action: crate::policy::ActionKind::SendCtrlC,
+            audit_action_id: None,
         }
     }
 
@@ -7200,6 +7230,7 @@ mod tests {
                     summary: "ctrl-c".to_string(),
                     pane_id: 1,
                     action: crate::policy::ActionKind::SendCtrlC,
+                    audit_action_id: None,
                 })
             }
         };

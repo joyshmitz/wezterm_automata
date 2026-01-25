@@ -37,6 +37,7 @@
 #![feature(stmt_expr_attributes)]
 
 pub mod approval;
+pub mod caut;
 pub mod config;
 pub mod crash;
 pub mod dry_run;

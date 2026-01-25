@@ -846,6 +846,94 @@ fn record_migration(conn: &Connection, version: i32, description: &str) -> Resul
     Ok(())
 }
 
+/// WAL recovery threshold: if WAL has more than this many frames, do a full checkpoint.
+const WAL_RECOVERY_THRESHOLD: i64 = 10_000;
+
+/// Check for and recover from unclean shutdown.
+///
+/// Handles WAL/journal files left over from crashes by:
+/// 1. Detecting recovery situation (WAL/journal files exist)
+/// 2. Running quick integrity check
+/// 3. Checkpointing WAL if it's large
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Database corruption is detected
+/// - WAL checkpoint fails
+pub fn check_and_recover_wal(conn: &Connection, db_path: &str) -> Result<()> {
+    let wal_path = format!("{db_path}-wal");
+    let journal_path = format!("{db_path}-journal");
+
+    let wal_exists = Path::new(&wal_path).exists();
+    let journal_exists = Path::new(&journal_path).exists();
+
+    if wal_exists || journal_exists {
+        tracing::info!(
+            wal_exists,
+            journal_exists,
+            "Recovery situation detected, attempting recovery"
+        );
+    }
+
+    // Run quick integrity check
+    let integrity_result: String = conn
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|e| StorageError::Database(format!("Integrity check failed: {e}")))?;
+
+    if integrity_result != "ok" {
+        tracing::error!(result = %integrity_result, "Database corruption detected");
+        return Err(StorageError::Corruption {
+            details: integrity_result,
+        }
+        .into());
+    }
+
+    // Checkpoint WAL using PASSIVE mode (doesn't block readers)
+    let (busy, wal_frames, checkpointed): (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|e| StorageError::Database(format!("WAL checkpoint failed: {e}")))?;
+
+    if wal_frames > 0 {
+        tracing::info!(
+            busy,
+            wal_frames,
+            checkpointed,
+            "WAL checkpoint completed"
+        );
+    }
+
+    // If WAL is huge, do a full checkpoint to truncate it
+    if wal_frames > WAL_RECOVERY_THRESHOLD {
+        tracing::warn!(
+            frames = wal_frames,
+            threshold = WAL_RECOVERY_THRESHOLD,
+            "Large WAL detected, performing full checkpoint"
+        );
+
+        let (busy2, wal_frames2, checkpointed2): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| StorageError::Database(format!("WAL truncate checkpoint failed: {e}")))?;
+
+        tracing::info!(
+            busy = busy2,
+            wal_frames = wal_frames2,
+            checkpointed = checkpointed2,
+            "WAL truncate checkpoint completed"
+        );
+    }
+
+    if wal_exists || journal_exists {
+        tracing::info!("Database recovery complete");
+    }
+
+    Ok(())
+}
+
 /// Initialize or migrate the database schema.
 ///
 /// This function handles both fresh databases and existing databases that
@@ -1254,12 +1342,16 @@ impl StorageHandle {
         // Ensure parent directory exists
         ensure_parent_dir(Path::new(db_path))?;
 
-        // Open connection and initialize schema (blocking)
+        // Open connection, recover WAL if needed, and initialize schema (blocking)
         let db_path_owned = db_path.to_string();
         let db_existed = Path::new(&db_path_owned).exists();
         let init_result = tokio::task::spawn_blocking(move || -> Result<Connection> {
             let conn = Connection::open(&db_path_owned)
                 .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+
+            // Check for and recover from unclean shutdown (wa-o8j)
+            check_and_recover_wal(&conn, &db_path_owned)?;
+
             initialize_schema(&conn)?;
             #[cfg(unix)]
             {
@@ -4137,6 +4229,62 @@ mod tests {
             .unwrap();
         // In-memory databases use "memory" mode, but WAL works on file-based DBs
         assert!(mode == "memory" || mode == "wal");
+    }
+
+    // =========================================================================
+    // WAL Recovery Tests (wa-o8j)
+    // =========================================================================
+
+    #[test]
+    fn wal_recovery_passes_on_fresh_in_memory_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Should pass without error on a fresh database
+        // Note: in-memory DBs don't have WAL files, but the function should handle this
+        check_and_recover_wal(&conn, ":memory:").unwrap();
+    }
+
+    #[test]
+    fn wal_recovery_passes_integrity_check() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        // After schema init, integrity check should still pass
+        check_and_recover_wal(&conn, ":memory:").unwrap();
+    }
+
+    #[test]
+    fn wal_recovery_with_file_db() {
+        use std::fs;
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_wal_recovery_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        // Create and populate a database
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+            initialize_schema(&conn).unwrap();
+            // Insert some data to ensure WAL activity
+            conn.execute(
+                "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at) VALUES (1, 'local', 0, 0)",
+                [],
+            ).unwrap();
+        }
+
+        // Re-open and run recovery
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            check_and_recover_wal(&conn, &db_path_str).unwrap();
+            // Verify data is intact
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM panes", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+
+        // Cleanup
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = fs::remove_file(format!("{db_path_str}-shm"));
     }
 
     // =========================================================================

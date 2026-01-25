@@ -2267,6 +2267,9 @@ pub enum InjectionResult {
         pane_id: u64,
         /// Action kind that was performed
         action: ActionKind,
+        /// Audit action ID for workflow step correlation (wa-nu4.1.1.11)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        audit_action_id: Option<i64>,
     },
     /// Injection was denied by policy
     Denied {
@@ -2278,6 +2281,9 @@ pub enum InjectionResult {
         pane_id: u64,
         /// Action kind that was attempted
         action: ActionKind,
+        /// Audit action ID for workflow step correlation (wa-nu4.1.1.11)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        audit_action_id: Option<i64>,
     },
     /// Injection requires approval before proceeding
     RequiresApproval {
@@ -2289,6 +2295,9 @@ pub enum InjectionResult {
         pane_id: u64,
         /// Action kind that was attempted
         action: ActionKind,
+        /// Audit action ID for workflow step correlation (wa-nu4.1.1.11)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        audit_action_id: Option<i64>,
     },
     /// Injection failed due to an error (after policy allowed)
     Error {
@@ -2298,6 +2307,9 @@ pub enum InjectionResult {
         pane_id: u64,
         /// Action kind that was attempted
         action: ActionKind,
+        /// Audit action ID for workflow step correlation (wa-nu4.1.1.11)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        audit_action_id: Option<i64>,
     },
 }
 
@@ -2340,6 +2352,45 @@ impl InjectionResult {
         }
     }
 
+    /// Get the audit action ID if set (for workflow step correlation)
+    #[must_use]
+    pub fn audit_action_id(&self) -> Option<i64> {
+        match self {
+            Self::Allowed {
+                audit_action_id, ..
+            }
+            | Self::Denied {
+                audit_action_id, ..
+            }
+            | Self::RequiresApproval {
+                audit_action_id, ..
+            }
+            | Self::Error {
+                audit_action_id, ..
+            } => *audit_action_id,
+        }
+    }
+
+    /// Set the audit action ID (called after audit record is persisted)
+    pub fn set_audit_action_id(&mut self, id: i64) {
+        match self {
+            Self::Allowed {
+                audit_action_id, ..
+            }
+            | Self::Denied {
+                audit_action_id, ..
+            }
+            | Self::RequiresApproval {
+                audit_action_id, ..
+            }
+            | Self::Error {
+                audit_action_id, ..
+            } => {
+                *audit_action_id = Some(id);
+            }
+        }
+    }
+
     /// Convert to an audit record for persistence
     ///
     /// Creates an `AuditActionRecord` suitable for storing in the audit trail.
@@ -2368,6 +2419,7 @@ impl InjectionResult {
                 summary,
                 pane_id,
                 action,
+                audit_action_id: _,
             } => crate::storage::AuditActionRecord {
                 id: 0, // Assigned by database
                 ts: now_ms,
@@ -2391,6 +2443,7 @@ impl InjectionResult {
                 summary,
                 pane_id,
                 action,
+                audit_action_id: _,
             } => crate::storage::AuditActionRecord {
                 id: 0,
                 ts: now_ms,
@@ -2414,6 +2467,7 @@ impl InjectionResult {
                 summary,
                 pane_id,
                 action,
+                audit_action_id: _,
             } => crate::storage::AuditActionRecord {
                 id: 0,
                 ts: now_ms,
@@ -2436,6 +2490,7 @@ impl InjectionResult {
                 error,
                 pane_id,
                 action,
+                audit_action_id: _,
             } => crate::storage::AuditActionRecord {
                 id: 0,
                 ts: now_ms,
@@ -2696,7 +2751,7 @@ impl PolicyGatedInjector {
         let decision = self.engine.authorize(&input);
 
         // Build the injection result
-        let result = match &decision {
+        let mut result = match &decision {
             PolicyDecision::Allow { .. } => {
                 // SAFETY: This is the only place where actual injection happens
                 // after policy approval. The text reference lifetime is handled
@@ -2724,11 +2779,13 @@ impl PolicyGatedInjector {
                         summary,
                         pane_id,
                         action,
+                        audit_action_id: None,
                     },
                     Err(e) => InjectionResult::Error {
                         error: e.to_string(),
                         pane_id,
                         action,
+                        audit_action_id: None,
                     },
                 }
             }
@@ -2737,31 +2794,37 @@ impl PolicyGatedInjector {
                 summary,
                 pane_id,
                 action,
+                audit_action_id: None,
             },
             PolicyDecision::RequireApproval { .. } => InjectionResult::RequiresApproval {
                 decision,
                 summary,
                 pane_id,
                 action,
+                audit_action_id: None,
             },
         };
 
         // Emit audit record if storage is configured (wa-4vx.8.7)
         // Audit is emitted for ALL outcomes: allow, deny, require_approval, and error
+        // Capture the audit ID for workflow step correlation (wa-nu4.1.1.11)
         if let Some(ref storage) = self.storage {
             let audit_record = result.to_audit_record(
                 actor,
                 workflow_id.map(String::from),
                 None, // domain - could be derived from pane info if available
             );
-            // Fire-and-forget: don't block on audit persistence
-            // Log on failure but don't propagate the error
-            if let Err(e) = storage.record_audit_action_redacted(audit_record).await {
-                tracing::warn!(
-                    pane_id,
-                    action = action.as_str(),
-                    "Failed to emit audit record: {e}"
-                );
+            match storage.record_audit_action_redacted(audit_record).await {
+                Ok(audit_id) => {
+                    result.set_audit_action_id(audit_id);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        pane_id,
+                        action = action.as_str(),
+                        "Failed to emit audit record: {e}"
+                    );
+                }
             }
         }
 
@@ -3107,6 +3170,7 @@ mod tests {
             summary: "ls -la".to_string(),
             pane_id: 42,
             action: ActionKind::SendText,
+            audit_action_id: None,
         };
 
         let record = result.to_audit_record(
@@ -3134,6 +3198,7 @@ mod tests {
             summary: "rm -rf /".to_string(),
             pane_id: 1,
             action: ActionKind::SendText,
+            audit_action_id: None,
         };
 
         let record = result.to_audit_record(ActorKind::Mcp, None, None);
@@ -3157,6 +3222,7 @@ mod tests {
             summary: "some command".to_string(),
             pane_id: 5,
             action: ActionKind::SendCtrlC,
+            audit_action_id: None,
         };
 
         let record = result.to_audit_record(ActorKind::Workflow, Some("wf-456".to_string()), None);
@@ -3176,6 +3242,7 @@ mod tests {
             error: "WezTerm connection failed".to_string(),
             pane_id: 99,
             action: ActionKind::SendText,
+            audit_action_id: None,
         };
 
         let record = result.to_audit_record(ActorKind::Human, None, None);
@@ -3908,6 +3975,7 @@ mod tests {
             summary: "ls -la".to_string(),
             pane_id: 1,
             action: ActionKind::SendText,
+            audit_action_id: None,
         };
         assert!(result.is_allowed());
         assert!(!result.is_denied());
@@ -3923,6 +3991,7 @@ mod tests {
             summary: "rm -rf /".to_string(),
             pane_id: 1,
             action: ActionKind::SendText,
+            audit_action_id: None,
         };
         assert!(!result.is_allowed());
         assert!(result.is_denied());
@@ -3941,6 +4010,7 @@ mod tests {
             summary: "git reset --hard".to_string(),
             pane_id: 1,
             action: ActionKind::SendText,
+            audit_action_id: None,
         };
         assert!(!result.is_allowed());
         assert!(!result.is_denied());
@@ -3954,6 +4024,7 @@ mod tests {
             error: "pane not found".to_string(),
             pane_id: 999,
             action: ActionKind::SendText,
+            audit_action_id: None,
         };
         assert!(!result.is_allowed());
         assert!(!result.is_denied());
@@ -3968,6 +4039,7 @@ mod tests {
             summary: "echo test".to_string(),
             pane_id: 42,
             action: ActionKind::SendText,
+            audit_action_id: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"status\":\"allowed\""));

@@ -2161,6 +2161,9 @@ fn is_structured_uservar_name(name: &str) -> bool {
 }
 
 fn validate_uservar_request(pane_id: u64, name: &str, value: &str) -> Result<(), String> {
+    // Maximum message size for IPC (64KB) - mirrors wa_core::ipc::MAX_MESSAGE_SIZE
+    const MAX_MESSAGE_SIZE: usize = 65536;
+
     if name.trim().is_empty() {
         return Err("user-var name cannot be empty".to_string());
     }
@@ -2168,18 +2171,12 @@ fn validate_uservar_request(pane_id: u64, name: &str, value: &str) -> Result<(),
         return Err("user-var value cannot be empty".to_string());
     }
 
-    let request = wa_core::ipc::IpcRequest::UserVar {
-        pane_id,
-        name: name.to_string(),
-        value: value.to_string(),
-    };
-    let request_json = serde_json::to_string(&request)
-        .map_err(|e| format!("failed to serialize IPC request for validation: {e}"))?;
-    let request_size = request_json.len();
-    if request_size > wa_core::ipc::MAX_MESSAGE_SIZE {
+    // Estimate request size (JSON overhead is ~50 bytes for field names + pane_id)
+    // Format: {"type":"user_var","pane_id":N,"name":"...","value":"..."}
+    let request_size = 50 + pane_id.to_string().len() + name.len() + value.len();
+    if request_size > MAX_MESSAGE_SIZE {
         return Err(format!(
-            "user-var payload too large: {request_size} bytes (max {})",
-            wa_core::ipc::MAX_MESSAGE_SIZE
+            "user-var payload too large: {request_size} bytes (max {MAX_MESSAGE_SIZE})"
         ));
     }
 
@@ -5707,8 +5704,10 @@ mod tests {
 
     #[test]
     fn validate_uservar_rejects_oversize_payload() {
+        // MAX_MESSAGE_SIZE is 65536 (64KB)
+        const MAX_MESSAGE_SIZE: usize = 65536;
         let name = "wa_event";
-        let value = "a".repeat(wa_core::ipc::MAX_MESSAGE_SIZE);
+        let value = "a".repeat(MAX_MESSAGE_SIZE);
         let err = validate_uservar_request(1, name, &value).unwrap_err();
         assert!(err.contains("too large"));
     }

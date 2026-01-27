@@ -6657,6 +6657,13 @@ mod tests {
             params![1i64, "local", now_ms, now_ms, 1],
         ).unwrap();
 
+        // Insert initial segment so gaps can be computed (needs seq_before)
+        conn.execute(
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, 0, "initial content", 15, now_ms],
+        )
+        .unwrap();
+
         // Record gaps with different reasons
         let reasons = vec![
             "sequence_jump",

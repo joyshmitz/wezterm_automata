@@ -474,7 +474,7 @@ mod tests {
             extra: Default::default(),
         };
 
-        let record = AccountRecord::from_caut(&caut_usage, CautService::OpenAI, 1234567890);
+        let record = AccountRecord::from_caut(&caut_usage, CautService::OpenAI, 1_234_567_890);
 
         assert_eq!(record.account_id, "acc-123");
         assert_eq!(record.service, "openai");

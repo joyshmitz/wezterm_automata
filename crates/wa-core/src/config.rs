@@ -1145,6 +1145,8 @@ pub struct HotReloadableConfig {
     pub poll_interval_ms: u64,
     /// Minimum poll interval (adaptive lower bound)
     pub min_poll_interval_ms: u64,
+    /// Maximum concurrent captures
+    pub max_concurrent_captures: u32,
 
     // Storage
     /// Retention period in days
@@ -1173,6 +1175,7 @@ impl HotReloadableConfig {
             log_level: config.general.log_level.clone(),
             poll_interval_ms: config.ingest.poll_interval_ms,
             min_poll_interval_ms: config.ingest.min_poll_interval_ms,
+            max_concurrent_captures: config.ingest.max_concurrent_captures,
             retention_days: config.storage.retention_days,
             retention_max_mb: config.storage.retention_max_mb,
             checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
@@ -1276,6 +1279,14 @@ impl Config {
                 name: "ingest.min_poll_interval_ms".to_string(),
                 old_value: self.ingest.min_poll_interval_ms.to_string(),
                 new_value: new_config.ingest.min_poll_interval_ms.to_string(),
+            });
+        }
+
+        if self.ingest.max_concurrent_captures != new_config.ingest.max_concurrent_captures {
+            changes.push(HotReloadChange {
+                name: "ingest.max_concurrent_captures".to_string(),
+                old_value: self.ingest.max_concurrent_captures.to_string(),
+                new_value: new_config.ingest.max_concurrent_captures.to_string(),
             });
         }
 

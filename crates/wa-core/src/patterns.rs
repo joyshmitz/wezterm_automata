@@ -2,7 +2,7 @@
 //!
 //! Provides fast, reliable detection of agent state transitions.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 
 use aho_corasick::AhoCorasick;
@@ -208,6 +208,8 @@ pub struct DetectionContext {
     pub agent_type: Option<AgentType>,
     /// Previously seen dedup keys to avoid re-emitting
     seen_keys: HashSet<String>,
+    /// Order of seen keys for eviction (FIFO)
+    seen_order: VecDeque<String>,
 }
 
 impl Default for DetectionContext {
@@ -217,6 +219,9 @@ impl Default for DetectionContext {
 }
 
 impl DetectionContext {
+    /// Maximum number of seen keys to retain
+    const MAX_SEEN_KEYS: usize = 1000;
+
     /// Create a new empty detection context
     #[must_use]
     pub fn new() -> Self {
@@ -224,6 +229,7 @@ impl DetectionContext {
             pane_id: None,
             agent_type: None,
             seen_keys: HashSet::new(),
+            seen_order: VecDeque::new(),
         }
     }
 
@@ -234,6 +240,7 @@ impl DetectionContext {
             pane_id: None,
             agent_type: Some(agent_type),
             seen_keys: HashSet::new(),
+            seen_order: VecDeque::new(),
         }
     }
 
@@ -244,12 +251,27 @@ impl DetectionContext {
             pane_id: Some(pane_id),
             agent_type,
             seen_keys: HashSet::new(),
+            seen_order: VecDeque::new(),
         }
     }
 
     /// Mark a detection as seen, returning true if it was new
     pub fn mark_seen(&mut self, detection: &Detection) -> bool {
-        self.seen_keys.insert(detection.dedup_key())
+        let key = detection.dedup_key();
+        if self.seen_keys.contains(&key) {
+            return false;
+        }
+
+        // Enforce capacity
+        if self.seen_keys.len() >= Self::MAX_SEEN_KEYS {
+            if let Some(oldest) = self.seen_order.pop_front() {
+                self.seen_keys.remove(&oldest);
+            }
+        }
+
+        self.seen_keys.insert(key.clone());
+        self.seen_order.push_back(key);
+        true
     }
 
     /// Check if a detection has been seen before
@@ -261,6 +283,7 @@ impl DetectionContext {
     /// Clear the set of seen detections
     pub fn clear_seen(&mut self) {
         self.seen_keys.clear();
+        self.seen_order.clear();
     }
 
     /// Get the number of seen detections

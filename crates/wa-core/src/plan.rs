@@ -1786,7 +1786,7 @@ mod tests {
                 "source": "test",
                 "version": 1
             }))
-            .created_at(1706400000000)
+            .created_at(1_706_400_000_000)
             .build();
 
         // Validate the plan

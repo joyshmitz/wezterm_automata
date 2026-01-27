@@ -68,7 +68,7 @@ impl Default for RuntimeConfig {
             discovery_interval: Duration::from_secs(5),
             capture_interval: Duration::from_millis(200),
             min_capture_interval: Duration::from_millis(50),
-            overlap_size: 1048576, // 1MB default
+            overlap_size: 1_048_576, // 1MB default
             pane_filter: PaneFilterConfig::default(),
             channel_buffer: 1024,
             max_concurrent_captures: 10,
@@ -220,6 +220,7 @@ impl ObservationRuntime {
             log_level: "info".to_string(), // Default, will be overridden
             poll_interval_ms: duration_ms_u64(config.capture_interval),
             min_poll_interval_ms: duration_ms_u64(config.min_capture_interval),
+            max_concurrent_captures: config.max_concurrent_captures as u32,
             retention_days: config.retention_days,
             retention_max_mb: config.retention_max_mb,
             checkpoint_interval_secs: config.checkpoint_interval_secs,
@@ -531,12 +532,14 @@ impl ObservationRuntime {
         let mut config_rx = self.config_rx.clone();
 
         // Create tailer config from runtime config
+        // Capture overlap_size for use in the async block (not hot-reloadable)
+        let overlap_size = self.config.overlap_size;
         let initial_config = TailerConfig {
             min_interval: self.config.min_capture_interval,
             max_interval: self.config.capture_interval,
             backoff_multiplier: 1.5,
             max_concurrent: self.config.max_concurrent_captures,
-            overlap_size: self.config.overlap_size,
+            overlap_size,
             send_timeout: Duration::from_millis(100),
         };
 
@@ -578,8 +581,8 @@ impl ObservationRuntime {
                                 min_interval: Duration::from_millis(new_config.min_poll_interval_ms),
                                 max_interval: Duration::from_millis(new_config.poll_interval_ms),
                                 backoff_multiplier: 1.5,
-                                max_concurrent: 10, // HotReloadableConfig doesn't have concurrency yet, assume static or add it?
-                                overlap_size: 4096, // Config doesn't have overlap size either
+                                max_concurrent: new_config.max_concurrent_captures as usize,
+                                overlap_size, // Use captured overlap_size
                                 send_timeout: Duration::from_millis(100),
                             };
                             supervisor.update_config(new_tailer_config);
@@ -1059,7 +1062,7 @@ mod tests {
 
         assert_eq!(config.discovery_interval, Duration::from_secs(5));
         assert_eq!(config.capture_interval, Duration::from_millis(200));
-        assert_eq!(config.overlap_size, 4096);
+        assert_eq!(config.overlap_size, 1_048_576); // 1MB default
         assert_eq!(config.channel_buffer, 1024);
     }
 

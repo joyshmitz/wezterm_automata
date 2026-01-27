@@ -14,7 +14,7 @@
 //! Converts repeated snapshots into minimal deltas using overlap matching.
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
@@ -1013,7 +1013,10 @@ pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> Delt
     // Fast path: pure append (current starts with previous)
     // This handles the common case efficiently (O(N)) and avoids the overlap limit
     if current.len() > previous.len() && current.starts_with(previous) {
-        return DeltaResult::Content(current[previous.len()..].to_string());
+        if current.is_char_boundary(previous.len()) {
+            return DeltaResult::Content(current[previous.len()..].to_string());
+        }
+        // If boundary check fails (should vary rare if starts_with matched), fall through to full check
     }
 
     if overlap_size == 0 || current.is_empty() {
@@ -1658,6 +1661,14 @@ mod tests {
     fn extract_delta_append_only() {
         let result = extract_delta("hello\n", "hello\nworld\n", 1024);
         assert!(matches!(result, DeltaResult::Content(ref s) if s == "world\n"));
+    }
+
+    #[test]
+    fn extract_delta_multibyte_append() {
+        let prev = "hello";
+        let cur = "hello world 🌍";
+        let result = extract_delta(prev, cur, 1024);
+        assert!(matches!(result, DeltaResult::Content(ref s) if s == " world 🌍"));
     }
 
     #[test]

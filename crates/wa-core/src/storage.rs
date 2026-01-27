@@ -16,6 +16,7 @@
 //! - `events`: Pattern detections with lifecycle tracking
 //! - `workflow_executions`: Durable workflow state
 //! - `workflow_step_logs`: Step execution history
+//! - `workflow_action_plans`: Canonical action plans for workflows
 //! - `audit_actions`: Audit trail for policy decisions and outcomes
 //! - `action_undo`: Undo metadata for audit actions
 //! - `action_history`: View joining audit + undo + workflow step info
@@ -33,7 +34,7 @@ use std::thread::{self, JoinHandle};
 
 use rusqlite::{
     Connection, OptionalExtension, params,
-    types::{Type, Value as SqlValue},
+    types::Value as SqlValue,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -50,7 +51,7 @@ use crate::policy::Redactor;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 6;
+pub const SCHEMA_VERSION: i32 = 7;
 
 /// Schema initialization SQL
 ///
@@ -238,8 +239,13 @@ CREATE TABLE IF NOT EXISTS workflow_step_logs (
     audit_action_id INTEGER REFERENCES audit_actions(id) ON DELETE SET NULL,
     step_index INTEGER NOT NULL,
     step_name TEXT NOT NULL,
+    step_id TEXT,
+    step_kind TEXT,
     result_type TEXT NOT NULL,        -- continue, done, retry, abort, wait_for
     result_data TEXT,                 -- JSON: result payload
+    policy_summary TEXT,              -- JSON: decision summary
+    verification_refs TEXT,           -- JSON: verification evidence refs
+    error_code TEXT,                  -- stable error code if step failed
     started_at INTEGER NOT NULL,      -- epoch ms
     completed_at INTEGER NOT NULL,    -- epoch ms
     duration_ms INTEGER NOT NULL      -- cached for stats
@@ -247,6 +253,17 @@ CREATE TABLE IF NOT EXISTS workflow_step_logs (
 
 CREATE INDEX IF NOT EXISTS idx_step_logs_workflow ON workflow_step_logs(workflow_id, step_index);
 CREATE INDEX IF NOT EXISTS idx_step_logs_audit_action ON workflow_step_logs(audit_action_id);
+
+-- Workflow action plans: canonical plan JSON + hash for explainability
+CREATE TABLE IF NOT EXISTS workflow_action_plans (
+    workflow_id TEXT PRIMARY KEY REFERENCES workflow_executions(id) ON DELETE CASCADE,
+    plan_id TEXT NOT NULL,
+    plan_hash TEXT NOT NULL,
+    plan_json TEXT NOT NULL,          -- canonical JSON
+    created_at INTEGER NOT NULL       -- epoch ms
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_plans_hash ON workflow_action_plans(plan_hash);
 
 -- Audit actions: policy decisions and outcomes
 CREATE TABLE IF NOT EXISTS audit_actions (
@@ -562,6 +579,27 @@ static MIGRATIONS: &[Migration] = &[
         ",
         down_sql: Some("DROP TABLE IF EXISTS wa_meta;"),
     },
+    Migration {
+        version: 7,
+        description: "Persist workflow action plans and enrich step logs",
+        up_sql: r"
+            CREATE TABLE IF NOT EXISTS workflow_action_plans (
+                workflow_id TEXT PRIMARY KEY REFERENCES workflow_executions(id) ON DELETE CASCADE,
+                plan_id TEXT NOT NULL,
+                plan_hash TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_action_plans_hash ON workflow_action_plans(plan_hash);
+        ",
+        down_sql: Some(
+            r"
+            DROP INDEX IF EXISTS idx_action_plans_hash;
+            DROP TABLE IF EXISTS workflow_action_plans;
+        ",
+        ),
+    },
 ];
 
 // =============================================================================
@@ -771,6 +809,21 @@ pub struct WorkflowRecord {
     pub completed_at: Option<i64>,
 }
 
+/// Workflow action plan record (canonical JSON + hash)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowActionPlanRecord {
+    /// Workflow execution ID (foreign key)
+    pub workflow_id: String,
+    /// Content-addressed plan ID
+    pub plan_id: String,
+    /// Plan hash (sha256 prefix)
+    pub plan_hash: String,
+    /// Canonical JSON representation of the plan
+    pub plan_json: String,
+    /// Creation timestamp (epoch ms)
+    pub created_at: i64,
+}
+
 /// Workflow step log entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowStepLogRecord {
@@ -784,10 +837,20 @@ pub struct WorkflowStepLogRecord {
     pub step_index: usize,
     /// Step name
     pub step_name: String,
+    /// Step idempotency key from plan (if available)
+    pub step_id: Option<String>,
+    /// Step action kind (if available)
+    pub step_kind: Option<String>,
     /// Result type (continue, done, retry, abort, wait_for)
     pub result_type: String,
     /// Result data (JSON)
     pub result_data: Option<String>,
+    /// Policy decision summary (JSON)
+    pub policy_summary: Option<String>,
+    /// Verification evidence references (JSON)
+    pub verification_refs: Option<String>,
+    /// Stable error code, if any
+    pub error_code: Option<String>,
     /// Started timestamp (epoch ms)
     pub started_at: i64,
     /// Completed timestamp (epoch ms)
@@ -1207,6 +1270,37 @@ fn ensure_workflow_step_logs_audit_action_id(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_workflow_step_log_columns(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "workflow_step_logs")? {
+        return Ok(());
+    }
+
+    let columns = [
+        ("step_id", "TEXT"),
+        ("step_kind", "TEXT"),
+        ("policy_summary", "TEXT"),
+        ("verification_refs", "TEXT"),
+        ("error_code", "TEXT"),
+    ];
+
+    for (column, column_type) in columns {
+        if table_has_column(conn, "workflow_step_logs", column)? {
+            continue;
+        }
+        conn.execute(
+            &format!("ALTER TABLE workflow_step_logs ADD COLUMN {column} {column_type};"),
+            [],
+        )
+        .map_err(|e| {
+            StorageError::MigrationFailed(format!(
+                "Failed to add {column} to workflow_step_logs: {e}"
+            ))
+        })?;
+    }
+
+    Ok(())
+}
+
 fn migration_for_version(version: i32) -> Option<&'static Migration> {
     MIGRATIONS.iter().find(|m| m.version == version)
 }
@@ -1318,6 +1412,9 @@ fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> Result<()> {
         MigrationDirection::Up => {
             if migration.version == 4 {
                 ensure_workflow_step_logs_audit_action_id(conn)?;
+            }
+            if migration.version == 7 {
+                ensure_workflow_step_log_columns(conn)?;
             }
             if !migration.up_sql.is_empty() {
                 conn.execute_batch(migration.up_sql).map_err(|e| {
@@ -1462,6 +1559,55 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
         )
         .map_err(|e| StorageError::Database(e.to_string()))?;
     Ok(exists > 0)
+}
+
+fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<_> = map.keys().cloned().collect();
+            keys.sort();
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                if let Some(val) = map.get(&key) {
+                    canonical.insert(key, canonicalize_json_value(val));
+                }
+            }
+            serde_json::Value::Object(canonical)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonicalize_json_value).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+fn canonical_json_string(value: &serde_json::Value) -> Result<String> {
+    let canonical = canonicalize_json_value(value);
+    serde_json::to_string(&canonical).map_err(|e| {
+        StorageError::Database(format!("Failed to serialize canonical JSON: {e}")).into()
+    })
+}
+
+fn action_plan_record_from_plan(
+    workflow_id: &str,
+    plan: &crate::plan::ActionPlan,
+) -> Result<WorkflowActionPlanRecord> {
+    let mut plan = plan.clone();
+    if plan.created_at.is_none() {
+        plan.created_at = Some(now_epoch_ms());
+    }
+    let plan_hash = plan.compute_hash();
+    let plan_json_value =
+        serde_json::to_value(&plan).map_err(|e| StorageError::Database(e.to_string()))?;
+    let plan_json = canonical_json_string(&plan_json_value)?;
+    let created_at = plan.created_at.unwrap_or_else(now_epoch_ms);
+    Ok(WorkflowActionPlanRecord {
+        workflow_id: workflow_id.to_string(),
+        plan_id: plan.plan_id.to_string(),
+        plan_hash,
+        plan_json,
+        created_at,
+    })
 }
 
 fn load_wa_meta(conn: &Connection) -> Result<Option<WaMeta>> {
@@ -1751,14 +1897,24 @@ enum WriteCommand {
         workflow: WorkflowRecord,
         respond: oneshot::Sender<Result<()>>,
     },
+    /// Insert or update a workflow action plan
+    UpsertActionPlan {
+        record: WorkflowActionPlanRecord,
+        respond: oneshot::Sender<Result<()>>,
+    },
     /// Insert a workflow step log
     InsertStepLog {
         workflow_id: String,
         audit_action_id: Option<i64>,
         step_index: usize,
         step_name: String,
+        step_id: Option<String>,
+        step_kind: Option<String>,
         result_type: String,
         result_data: Option<String>,
+        policy_summary: Option<String>,
+        verification_refs: Option<String>,
+        error_code: Option<String>,
         started_at: i64,
         completed_at: i64,
         respond: oneshot::Sender<Result<()>>,
@@ -2293,6 +2449,26 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
     }
 
+    /// Upsert a workflow action plan (canonical JSON + hash)
+    pub async fn upsert_action_plan(
+        &self,
+        workflow_id: &str,
+        plan: &crate::plan::ActionPlan,
+    ) -> Result<()> {
+        let record = action_plan_record_from_plan(workflow_id, plan)?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send(WriteCommand::UpsertActionPlan {
+                record,
+                respond: tx,
+            })
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+
+        rx.await
+            .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
+    }
+
     /// Insert a workflow step log entry
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_step_log(
@@ -2301,8 +2477,13 @@ impl StorageHandle {
         audit_action_id: Option<i64>,
         step_index: usize,
         step_name: &str,
+        step_id: Option<String>,
+        step_kind: Option<String>,
         result_type: &str,
         result_data: Option<String>,
+        policy_summary: Option<String>,
+        verification_refs: Option<String>,
+        error_code: Option<String>,
         started_at: i64,
         completed_at: i64,
     ) -> Result<()> {
@@ -2313,8 +2494,13 @@ impl StorageHandle {
                 audit_action_id,
                 step_index,
                 step_name: step_name.to_string(),
+                step_id,
+                step_kind,
                 result_type: result_type.to_string(),
                 result_data,
+                policy_summary,
+                verification_refs,
+                error_code,
                 started_at,
                 completed_at,
                 respond: tx,
@@ -2658,6 +2844,25 @@ impl StorageHandle {
         .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
     }
 
+    /// Get the persisted action plan for a workflow execution, if available
+    pub async fn get_action_plan(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<WorkflowActionPlanRecord>> {
+        let db_path = Arc::clone(&self.db_path);
+        let workflow_id = workflow_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+
+            query_action_plan(&conn, &workflow_id)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
     /// Find incomplete workflows for resume on restart
     ///
     /// Returns all workflows with status 'running' or 'waiting', ordered by started_at.
@@ -2969,13 +3174,22 @@ fn writer_loop(conn: &mut Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
                 let result = upsert_workflow_sync(conn, &workflow);
                 let _ = respond.send(result);
             }
+            WriteCommand::UpsertActionPlan { record, respond } => {
+                let result = upsert_action_plan_sync(conn, &record);
+                let _ = respond.send(result);
+            }
             WriteCommand::InsertStepLog {
                 workflow_id,
                 audit_action_id,
                 step_index,
                 step_name,
+                step_id,
+                step_kind,
                 result_type,
                 result_data,
+                policy_summary,
+                verification_refs,
+                error_code,
                 started_at,
                 completed_at,
                 respond,
@@ -2986,8 +3200,13 @@ fn writer_loop(conn: &mut Connection, rx: &mut mpsc::Receiver<WriteCommand>) {
                     audit_action_id,
                     step_index,
                     &step_name,
+                    step_id.as_deref(),
+                    step_kind.as_deref(),
                     &result_type,
                     result_data.as_deref(),
+                    policy_summary.as_deref(),
+                    verification_refs.as_deref(),
+                    error_code.as_deref(),
                     started_at,
                     completed_at,
                 );
@@ -3368,6 +3587,29 @@ fn upsert_workflow_sync(conn: &Connection, workflow: &WorkflowRecord) -> Result<
     Ok(())
 }
 
+/// Upsert workflow action plan (synchronous)
+fn upsert_action_plan_sync(conn: &Connection, record: &WorkflowActionPlanRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO workflow_action_plans (workflow_id, plan_id, plan_hash, plan_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(workflow_id) DO UPDATE SET
+            plan_id = excluded.plan_id,
+            plan_hash = excluded.plan_hash,
+            plan_json = excluded.plan_json,
+            created_at = excluded.created_at",
+        params![
+            record.workflow_id,
+            record.plan_id,
+            record.plan_hash,
+            record.plan_json,
+            record.created_at,
+        ],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to upsert action plan: {e}")))?;
+
+    Ok(())
+}
+
 /// Insert workflow step log (synchronous)
 #[allow(clippy::too_many_arguments)]
 fn insert_step_log_sync(
@@ -3376,8 +3618,13 @@ fn insert_step_log_sync(
     audit_action_id: Option<i64>,
     step_index: usize,
     step_name: &str,
+    step_id: Option<&str>,
+    step_kind: Option<&str>,
     result_type: &str,
     result_data: Option<&str>,
+    policy_summary: Option<&str>,
+    verification_refs: Option<&str>,
+    error_code: Option<&str>,
     started_at: i64,
     completed_at: i64,
 ) -> Result<()> {
@@ -3385,16 +3632,22 @@ fn insert_step_log_sync(
     let step_index_i64 = usize_to_i64(step_index, "step_index")?;
 
     conn.execute(
-        "INSERT INTO workflow_step_logs (workflow_id, audit_action_id, step_index, step_name, result_type,
-         result_data, started_at, completed_at, duration_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO workflow_step_logs (workflow_id, audit_action_id, step_index, step_name, step_id,
+         step_kind, result_type, result_data, policy_summary, verification_refs, error_code,
+         started_at, completed_at, duration_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             workflow_id,
             audit_action_id,
             step_index_i64,
             step_name,
+            step_id,
+            step_kind,
             result_type,
             result_data,
+            policy_summary,
+            verification_refs,
+            error_code,
             started_at,
             completed_at,
             duration_ms,
@@ -3992,10 +4245,6 @@ fn validate_fts_query(conn: &Connection, query: &str) -> Result<()> {
     }
 }
 
-/// Escape a string for safe inclusion in a SQL string literal.
-fn escape_sql_literal(value: &str) -> String {
-    value.replace('\'', "''")
-}
 
 /// Search using FTS5 with snippet extraction and BM25 scores
 ///
@@ -4016,17 +4265,23 @@ fn search_fts_with_snippets(
     let limit = options.limit.unwrap_or(100);
     let include_snippets = options.include_snippets.unwrap_or(true);
     let max_tokens = options.snippet_max_tokens.unwrap_or(64);
-    let prefix = escape_sql_literal(options.highlight_prefix.as_deref().unwrap_or(">>>"));
-    let suffix = escape_sql_literal(options.highlight_suffix.as_deref().unwrap_or("<<<"));
+    let prefix = options.highlight_prefix.as_deref().unwrap_or(">>>");
+    let suffix = options.highlight_suffix.as_deref().unwrap_or("<<<");
+
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.to_string())];
 
     // Build query with optional filters
     // FTS5 snippet function: snippet(table, column_idx, prefix, suffix, ellipsis, max_tokens)
     // FTS5 bm25 function: bm25(table) returns negative score (more negative = better match)
     let mut sql = if include_snippets {
+        params_vec.push(Box::new(prefix.to_string()));
+        params_vec.push(Box::new(suffix.to_string()));
+        params_vec.push(Box::new(usize_to_i64(max_tokens, "max_tokens")?));
+
         format!(
             "SELECT s.id, s.pane_id, s.seq, s.content, s.content_len, s.content_hash, s.captured_at,
-                    snippet(output_segments_fts, 0, '{prefix}', '{suffix}', '...', {max_tokens}) as snippet,
-                    highlight(output_segments_fts, 0, '{prefix}', '{suffix}') as highlight,
+                    snippet(output_segments_fts, 0, ?2, ?3, '...', ?4) as snippet,
+                    highlight(output_segments_fts, 0, ?2, ?3) as highlight,
                     bm25(output_segments_fts) as score
              FROM output_segments s
              JOIN output_segments_fts fts ON s.id = fts.rowid
@@ -4043,8 +4298,6 @@ fn search_fts_with_snippets(
              WHERE output_segments_fts MATCH ?1",
         )
     };
-
-    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.to_string())];
 
     if let Some(pane_id) = options.pane_id {
         sql.push_str(" AND s.pane_id = ?");
@@ -4923,10 +5176,33 @@ fn query_workflow(conn: &Connection, workflow_id: &str) -> Result<Option<Workflo
 }
 
 /// Query workflow step logs by workflow ID
+fn query_action_plan(
+    conn: &Connection,
+    workflow_id: &str,
+) -> Result<Option<WorkflowActionPlanRecord>> {
+    conn.query_row(
+        "SELECT workflow_id, plan_id, plan_hash, plan_json, created_at \
+         FROM workflow_action_plans WHERE workflow_id = ?1",
+        [workflow_id],
+        |row| {
+            Ok(WorkflowActionPlanRecord {
+                workflow_id: row.get(0)?,
+                plan_id: row.get(1)?,
+                plan_hash: row.get(2)?,
+                plan_json: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
+}
+
 fn query_step_logs(conn: &Connection, workflow_id: &str) -> Result<Vec<WorkflowStepLogRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, workflow_id, audit_action_id, step_index, step_name, result_type, result_data,
+            "SELECT id, workflow_id, audit_action_id, step_index, step_name, step_id, step_kind,
+             result_type, result_data, policy_summary, verification_refs, error_code,
              started_at, completed_at, duration_ms
              FROM workflow_step_logs
              WHERE workflow_id = ?1
@@ -4945,11 +5221,16 @@ fn query_step_logs(conn: &Connection, workflow_id: &str) -> Result<Vec<WorkflowS
                     i64_to_usize(val)?
                 },
                 step_name: row.get(4)?,
-                result_type: row.get(5)?,
-                result_data: row.get(6)?,
-                started_at: row.get(7)?,
-                completed_at: row.get(8)?,
-                duration_ms: row.get(9)?,
+                step_id: row.get(5)?,
+                step_kind: row.get(6)?,
+                result_type: row.get(7)?,
+                result_data: row.get(8)?,
+                policy_summary: row.get(9)?,
+                verification_refs: row.get(10)?,
+                error_code: row.get(11)?,
+                started_at: row.get(12)?,
+                completed_at: row.get(13)?,
+                duration_ms: row.get(14)?,
             })
         })
         .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
@@ -6876,8 +7157,13 @@ fn can_insert_and_query_workflow_step_logs() {
         None,
         0,
         "step_one",
+        None, // step_id
+        None, // step_kind
         "continue",
         Some(r#"{"output": "step 1 done"}"#),
+        None, // policy_summary
+        None, // verification_refs
+        None, // error_code
         now_ms,
         now_ms + 100,
     )
@@ -6889,8 +7175,13 @@ fn can_insert_and_query_workflow_step_logs() {
         None,
         1,
         "step_two",
+        None, // step_id
+        None, // step_kind
         "done",
         Some(r#"{"output": "final"}"#),
+        None, // policy_summary
+        None, // verification_refs
+        None, // error_code
         now_ms + 100,
         now_ms + 300,
     )
@@ -6953,8 +7244,13 @@ fn workflow_step_log_result_data_is_optional() {
         None,
         0,
         "simple_step",
+        None,
+        None,
         "continue",
         None, // No result data
+        None,
+        None,
+        None,
         now_ms,
         now_ms + 50,
     )
@@ -6974,8 +7270,13 @@ fn workflow_step_log_record_serializes() {
         audit_action_id: None,
         step_index: 0,
         step_name: "init".to_string(),
+        step_id: None,
+        step_kind: None,
         result_type: "continue".to_string(),
         result_data: Some(r#"{"status": "ok"}"#.to_string()),
+        policy_summary: None,
+        verification_refs: None,
+        error_code: None,
         started_at: 1_700_000_000_000,
         completed_at: 1_700_000_000_100,
         duration_ms: 100,
@@ -6985,6 +7286,49 @@ fn workflow_step_log_record_serializes() {
     assert!(json.contains("wf-001"));
     assert!(json.contains("init"));
     assert!(json.contains("duration_ms"));
+}
+
+#[test]
+fn can_insert_and_query_workflow_action_plan() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let now_ms = 1_700_000_000_000i64;
+
+    conn.execute(
+        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, "local", now_ms, now_ms, 1],
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO workflow_executions (id, workflow_name, pane_id, current_step, status, started_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params!["wf-plan-001", "test_workflow", 1i64, 0, "running", now_ms, now_ms],
+    )
+    .unwrap();
+
+    let plan = crate::plan::ActionPlan::builder("Test Plan", "workspace-1")
+        .add_step(crate::plan::StepPlan::new(
+            1,
+            crate::plan::StepAction::SendText {
+                pane_id: 1,
+                text: "hello".to_string(),
+                paste_mode: None,
+            },
+            "Send hello",
+        ))
+        .build();
+
+    let record = action_plan_record_from_plan("wf-plan-001", &plan).unwrap();
+    upsert_action_plan_sync(&conn, &record).unwrap();
+
+    let fetched = query_action_plan(&conn, "wf-plan-001").unwrap().unwrap();
+    assert_eq!(fetched.plan_id, plan.plan_id.to_string());
+    assert_eq!(fetched.plan_hash, plan.compute_hash());
+
+    let parsed: crate::plan::ActionPlan = serde_json::from_str(&fetched.plan_json).unwrap();
+    assert_eq!(parsed.plan_id, plan.plan_id);
 }
 
 // =========================================================================
@@ -7078,8 +7422,13 @@ async fn storage_handle_insert_step_log_and_query() {
             None,
             0,
             "async_step",
+            None,
+            None,
             "continue",
             Some(r#"{"async": true}"#.to_string()),
+            None,
+            None,
+            None,
             1_700_000_000_000,
             1_700_000_000_050,
         )
@@ -7096,6 +7445,79 @@ async fn storage_handle_insert_step_log_and_query() {
     storage.shutdown().await.unwrap();
 
     // Cleanup
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+    let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+}
+
+#[tokio::test]
+async fn storage_handle_action_plan_roundtrip() {
+    let temp_dir = std::env::temp_dir();
+    let db_path = temp_dir.join(format!("wa_test_plan_{}.db", std::process::id()));
+    let db_path_str = db_path.to_string_lossy().to_string();
+
+    let storage = StorageHandle::new(&db_path_str).await.unwrap();
+
+    let pane = PaneRecord {
+        pane_id: 1,
+        pane_uuid: None,
+        domain: "local".to_string(),
+        window_id: None,
+        tab_id: None,
+        title: Some("test".to_string()),
+        cwd: None,
+        tty_name: None,
+        first_seen_at: 1_700_000_000_000,
+        last_seen_at: 1_700_000_000_000,
+        observed: true,
+        ignore_reason: None,
+        last_decision_at: None,
+    };
+    storage.upsert_pane(pane).await.unwrap();
+
+    let workflow = WorkflowRecord {
+        id: "wf-plan-async-001".to_string(),
+        workflow_name: "async_plan_test".to_string(),
+        pane_id: 1,
+        trigger_event_id: None,
+        current_step: 0,
+        status: "running".to_string(),
+        wait_condition: None,
+        context: None,
+        result: None,
+        error: None,
+        started_at: 1_700_000_000_000,
+        updated_at: 1_700_000_000_000,
+        completed_at: None,
+    };
+    storage.upsert_workflow(workflow).await.unwrap();
+
+    let plan = crate::plan::ActionPlan::builder("Async Plan", "workspace-async")
+        .add_step(crate::plan::StepPlan::new(
+            1,
+            crate::plan::StepAction::SendText {
+                pane_id: 1,
+                text: "/compact".to_string(),
+                paste_mode: None,
+            },
+            "Send compact",
+        ))
+        .build();
+
+    storage
+        .upsert_action_plan("wf-plan-async-001", &plan)
+        .await
+        .unwrap();
+
+    let fetched = storage
+        .get_action_plan("wf-plan-async-001")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.plan_id, plan.plan_id.to_string());
+
+    storage.shutdown().await.unwrap();
+
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
     let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
@@ -7444,8 +7866,13 @@ mod storage_handle_tests {
                 None,
                 0,
                 "init",
+                None,
+                None,
                 "success",
                 Some(r#"{"message":"started"}"#.to_string()),
+                None,
+                None,
+                None,
                 now,
                 now + 100,
             )
@@ -7458,8 +7885,13 @@ mod storage_handle_tests {
                 None,
                 1,
                 "send_text",
+                None,
+                None,
                 "success",
                 Some(r#"{"chars":42}"#.to_string()),
+                None,
+                None,
+                None,
                 now + 100,
                 now + 200,
             )
@@ -7472,8 +7904,13 @@ mod storage_handle_tests {
                 None,
                 2,
                 "wait_for",
+                None,
+                None,
                 "success",
                 Some(r#"{"matched":true}"#.to_string()),
+                None,
+                None,
+                None,
                 now + 200,
                 now + 500,
             )

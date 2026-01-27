@@ -5136,8 +5136,8 @@ async fn handle_db_command(
     layout: &wa_core::config::WorkspaceLayout,
 ) -> anyhow::Result<()> {
     use wa_core::storage::{
-        MigrationDirection, SCHEMA_VERSION, migrate_database_to_version,
-        migration_plan_for_path, migration_status_for_path,
+        MigrationDirection, SCHEMA_VERSION, migrate_database_to_version, migration_plan_for_path,
+        migration_status_for_path,
     };
 
     let db_path = &layout.db_path;

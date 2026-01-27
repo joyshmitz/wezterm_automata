@@ -373,6 +373,129 @@ pub(crate) async fn persist_codex_session_summary(
 }
 
 // ============================================================================
+// Account Selection Step (wa-nu4.1.3.4)
+// ============================================================================
+
+/// Result of the account selection workflow step.
+#[derive(Debug, Clone)]
+pub struct AccountSelectionStepResult {
+    /// The selected account (if any eligible accounts exist)
+    pub selected: Option<crate::accounts::AccountRecord>,
+    /// Full explanation of the selection decision
+    pub explanation: crate::accounts::SelectionExplanation,
+    /// Number of accounts refreshed from caut
+    pub accounts_refreshed: usize,
+}
+
+/// Errors that can occur during account selection step.
+#[derive(Debug)]
+pub enum AccountSelectionStepError {
+    /// caut command failed
+    Caut(crate::caut::CautError),
+    /// Storage operation failed
+    Storage(String),
+}
+
+impl std::fmt::Display for AccountSelectionStepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Caut(e) => write!(f, "caut error: {e}"),
+            Self::Storage(e) => write!(f, "storage error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for AccountSelectionStepError {}
+
+/// Refresh account usage from caut and select the best account for failover.
+///
+/// This function:
+/// 1. Calls `caut refresh --service openai --format json` to get latest usage
+/// 2. Updates the accounts mirror in the database
+/// 3. Selects the best account according to the configured policy
+///
+/// # Arguments
+/// * `caut_client` - The caut CLI wrapper client
+/// * `storage` - Storage handle for persisting accounts
+/// * `config` - Account selection configuration (threshold, etc.)
+///
+/// # Returns
+/// An `AccountSelectionStepResult` with the selected account and explanation.
+///
+/// # Note
+/// This function does NOT update `last_used_at` - that should only happen
+/// after the failover is actually successful.
+#[allow(dead_code)]
+pub(crate) async fn refresh_and_select_account(
+    caut_client: &crate::caut::CautClient,
+    storage: &StorageHandle,
+    config: &crate::accounts::AccountSelectionConfig,
+) -> Result<AccountSelectionStepResult, AccountSelectionStepError> {
+    // Step 1: Refresh usage from caut
+    let refresh_result = caut_client
+        .refresh(crate::caut::CautService::OpenAI)
+        .await
+        .map_err(AccountSelectionStepError::Caut)?;
+
+    // Step 2: Update accounts mirror in DB
+    let now_ms = crate::accounts::now_ms();
+    let accounts_refreshed = refresh_result.accounts.len();
+
+    for usage in &refresh_result.accounts {
+        let record =
+            crate::accounts::AccountRecord::from_caut(usage, crate::caut::CautService::OpenAI, now_ms);
+        storage
+            .upsert_account(record)
+            .await
+            .map_err(|e| AccountSelectionStepError::Storage(e.to_string()))?;
+    }
+
+    // Step 3: Select best account
+    let selection = storage
+        .select_account("openai", config)
+        .await
+        .map_err(|e| AccountSelectionStepError::Storage(e.to_string()))?;
+
+    Ok(AccountSelectionStepResult {
+        selected: selection.selected,
+        explanation: selection.explanation,
+        accounts_refreshed,
+    })
+}
+
+/// Mark an account as used (update `last_used_at`) after successful failover.
+///
+/// This should only be called after the failover workflow completes successfully.
+#[allow(dead_code)]
+pub(crate) async fn mark_account_used(
+    storage: &StorageHandle,
+    service: &str,
+    account_id: &str,
+) -> Result<(), String> {
+    // Get current account record
+    let account = storage
+        .get_account(service, account_id)
+        .await
+        .map_err(|e| format!("Failed to get account: {e}"))?
+        .ok_or_else(|| format!("Account not found: {service}/{account_id}"))?;
+
+    // Update last_used_at
+    let now_ms = crate::accounts::now_ms();
+    let updated = crate::accounts::AccountRecord {
+        last_used_at: Some(now_ms),
+        updated_at: now_ms,
+        ..account
+    };
+
+    storage
+        .upsert_account(updated)
+        .await
+        .map_err(|e| format!("Failed to update account: {e}"))?;
+
+    Ok(())
+}
+
+// ============================================================================
 // Step Results
 // ============================================================================
 
@@ -7246,5 +7369,205 @@ mod tests {
             .expect_err("expected denial");
         assert!(err.contains("denied"));
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // ========================================================================
+    // Codex Session Summary Parsing Tests (wa-nu4.1.3.3)
+    // ========================================================================
+
+    #[test]
+    fn parse_codex_session_summary_succeeds_on_valid_fixture() {
+        let tail = r#"
+You've reached your usage limit.
+Token usage: total=1,234 input=500 (+ 200 cached) output=534 (reasoning 100)
+To continue this session, run: codex resume 123e4567-e89b-12d3-a456-426614174000
+Try again at 3:00 PM UTC.
+"#;
+        let result = parse_codex_session_summary(tail).expect("should parse");
+
+        assert_eq!(result.session_id, "123e4567-e89b-12d3-a456-426614174000");
+        assert_eq!(result.token_usage.total, Some(1234));
+        assert_eq!(result.token_usage.input, Some(500));
+        assert_eq!(result.token_usage.cached, Some(200));
+        assert_eq!(result.token_usage.output, Some(534));
+        assert_eq!(result.token_usage.reasoning, Some(100));
+        assert_eq!(result.reset_time.as_deref(), Some("3:00 PM UTC"));
+    }
+
+    #[test]
+    fn parse_codex_session_summary_handles_minimal_valid_input() {
+        let tail = "Token usage: total=100\ncodex resume abc12345-1234-1234-1234-123456789abc";
+        let result = parse_codex_session_summary(tail).expect("should parse");
+
+        assert_eq!(result.session_id, "abc12345-1234-1234-1234-123456789abc");
+        assert_eq!(result.token_usage.total, Some(100));
+        assert!(result.token_usage.input.is_none());
+        assert!(result.reset_time.is_none());
+    }
+
+    #[test]
+    fn parse_codex_session_summary_handles_numbers_with_commas() {
+        let tail = "Token usage: total=1,234,567 input=999,999\ncodex resume abcd1234-5678-90ab-cdef-1234567890ab";
+        let result = parse_codex_session_summary(tail).expect("should parse");
+
+        assert_eq!(result.token_usage.total, Some(1_234_567));
+        assert_eq!(result.token_usage.input, Some(999_999));
+    }
+
+    #[test]
+    fn parse_codex_session_summary_fails_when_session_id_missing() {
+        let tail = "Token usage: total=100 input=50";
+        let err = parse_codex_session_summary(tail).expect_err("should fail");
+
+        assert!(err.missing.contains(&"session_id"));
+        assert!(!err.missing.contains(&"token_usage"));
+    }
+
+    #[test]
+    fn parse_codex_session_summary_fails_when_token_usage_missing() {
+        let tail = "codex resume 123e4567-e89b-12d3-a456-426614174000";
+        let err = parse_codex_session_summary(tail).expect_err("should fail");
+
+        assert!(err.missing.contains(&"token_usage"));
+        assert!(!err.missing.contains(&"session_id"));
+    }
+
+    #[test]
+    fn parse_codex_session_summary_fails_when_both_missing() {
+        let tail = "Some random text without markers";
+        let err = parse_codex_session_summary(tail).expect_err("should fail");
+
+        assert!(err.missing.contains(&"session_id"));
+        assert!(err.missing.contains(&"token_usage"));
+    }
+
+    #[test]
+    fn parse_codex_session_summary_error_does_not_leak_raw_content() {
+        let tail = "secret_api_key=sk-12345 some sensitive data";
+        let err = parse_codex_session_summary(tail).expect_err("should fail");
+
+        // Error should contain hash and length, not raw content
+        let err_string = err.to_string();
+        assert!(err_string.contains("tail_hash="));
+        assert!(err_string.contains("tail_len="));
+        assert!(!err_string.contains("secret_api_key"));
+        assert!(!err_string.contains("sk-12345"));
+    }
+
+    #[test]
+    fn parse_codex_session_summary_extracts_reset_time_variations() {
+        // Various reset time formats
+        let cases = [
+            ("Token usage: total=1\ncodex resume abcd1234\ntry again at 2:30 PM", Some("2:30 PM")),
+            ("Token usage: total=1\ncodex resume abcd1234\nTry again at tomorrow 9am.", Some("tomorrow 9am")),
+            ("Token usage: total=1\ncodex resume abcd1234", None),
+        ];
+
+        for (tail, expected_reset) in cases {
+            let result = parse_codex_session_summary(tail).expect("should parse");
+            assert_eq!(result.reset_time.as_deref(), expected_reset, "Failed for: {tail}");
+        }
+    }
+
+    #[test]
+    fn parse_codex_session_summary_uses_last_session_id_when_multiple() {
+        // If multiple resume hints appear, use the last one
+        let tail = "codex resume 11111111-1111-1111-1111-111111111111\nToken usage: total=1\ncodex resume 22222222-2222-2222-2222-222222222222";
+        let result = parse_codex_session_summary(tail).expect("should parse");
+
+        assert_eq!(result.session_id, "22222222-2222-2222-2222-222222222222");
+    }
+
+    // ========================================================================
+    // Account Selection Step Tests (wa-nu4.1.3.4)
+    // ========================================================================
+    //
+    // Note: The core selection logic (determinism, threshold filtering, LRU tie-break)
+    // is tested in accounts.rs (9 tests). The `refresh_and_select_account` function
+    // wires caut + storage + selection together.
+    //
+    // Full integration tests with a real database should be added to verify:
+    // - caut refresh results are correctly persisted to the accounts table
+    // - selection uses the refreshed data from DB
+    // - last_used_at updates work correctly after successful failover
+    //
+    // The tests below verify the error types and result structures.
+
+    #[test]
+    fn account_selection_step_error_displays_caut_error() {
+        let caut_err = crate::caut::CautError::NotInstalled;
+        let step_err = AccountSelectionStepError::Caut(caut_err);
+        let display = step_err.to_string();
+        assert!(display.contains("caut error"));
+        assert!(display.contains("not installed"));
+    }
+
+    #[test]
+    fn account_selection_step_error_displays_storage_error() {
+        let step_err = AccountSelectionStepError::Storage("connection failed".to_string());
+        let display = step_err.to_string();
+        assert!(display.contains("storage error"));
+        assert!(display.contains("connection failed"));
+    }
+
+    #[test]
+    fn account_selection_step_result_can_be_constructed() {
+        use crate::accounts::{AccountRecord, AccountSelectionConfig, SelectionExplanation};
+
+        // Verify the step result structure is correct
+        let explanation = SelectionExplanation {
+            total_considered: 2,
+            filtered_out: vec![],
+            candidates: vec![],
+            selection_reason: "Test reason".to_string(),
+        };
+
+        let result = AccountSelectionStepResult {
+            selected: None,
+            explanation,
+            accounts_refreshed: 2,
+        };
+
+        assert!(result.selected.is_none());
+        assert_eq!(result.accounts_refreshed, 2);
+        assert_eq!(result.explanation.total_considered, 2);
+    }
+
+    #[test]
+    fn account_selection_step_result_with_selected_account() {
+        use crate::accounts::{AccountRecord, SelectionExplanation};
+
+        let account = AccountRecord {
+            id: 1,
+            account_id: "acc-123".to_string(),
+            service: "openai".to_string(),
+            name: Some("Test Account".to_string()),
+            percent_remaining: 75.0,
+            reset_at: None,
+            tokens_used: Some(1000),
+            tokens_remaining: Some(3000),
+            tokens_limit: Some(4000),
+            last_refreshed_at: 1000,
+            last_used_at: None,
+            created_at: 1000,
+            updated_at: 1000,
+        };
+
+        let explanation = SelectionExplanation {
+            total_considered: 1,
+            filtered_out: vec![],
+            candidates: vec![],
+            selection_reason: "Only eligible account".to_string(),
+        };
+
+        let result = AccountSelectionStepResult {
+            selected: Some(account.clone()),
+            explanation,
+            accounts_refreshed: 1,
+        };
+
+        assert!(result.selected.is_some());
+        assert_eq!(result.selected.as_ref().unwrap().account_id, "acc-123");
+        assert_eq!(result.accounts_refreshed, 1);
     }
 }

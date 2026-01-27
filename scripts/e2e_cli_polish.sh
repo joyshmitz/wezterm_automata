@@ -84,6 +84,13 @@ run_wa() {
     "$WA_BIN" "$@"
 }
 
+# Run wa command with a timeout (for commands that might hang without watcher)
+run_wa_timeout() {
+    local timeout_secs="${1:-5}"
+    shift
+    timeout "$timeout_secs" "$WA_BIN" "$@" 2>&1 || true
+}
+
 # Check if output contains ANSI escape sequences
 has_ansi() {
     # Look for \033[ or \x1b[ patterns
@@ -199,20 +206,21 @@ test_help_output() {
 test_verbosity_tiers() {
     log_test "Testing Verbosity Tiers"
 
-    # Test 1: Default output (no -v)
+    # Commands that require a watcher may hang without one, so use timeouts
+    # Test 1: Default output (no -v) - use short timeout
     local default_output
-    default_output=$(run_wa status 2>&1) || true
+    default_output=$(run_wa_timeout 3 status) || true
 
-    # Default should produce some output (even if error due to no watcher)
+    # Default should produce some output (even if timeout error due to no watcher)
     if [[ -n "$default_output" ]]; then
         log_pass "Default output produces content"
     else
         log_fail "Default output is empty"
     fi
 
-    # Test 2: Verbose output (-v) should work
+    # Test 2: Verbose output (-v) should work - use short timeout
     local verbose_output
-    verbose_output=$(run_wa -v status 2>&1) || true
+    verbose_output=$(run_wa_timeout 3 -v status) || true
 
     if [[ -n "$verbose_output" ]]; then
         log_pass "Verbose output (-v) works"
@@ -221,10 +229,10 @@ test_verbosity_tiers() {
     fi
 
     # Test 3: Check that verbosity affects output (when watcher is running)
-    # Note: Without a running watcher, both might show similar error messages
+    # Note: Without a running watcher, commands may timeout
     # We mainly verify the flag is accepted
 
-    # Test 4: Verbose flag is global (works with subcommands)
+    # Test 4: Verbose flag is global (works with subcommands) - this doesn't need timeout
     local verbose_help
     verbose_help=$(run_wa -v --help 2>&1) || true
 
@@ -339,11 +347,11 @@ test_output_consistency() {
         log_pass "Invalid command exits non-zero"
     fi
 
-    # Test 4: JSON output format (where supported)
+    # Test 4: JSON output format (where supported) - may need watcher
     local json_output
-    json_output=$(run_wa robot panes --format json 2>&1) || true
+    json_output=$(run_wa_timeout 3 robot panes --format json) || true
 
-    # Even if error, check if it's valid JSON
+    # Even if error or timeout, check if it's valid JSON
     if echo "$json_output" | jq . >/dev/null 2>&1; then
         log_pass "Robot mode produces valid JSON"
         e2e_add_json "robot_panes.json" "$json_output"
@@ -382,12 +390,12 @@ test_help_examples() {
     for cmd in send search workflow events; do
         local cmd_help
         cmd_help=$(run_wa "$cmd" --help 2>&1) || true
-        ((commands_checked++))
+        ((commands_checked++)) || true
 
         # Check for EXAMPLES section or example-like content
         if echo "$cmd_help" | grep -qiE "(examples?:|e\.g\.|for example)"; then
             log_pass "Command has examples: $cmd"
-            ((commands_with_examples++))
+            ((commands_with_examples++)) || true
         else
             # Not a failure yet since wa-rnf.4 hasn't been implemented
             log_skip "Command missing examples: $cmd (wa-rnf.4)"
@@ -460,13 +468,14 @@ test_progressive_disclosure() {
 
     # Test that commands show minimal output by default
     # and more detail with -v
+    # Note: Without a running watcher, commands may timeout
 
-    # Test with 'events' command (shows event list)
+    # Test with 'events' command (shows event list) - use timeout
     local events_default
-    events_default=$(run_wa events 2>&1) || true
+    events_default=$(run_wa_timeout 3 events) || true
 
     local events_verbose
-    events_verbose=$(run_wa -v events 2>&1) || true
+    events_verbose=$(run_wa_timeout 3 -v events) || true
 
     # Artifact capture
     e2e_add_file "events_default.txt" "$events_default"

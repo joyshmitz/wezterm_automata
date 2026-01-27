@@ -19,6 +19,10 @@
           "minimum": 0,
           "description": "Unique pane identifier within WezTerm"
         },
+        "pane_uuid": {
+          "type": ["string", "null"],
+          "description": "UUID assigned by WezTerm for cross-session pane tracking (may be null if not available)"
+        },
         "tab_id": {
           "type": "integer",
           "minimum": 0,

@@ -60,19 +60,19 @@ log_info() {
 
 log_pass() {
     echo -e "${GREEN}[PASS]${NC} $*"
-    ((TESTS_PASSED++))
-    ((TESTS_RUN++))
+    ((TESTS_PASSED++)) || true
+    ((TESTS_RUN++)) || true
 }
 
 log_fail() {
     echo -e "${RED}[FAIL]${NC} $*"
-    ((TESTS_FAILED++))
-    ((TESTS_RUN++))
+    ((TESTS_FAILED++)) || true
+    ((TESTS_RUN++)) || true
 }
 
 log_skip() {
     echo -e "${YELLOW}[SKIP]${NC} $*"
-    ((TESTS_SKIPPED++))
+    ((TESTS_SKIPPED++)) || true
 }
 
 log_test() {

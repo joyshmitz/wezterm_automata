@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{RwLock, mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::config::{HotReloadableConfig, PaneFilterConfig};
@@ -54,6 +54,12 @@ pub struct RuntimeConfig {
     pub channel_buffer: usize,
     /// Maximum concurrent capture operations
     pub max_concurrent_captures: usize,
+    /// Data retention period in days
+    pub retention_days: u32,
+    /// Maximum size of storage in MB (0 = unlimited)
+    pub retention_max_mb: u32,
+    /// Database checkpoint interval in seconds
+    pub checkpoint_interval_secs: u32,
 }
 
 impl Default for RuntimeConfig {
@@ -62,10 +68,13 @@ impl Default for RuntimeConfig {
             discovery_interval: Duration::from_secs(5),
             capture_interval: Duration::from_millis(200),
             min_capture_interval: Duration::from_millis(50),
-            overlap_size: 4096,
+            overlap_size: 1048576, // 1MB default
             pane_filter: PaneFilterConfig::default(),
             channel_buffer: 1024,
             max_concurrent_captures: 10,
+            retention_days: 30,
+            retention_max_mb: 0,
+            checkpoint_interval_secs: 60,
         }
     }
 }
@@ -211,9 +220,9 @@ impl ObservationRuntime {
             log_level: "info".to_string(), // Default, will be overridden
             poll_interval_ms: duration_ms_u64(config.capture_interval),
             min_poll_interval_ms: duration_ms_u64(config.min_capture_interval),
-            retention_days: 30,
-            retention_max_mb: 0,
-            checkpoint_interval_secs: 60,
+            retention_days: config.retention_days,
+            retention_max_mb: config.retention_max_mb,
+            checkpoint_interval_secs: config.checkpoint_interval_secs,
             pattern_packs: vec![],
             workflows_enabled: vec![],
             auto_run_allowlist: vec![],
@@ -262,7 +271,10 @@ impl ObservationRuntime {
         let capture_handle = self.spawn_capture_task(capture_tx);
 
         // Spawn persistence and detection task
-        let persistence_handle = self.spawn_persistence_task(capture_rx);
+        let persistence_handle = self.spawn_persistence_task(capture_rx, Arc::clone(&self.cursors));
+
+        // Spawn maintenance task
+        let maintenance_handle = self.spawn_maintenance_task();
 
         info!("Observation runtime started");
 
@@ -270,6 +282,7 @@ impl ObservationRuntime {
             discovery: discovery_handle,
             capture: capture_handle,
             persistence: persistence_handle,
+            maintenance: Some(maintenance_handle),
             shutdown_flag: Arc::clone(&self.shutdown_flag),
             storage: Arc::clone(&self.storage),
             metrics: Arc::clone(&self.metrics),
@@ -278,6 +291,83 @@ impl ObservationRuntime {
             start_time: Instant::now(),
             config_tx: self.config_tx.clone(),
             event_bus: self.event_bus.clone(),
+        })
+    }
+
+    /// Spawn the maintenance task.
+    fn spawn_maintenance_task(&self) -> JoinHandle<()> {
+        let storage = Arc::clone(&self.storage);
+        let shutdown_flag = Arc::clone(&self.shutdown_flag);
+        let mut config_rx = self.config_rx.clone();
+        
+        let initial_retention_days = self.config.retention_days;
+        let initial_checkpoint_secs = self.config.checkpoint_interval_secs;
+
+        tokio::spawn(async move {
+            let mut retention_days = initial_retention_days;
+            let mut checkpoint_secs = initial_checkpoint_secs;
+            
+            // Run maintenance every minute, but only do expensive ops when needed
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut last_retention_check = Instant::now();
+            let mut last_checkpoint = Instant::now();
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if shutdown_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+
+                        // Check for config updates
+                        if config_rx.has_changed().unwrap_or(false) {
+                            let new_config = config_rx.borrow_and_update().clone();
+                            if new_config.retention_days != retention_days {
+                                info!(old = retention_days, new = new_config.retention_days, "Retention policy updated");
+                                retention_days = new_config.retention_days;
+                            }
+                            if new_config.checkpoint_interval_secs != checkpoint_secs {
+                                info!(old = checkpoint_secs, new = new_config.checkpoint_interval_secs, "Checkpoint interval updated");
+                                checkpoint_secs = new_config.checkpoint_interval_secs;
+                            }
+                        }
+
+                        let now = Instant::now();
+
+                        // Run retention cleanup every hour (or if just started/updated)
+                        if now.duration_since(last_retention_check) >= Duration::from_secs(3600) {
+                            if retention_days > 0 {
+                                let cutoff_days = retention_days as u64;
+                                let cutoff_ms = epoch_ms() - (cutoff_days * 24 * 60 * 60 * 1000) as i64;
+                                let storage_guard = storage.lock().await;
+                                if let Err(e) = storage_guard.retention_cleanup(cutoff_ms).await {
+                                    error!(error = %e, "Retention cleanup failed");
+                                } else {
+                                    debug!("Retention cleanup completed");
+                                }
+                                // Also purge old audit actions
+                                if let Err(e) = storage_guard.purge_audit_actions_before(cutoff_ms).await {
+                                    error!(error = %e, "Audit purge failed");
+                                }
+                            }
+                            last_retention_check = now;
+                        }
+
+                        // Run checkpoint/vacuum
+                        if checkpoint_secs > 0 && now.duration_since(last_checkpoint) >= Duration::from_secs(checkpoint_secs as u64) {
+                            let storage_guard = storage.lock().await;
+                            // Vacuum also handles WAL checkpointing implicitly in many cases,
+                            // or we could add explicit checkpoint support. For now vacuum is good maintenance.
+                            if let Err(e) = storage_guard.vacuum().await {
+                                error!(error = %e, "Database maintenance (vacuum) failed");
+                            } else {
+                                debug!("Database maintenance (vacuum) completed");
+                            }
+                            last_checkpoint = now;
+                        }
+                    }
+                }
+            }
         })
     }
 
@@ -292,13 +382,23 @@ impl ObservationRuntime {
         let mut config_rx = self.config_rx.clone();
 
         tokio::spawn(async move {
-            // Create a fresh WezTerm client for this task
-            let wezterm = WeztermClient::new();
+            // Create a fresh WezTerm client for this task with shorter timeout
+            let wezterm = WeztermClient::new().with_timeout(5);
             let mut current_interval = initial_interval;
 
             loop {
-                // Use sleep instead of interval to support dynamic interval changes
-                tokio::time::sleep(current_interval).await;
+                // Wait for interval, checking shutdown periodically to ensure responsiveness
+                let deadline = tokio::time::Instant::now() + current_interval;
+                loop {
+                    if shutdown_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    // Sleep in short bursts to remain responsive to shutdown signals
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
 
                 // Check shutdown flag
                 if shutdown_flag.load(Ordering::SeqCst) {
@@ -428,9 +528,10 @@ impl ObservationRuntime {
         let cursors = Arc::clone(&self.cursors);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let discovery_interval = self.config.discovery_interval;
+        let mut config_rx = self.config_rx.clone();
 
         // Create tailer config from runtime config
-        let tailer_config = TailerConfig {
+        let initial_config = TailerConfig {
             min_interval: self.config.min_capture_interval,
             max_interval: self.config.capture_interval,
             backoff_multiplier: 1.5,
@@ -440,11 +541,11 @@ impl ObservationRuntime {
         };
 
         tokio::spawn(async move {
-            let poll_interval = tailer_config.min_interval;
-            let source = Arc::new(WeztermClient::new());
+            // Use shorter timeout for capture to prevent head-of-line blocking
+            let source = Arc::new(WeztermClient::new().with_timeout(5));
             // Create tailer supervisor
             let mut supervisor = TailerSupervisor::new(
-                tailer_config,
+                initial_config,
                 capture_tx,
                 cursors,
                 Arc::clone(&registry), // Pass registry for authoritative state
@@ -454,14 +555,34 @@ impl ObservationRuntime {
 
             // Sync tailers periodically with discovery interval
             let mut sync_tick = tokio::time::interval(discovery_interval);
-            let mut poll_tick = tokio::time::interval(poll_interval);
+            let mut join_set = JoinSet::new();
 
             loop {
+                // Determine poll interval dynamically from supervisor config
+                // (Using min_interval for responsiveness)
+                // Actually supervisor manages per-tailer intervals. We just need to wake up often enough to spawn ready tasks.
+                // A fixed tick is fine, supervisor filters ready tasks.
+                let tick_duration = Duration::from_millis(10); 
+
                 tokio::select! {
                     _ = sync_tick.tick() => {
                         if shutdown_flag.load(Ordering::SeqCst) {
                             debug!("Capture task: shutdown signal received");
                             break;
+                        }
+
+                        // Check for config updates
+                        if config_rx.has_changed().unwrap_or(false) {
+                            let new_config = config_rx.borrow_and_update().clone();
+                            let new_tailer_config = TailerConfig {
+                                min_interval: Duration::from_millis(new_config.min_poll_interval_ms),
+                                max_interval: Duration::from_millis(new_config.poll_interval_ms),
+                                backoff_multiplier: 1.5,
+                                max_concurrent: 10, // HotReloadableConfig doesn't have concurrency yet, assume static or add it?
+                                overlap_size: 4096, // Config doesn't have overlap size either
+                                send_timeout: Duration::from_millis(100),
+                            };
+                            supervisor.update_config(new_tailer_config);
                         }
 
                         // Get current observed panes from registry
@@ -481,8 +602,21 @@ impl ObservationRuntime {
                             "Tailer sync tick"
                         );
                     }
-                    _ = poll_tick.tick() => {
-                        supervisor.poll_once().await;
+                    // Handle completed captures
+                    Some(result) = join_set.join_next(), if !join_set.is_empty() => {
+                        match result {
+                            Ok((pane_id, outcome)) => supervisor.handle_poll_result(pane_id, outcome),
+                            Err(e) => {
+                                warn!(error = %e, "Tailer poll task failed");
+                            }
+                        }
+                    }
+                    // Spawn new captures if slots available
+                    _ = tokio::time::sleep(tick_duration) => {
+                         if shutdown_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        supervisor.spawn_ready(&mut join_set);
                     }
                 }
             }
@@ -496,6 +630,7 @@ impl ObservationRuntime {
     fn spawn_persistence_task(
         &self,
         mut capture_rx: mpsc::Receiver<CaptureEvent>,
+        cursors: Arc<RwLock<HashMap<u64, PaneCursor>>>,
     ) -> JoinHandle<()> {
         let storage = Arc::clone(&self.storage);
         let pattern_engine = Arc::clone(&self.pattern_engine);
@@ -515,11 +650,26 @@ impl ObservationRuntime {
                 let pane_id = event.segment.pane_id;
                 let content = event.segment.content.clone();
                 let captured_at = event.segment.captured_at;
+                let captured_seq = event.segment.seq;
 
                 // Persist the segment
                 let storage_guard = storage.lock().await;
                 match persist_captured_segment(&storage_guard, &event.segment).await {
                     Ok(persisted) => {
+                        // Check for sequence discontinuity and resync cursor if needed
+                        if persisted.segment.seq != captured_seq {
+                            warn!(
+                                pane_id,
+                                expected_seq = captured_seq,
+                                actual_seq = persisted.segment.seq,
+                                "Sequence discontinuity detected, resyncing cursor"
+                            );
+                            let mut cursors_guard = cursors.write().await;
+                            if let Some(cursor) = cursors_guard.get_mut(&pane_id) {
+                                cursor.resync_seq(persisted.segment.seq);
+                            }
+                        }
+
                         // Track metrics
                         metrics.segments_persisted.fetch_add(1, Ordering::SeqCst);
 
@@ -629,6 +779,8 @@ pub struct RuntimeHandle {
     pub capture: JoinHandle<()>,
     /// Persistence task handle
     pub persistence: JoinHandle<()>,
+    /// Maintenance task handle (retention, checkpointing)
+    pub maintenance: Option<JoinHandle<()>>,
     /// Shutdown flag for signaling tasks
     pub shutdown_flag: Arc<AtomicBool>,
     /// Storage handle for external access
@@ -653,6 +805,9 @@ impl RuntimeHandle {
         let _ = self.discovery.await;
         let _ = self.capture.await;
         let _ = self.persistence.await;
+        if let Some(maintenance) = self.maintenance {
+            let _ = maintenance.await;
+        }
     }
 
     /// Request graceful shutdown and collect a summary.

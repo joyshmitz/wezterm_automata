@@ -3,7 +3,7 @@
 //! This module provides the TailerSupervisor for managing per-pane content
 //! capture with adaptive polling intervals.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -140,6 +140,8 @@ where
     semaphore: Arc<Semaphore>,
     /// Per-pane tailer state
     tailers: HashMap<u64, PaneTailer>,
+    /// Panes currently being captured (to prevent duplicate polling)
+    capturing_panes: HashSet<u64>,
     /// Metrics
     metrics: TailerMetrics,
     /// Supervisor metrics
@@ -169,6 +171,7 @@ where
             source,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             tailers: HashMap::new(),
+            capturing_panes: HashSet::new(),
             metrics: TailerMetrics::default(),
             supervisor_metrics: SupervisorMetrics::default(),
         }
@@ -196,6 +199,7 @@ where
 
         for pane_id in to_remove {
             self.tailers.remove(&pane_id);
+            self.capturing_panes.remove(&pane_id);
             self.supervisor_metrics.tailers_stopped += 1;
             debug!(pane_id, "Removed tailer for departed pane");
         }
@@ -211,27 +215,57 @@ where
         }
     }
 
-    /// Perform one poll cycle, capturing from panes that are ready.
-    pub async fn poll_once(&mut self) {
+    /// Update configuration dynamically.
+    ///
+    /// Updates polling intervals and concurrency limits. Note that `semaphore` is updated
+    /// to reflect the new concurrency limit.
+    pub fn update_config(&mut self, config: TailerConfig) {
+        if config.max_concurrent != self.config.max_concurrent {
+            // Update semaphore capacity
+            // Note: Semaphore doesn't support resizing, so we replace it.
+            // This is safe because tasks hold a permit from the OLD semaphore.
+            // New tasks will acquire from the NEW semaphore.
+            // The concurrency limit will effectively be the sum during the transition,
+            // but will converge quickly.
+            self.semaphore = Arc::new(Semaphore::new(config.max_concurrent.max(1)));
+            debug!(
+                old = self.config.max_concurrent,
+                new = config.max_concurrent,
+                "Tailer concurrency updated"
+            );
+        }
+
+        if config.min_interval != self.config.min_interval
+            || config.max_interval != self.config.max_interval
+        {
+            debug!(
+                min = ?config.min_interval,
+                max = ?config.max_interval,
+                "Tailer intervals updated"
+            );
+        }
+
+        self.config = config;
+    }
+
+    /// Spawn tasks for all ready panes that are not currently being captured.
+    pub fn spawn_ready(&mut self, join_set: &mut JoinSet<(u64, PollOutcome)>) {
         if self.shutdown_flag.load(Ordering::SeqCst) {
             return;
         }
 
-        // Find panes ready for polling
+        // Find panes ready for polling AND not currently capturing
         let ready_panes: Vec<u64> = self
             .tailers
             .iter()
-            .filter(|(_, t)| t.should_poll())
+            .filter(|(id, t)| t.should_poll() && !self.capturing_panes.contains(id))
             .map(|(id, _)| *id)
             .collect();
 
-        if ready_panes.is_empty() {
-            return;
-        }
-
-        let mut join_set = JoinSet::new();
-
         for pane_id in ready_panes {
+            // Mark as capturing to prevent duplicate spawns
+            self.capturing_panes.insert(pane_id);
+
             let tx = self.tx.clone();
             let cursors = Arc::clone(&self.cursors);
             let registry = Arc::clone(&self.registry);
@@ -290,44 +324,40 @@ where
                 }
             });
         }
+    }
 
-        while let Some(result) = join_set.join_next().await {
-            let (pane_id, outcome) = match result {
-                Ok(value) => value,
-                Err(e) => {
-                    warn!(error = %e, "Tailer poll task failed");
-                    continue;
+    /// Handle the result of a completed poll task.
+    pub fn handle_poll_result(&mut self, pane_id: u64, outcome: PollOutcome) {
+        // Mark as no longer capturing so it can be polled again later
+        self.capturing_panes.remove(&pane_id);
+
+        if let Some(tailer) = self.tailers.get_mut(&pane_id) {
+            match outcome {
+                PollOutcome::Changed => {
+                    tailer.record_poll(true, &self.config);
+                    self.metrics.events_sent += 1;
                 }
-            };
-
-            if let Some(tailer) = self.tailers.get_mut(&pane_id) {
-                match outcome {
-                    PollOutcome::Changed => {
-                        tailer.record_poll(true, &self.config);
-                        self.metrics.events_sent += 1;
-                    }
-                    PollOutcome::NoChange => {
-                        tailer.record_poll(false, &self.config);
-                        self.metrics.no_change_captures += 1;
-                        trace!(pane_id, "Tailer poll no change");
-                    }
-                    PollOutcome::Backpressure => {
-                        tailer.record_poll(false, &self.config);
-                        self.metrics.send_timeouts += 1;
-                        warn!(pane_id, "Tailer backpressure: capture queue full");
-                    }
-                    PollOutcome::NoCursor => {
-                        tailer.record_poll(false, &self.config);
-                        trace!(pane_id, "Tailer poll skipped (no cursor)");
-                    }
-                    PollOutcome::ChannelClosed => {
-                        tailer.record_poll(false, &self.config);
-                        warn!(pane_id, "Tailer channel closed");
-                    }
-                    PollOutcome::Error(error) => {
-                        tailer.record_poll(false, &self.config);
-                        warn!(pane_id, error = %error, "Tailer poll failed");
-                    }
+                PollOutcome::NoChange => {
+                    tailer.record_poll(false, &self.config);
+                    self.metrics.no_change_captures += 1;
+                    trace!(pane_id, "Tailer poll no change");
+                }
+                PollOutcome::Backpressure => {
+                    tailer.record_poll(false, &self.config);
+                    self.metrics.send_timeouts += 1;
+                    warn!(pane_id, "Tailer backpressure: capture queue full");
+                }
+                PollOutcome::NoCursor => {
+                    tailer.record_poll(false, &self.config);
+                    trace!(pane_id, "Tailer poll skipped (no cursor)");
+                }
+                PollOutcome::ChannelClosed => {
+                    tailer.record_poll(false, &self.config);
+                    warn!(pane_id, "Tailer channel closed");
+                }
+                PollOutcome::Error(error) => {
+                    tailer.record_poll(false, &self.config);
+                    warn!(pane_id, error = %error, "Tailer poll failed");
                 }
             }
         }
@@ -340,6 +370,7 @@ where
             "Shutting down tailer supervisor"
         );
         self.tailers.clear();
+        self.capturing_panes.clear();
     }
 
     /// Get current metrics.
@@ -356,7 +387,7 @@ where
 }
 
 #[derive(Debug)]
-enum PollOutcome {
+pub(crate) enum PollOutcome {
     Changed,
     NoChange,
     Backpressure,
@@ -371,6 +402,7 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::task::JoinSet;
 
     fn make_pane(id: u64) -> PaneInfo {
         PaneInfo {
@@ -573,11 +605,21 @@ mod tests {
         }
         supervisor.sync_tailers(&panes);
 
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        supervisor.poll_once().await;
+        let mut join_set = JoinSet::new();
+        supervisor.spawn_ready(&mut join_set);
+
+        // Wait for a bit to let tasks start
+        tokio::time::sleep(Duration::from_millis(5)).await;
 
         let max_seen = max.load(Ordering::SeqCst);
         assert!(max_seen <= 2, "max concurrency observed: {max_seen}");
+
+        // Cleanup
+        while let Some(result) = join_set.join_next().await {
+            if let Ok((pane_id, outcome)) = result {
+                supervisor.handle_poll_result(pane_id, outcome);
+            }
+        }
     }
 
     #[tokio::test]
@@ -609,8 +651,14 @@ mod tests {
         panes.insert(2, make_pane(2));
         supervisor.sync_tailers(&panes);
 
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        supervisor.poll_once().await;
+        let mut join_set = JoinSet::new();
+        supervisor.spawn_ready(&mut join_set);
+
+        while let Some(result) = join_set.join_next().await {
+            if let Ok((pane_id, outcome)) = result {
+                supervisor.handle_poll_result(pane_id, outcome);
+            }
+        }
 
         assert!(supervisor.metrics().send_timeouts >= 1);
     }

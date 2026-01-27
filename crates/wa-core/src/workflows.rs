@@ -1620,6 +1620,8 @@ impl WorkflowEngine {
             StepResult::SendText { .. } => "send_text",
         };
         let result_data = serde_json::to_string(result).ok();
+        let verification_refs = build_verification_refs(result, None);
+        let error_code = step_error_code_from_result(result);
 
         storage
             .insert_step_log(
@@ -1627,8 +1629,13 @@ impl WorkflowEngine {
                 None,
                 step_index,
                 step_name,
+                None,
+                None,
                 result_type,
                 result_data,
+                None,
+                verification_refs,
+                error_code,
                 started_at,
                 completed_at,
             )
@@ -1671,6 +1678,166 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+fn build_verification_refs(
+    step_result: &StepResult,
+    step_plan: Option<&crate::plan::StepPlan>,
+) -> Option<String> {
+    let mut refs: Vec<serde_json::Value> = Vec::new();
+
+    if let Some(step_plan) = step_plan {
+        if let Some(verification) = &step_plan.verification {
+            refs.push(serde_json::json!({
+                "source": "plan",
+                "strategy": &verification.strategy,
+                "description": verification.description,
+                "timeout_ms": verification.timeout_ms,
+            }));
+        }
+    }
+
+    match step_result {
+        StepResult::WaitFor {
+            condition,
+            timeout_ms,
+        } => {
+            refs.push(serde_json::json!({
+                "source": "wait_for",
+                "condition": condition,
+                "timeout_ms": timeout_ms,
+            }));
+        }
+        StepResult::SendText {
+            wait_for,
+            wait_timeout_ms,
+            ..
+        } => {
+            if let Some(condition) = wait_for {
+                refs.push(serde_json::json!({
+                    "source": "post_send_wait",
+                    "condition": condition,
+                    "timeout_ms": wait_timeout_ms,
+                }));
+            }
+        }
+        _ => {}
+    }
+
+    if refs.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&refs).ok()
+    }
+}
+
+fn step_error_code_from_result(step_result: &StepResult) -> Option<String> {
+    match step_result {
+        StepResult::Abort { .. } => Some("WA-5002".to_string()),
+        _ => None,
+    }
+}
+
+fn policy_summary_from_injection(result: &crate::policy::InjectionResult) -> Option<String> {
+    use crate::policy::InjectionResult;
+
+    let mut obj = serde_json::Map::new();
+    match result {
+        InjectionResult::Allowed {
+            decision,
+            summary,
+            action,
+            ..
+        } => {
+            obj.insert("decision".to_string(), serde_json::json!("allow"));
+            if let Ok(action_val) = serde_json::to_value(action) {
+                obj.insert("action".to_string(), action_val);
+            }
+            if let Some(rule_id) = decision.rule_id() {
+                obj.insert("rule_id".to_string(), serde_json::json!(rule_id));
+            }
+            obj.insert("summary".to_string(), serde_json::json!(summary));
+        }
+        InjectionResult::Denied {
+            decision,
+            summary,
+            action,
+            ..
+        } => {
+            obj.insert("decision".to_string(), serde_json::json!("deny"));
+            if let Ok(action_val) = serde_json::to_value(action) {
+                obj.insert("action".to_string(), action_val);
+            }
+            if let Some(rule_id) = decision.rule_id() {
+                obj.insert("rule_id".to_string(), serde_json::json!(rule_id));
+            }
+            if let Some(reason) = decision.denial_reason() {
+                obj.insert("reason".to_string(), serde_json::json!(reason));
+            }
+            obj.insert("summary".to_string(), serde_json::json!(summary));
+        }
+        InjectionResult::RequiresApproval {
+            decision,
+            summary,
+            action,
+            ..
+        } => {
+            obj.insert(
+                "decision".to_string(),
+                serde_json::json!("require_approval"),
+            );
+            if let Ok(action_val) = serde_json::to_value(action) {
+                obj.insert("action".to_string(), action_val);
+            }
+            if let Some(rule_id) = decision.rule_id() {
+                obj.insert("rule_id".to_string(), serde_json::json!(rule_id));
+            }
+            if let crate::policy::PolicyDecision::RequireApproval { reason, .. } = decision {
+                obj.insert("reason".to_string(), serde_json::json!(reason));
+            }
+            obj.insert("summary".to_string(), serde_json::json!(summary));
+        }
+        InjectionResult::Error { error, action, .. } => {
+            obj.insert("decision".to_string(), serde_json::json!("error"));
+            if let Ok(action_val) = serde_json::to_value(action) {
+                obj.insert("action".to_string(), action_val);
+            }
+            obj.insert("error".to_string(), serde_json::json!(error));
+        }
+    }
+
+    if obj.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&obj).ok()
+    }
+}
+
+fn policy_error_code_from_decision(
+    decision: &crate::policy::PolicyDecision,
+) -> Option<&'static str> {
+    if matches!(
+        decision,
+        crate::policy::PolicyDecision::RequireApproval { .. }
+    ) {
+        return Some("WA-4010");
+    }
+    match decision.rule_id() {
+        Some("policy.alt_screen" | "policy.alt_screen_unknown") => Some("WA-4001"),
+        Some("policy.prompt_required" | "policy.prompt_unknown") => Some("WA-4002"),
+        Some("policy.rate_limit") => Some("WA-4003"),
+        _ => None,
+    }
+}
+
+fn policy_error_code_from_injection(result: &crate::policy::InjectionResult) -> Option<String> {
+    match result {
+        crate::policy::InjectionResult::Denied { decision, .. }
+        | crate::policy::InjectionResult::RequiresApproval { decision, .. } => {
+            policy_error_code_from_decision(decision).map(str::to_string)
+        }
+        _ => None,
+    }
 }
 
 // ============================================================================
@@ -1755,11 +1922,10 @@ pub async fn check_step_idempotency(
                                     completed_at: log.completed_at,
                                     previous_result: log.result_data.clone(),
                                 };
-                            } else {
-                                return IdempotencyCheckResult::PartiallyExecuted {
-                                    started_at: log.started_at,
-                                };
                             }
+                            return IdempotencyCheckResult::PartiallyExecuted {
+                                started_at: log.started_at,
+                            };
                         }
                     }
                 }
@@ -2874,6 +3040,18 @@ impl WorkflowRunner {
                 };
             }
 
+            if let Err(e) = self
+                .storage
+                .upsert_action_plan(execution_id, &plan)
+                .await
+            {
+                tracing::warn!(
+                    execution_id,
+                    error = %e,
+                    "Failed to persist action plan"
+                );
+            }
+
             ctx.set_action_plan(plan);
         }
 
@@ -2896,6 +3074,12 @@ impl WorkflowRunner {
                 .get(current_step)
                 .map_or("unknown", |s| s.name.as_str());
 
+            let step_plan = ctx.get_step_plan(current_step);
+            let step_id = step_plan.map(|step| step.step_id.0.clone());
+            let step_kind = step_plan.map(|step| step.action.action_type_name().to_string());
+            let verification_refs = build_verification_refs(&step_result, step_plan);
+            let step_error_code = step_error_code_from_result(&step_result);
+
             // Build result data, enriching with plan information if available (wa-upg.2.3)
             let result_data = {
                 let mut data = serde_json::json!({
@@ -2908,7 +3092,7 @@ impl WorkflowRunner {
                 }
 
                 // Include step action type from plan if available
-                if let Some(step_plan) = ctx.get_step_plan(current_step) {
+                if let Some(step_plan) = step_plan {
                     data["action_type"] = serde_json::json!(step_plan.action.action_type_name());
                     data["step_description"] = serde_json::json!(step_plan.description);
                 }
@@ -2928,8 +3112,13 @@ impl WorkflowRunner {
                         None,
                         current_step,
                         step_name,
+                        step_id.clone(),
+                        step_kind.clone(),
                         result_type,
                         result_data.clone(),
+                        None,
+                        verification_refs.clone(),
+                        step_error_code,
                         step_started_at,
                         step_completed_at,
                     )
@@ -3185,6 +3374,8 @@ impl WorkflowRunner {
 
                     // Log the SendText step with audit_action_id (wa-nu4.1.1.11)
                     let audit_action_id = send_result.audit_action_id();
+                    let policy_summary = policy_summary_from_injection(&send_result);
+                    let policy_error_code = policy_error_code_from_injection(&send_result);
                     if let Err(e) = self
                         .storage
                         .insert_step_log(
@@ -3192,8 +3383,13 @@ impl WorkflowRunner {
                             audit_action_id,
                             current_step,
                             step_name,
+                            step_id.clone(),
+                            step_kind.clone(),
                             "send_text",
                             result_data.clone(),
+                            policy_summary,
+                            verification_refs.clone(),
+                            policy_error_code,
                             step_started_at,
                             now_ms(), // Use current time as completion
                         )
@@ -4328,7 +4524,7 @@ impl Workflow for HandleUsageLimits {
     ) -> BoxFuture<'_, StepResult> {
         let pane_id = ctx.pane_id();
         let storage = ctx.storage().clone();
-        let mut ctx_clone = ctx.clone();
+        let ctx_clone = ctx.clone();
 
         Box::pin(async move {
             match step_idx {
@@ -5224,8 +5420,13 @@ mod tests {
             audit_action_id: None,
             step_index: 0,
             step_name: "step_0".to_string(),
+            step_id: None,
+            step_kind: None,
             result_type: "continue".to_string(),
             result_data: None,
+            policy_summary: None,
+            verification_refs: None,
+            error_code: None,
             started_at: 1000,
             completed_at: 1100,
             duration_ms: 100,
@@ -5241,8 +5442,13 @@ mod tests {
             audit_action_id: None,
             step_index: 2,
             step_name: "step_2".to_string(),
+            step_id: None,
+            step_kind: None,
             result_type: "done".to_string(),
             result_data: None,
+            policy_summary: None,
+            verification_refs: None,
+            error_code: None,
             started_at: 1000,
             completed_at: 1100,
             duration_ms: 100,
@@ -5259,8 +5465,13 @@ mod tests {
             audit_action_id: None,
             step_index: 1,
             step_name: "step_1".to_string(),
+            step_id: None,
+            step_kind: None,
             result_type: "retry".to_string(),
             result_data: None,
+            policy_summary: None,
+            verification_refs: None,
+            error_code: None,
             started_at: 1000,
             completed_at: 1100,
             duration_ms: 100,
@@ -5278,8 +5489,13 @@ mod tests {
                 audit_action_id: None,
                 step_index: 0,
                 step_name: "step_0".to_string(),
+                step_id: None,
+                step_kind: None,
                 result_type: "continue".to_string(),
                 result_data: None,
+                policy_summary: None,
+                verification_refs: None,
+                error_code: None,
                 started_at: 1000,
                 completed_at: 1100,
                 duration_ms: 100,
@@ -5290,8 +5506,13 @@ mod tests {
                 audit_action_id: None,
                 step_index: 1,
                 step_name: "step_1".to_string(),
+                step_id: None,
+                step_kind: None,
                 result_type: "continue".to_string(),
                 result_data: None,
+                policy_summary: None,
+                verification_refs: None,
+                error_code: None,
                 started_at: 1100,
                 completed_at: 1200,
                 duration_ms: 100,
@@ -5302,8 +5523,13 @@ mod tests {
                 audit_action_id: None,
                 step_index: 2,
                 step_name: "step_2".to_string(),
+                step_id: None,
+                step_kind: None,
                 result_type: "retry".to_string(),
                 result_data: None,
+                policy_summary: None,
+                verification_refs: None,
+                error_code: None,
                 started_at: 1200,
                 completed_at: 1300,
                 duration_ms: 100,
@@ -5323,8 +5549,13 @@ mod tests {
                 audit_action_id: None,
                 step_index: 2,
                 step_name: "step_2".to_string(),
+                step_id: None,
+                step_kind: None,
                 result_type: "continue".to_string(),
                 result_data: None,
+                policy_summary: None,
+                verification_refs: None,
+                error_code: None,
                 started_at: 1200,
                 completed_at: 1300,
                 duration_ms: 100,
@@ -5335,8 +5566,13 @@ mod tests {
                 audit_action_id: None,
                 step_index: 0,
                 step_name: "step_0".to_string(),
+                step_id: None,
+                step_kind: None,
                 result_type: "continue".to_string(),
                 result_data: None,
+                policy_summary: None,
+                verification_refs: None,
+                error_code: None,
                 started_at: 1000,
                 completed_at: 1100,
                 duration_ms: 100,
@@ -7454,7 +7690,12 @@ mod tests {
                 None,
                 0,
                 "step_0",
+                None,
+                None,
                 "continue",
+                None,
+                None,
+                None,
                 None,
                 1000,
                 1100,
@@ -7467,7 +7708,12 @@ mod tests {
                 None,
                 1,
                 "step_1",
+                None,
+                None,
                 "continue",
+                None,
+                None,
+                None,
                 None,
                 1100,
                 1200,
@@ -7588,7 +7834,12 @@ mod tests {
                 None,
                 0,
                 "step_0",
+                None,
+                None,
                 "continue",
+                None,
+                None,
+                None,
                 None,
                 1000,
                 1100,
@@ -7601,7 +7852,12 @@ mod tests {
                 None,
                 1,
                 "step_1",
+                None,
+                None,
                 "continue",
+                None,
+                None,
+                None,
                 None,
                 1100,
                 1200,
@@ -7868,12 +8124,12 @@ mod tests {
 
     #[test]
     fn parse_codex_session_summary_succeeds_on_valid_fixture() {
-        let tail = r#"
+        let tail = r"
 You've reached your usage limit.
 Token usage: total=1,234 input=500 (+ 200 cached) output=534 (reasoning 100)
 To continue this session, run: codex resume 123e4567-e89b-12d3-a456-426614174000
 Try again at 3:00 PM UTC.
-"#;
+";
         let result = parse_codex_session_summary(tail).expect("should parse");
 
         assert_eq!(result.session_id, "123e4567-e89b-12d3-a456-426614174000");

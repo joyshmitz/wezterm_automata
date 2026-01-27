@@ -5316,8 +5316,8 @@ retention_max_mb = 1000
 enabled_packs = ["builtin:core"]
 
 [workflows]
-# Enable workflow execution
-enabled = true
+# Enabled workflows (by name)
+enabled = ["handle_compaction", "handle_usage_limits"]
 # Maximum concurrent workflows
 max_concurrent = 3
 

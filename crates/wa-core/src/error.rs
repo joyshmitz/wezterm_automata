@@ -231,6 +231,10 @@ pub enum WeztermError {
     /// Timeout waiting for command
     #[error("Command timed out after {0} seconds")]
     Timeout(u64),
+
+    /// Circuit breaker open (temporary backoff)
+    #[error("WezTerm circuit breaker is open; retry in {retry_after_ms} ms")]
+    CircuitOpen { retry_after_ms: u64 },
 }
 
 impl WeztermError {
@@ -279,6 +283,12 @@ impl WeztermError {
             ))
             .command("Diagnostics", "wa doctor")
             .alternative("Reduce load or retry with a longer timeout."),
+            Self::CircuitOpen { retry_after_ms } => Remediation::new(format!(
+                "WezTerm circuit breaker is open. Retry after {retry_after_ms} ms."
+            ))
+            .command("Check status", "wa status")
+            .command("Diagnostics", "wa doctor")
+            .alternative("Ensure WezTerm is running and responsive."),
         }
     }
 }
@@ -532,6 +542,7 @@ mod tests {
             Error::Wezterm(WeztermError::CommandFailed("boom".to_string())),
             Error::Wezterm(WeztermError::ParseError("bad json".to_string())),
             Error::Wezterm(WeztermError::Timeout(5)),
+            Error::Wezterm(WeztermError::CircuitOpen { retry_after_ms: 500 }),
             Error::Storage(StorageError::Database("db error".to_string())),
             Error::Storage(StorageError::SequenceDiscontinuity {
                 expected: 1,

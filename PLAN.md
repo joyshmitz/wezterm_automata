@@ -286,26 +286,34 @@ impl WeztermCliClient {
 
 #### Tier 2: Lua IPC (Enhanced Signals)
 
-Install a Lua module in WezTerm that communicates via Unix socket:
+> **DEPRECATED (v0.2.0)**: The `update-status` hook was removed due to performance issues.
+> It fires at ~60Hz, causing continuous Lua interpreter invocations and IPC overhead.
+> Alt-screen detection is now handled via escape sequence parsing (see `screen_state.rs`).
+> Pane metadata is obtained via `wezterm cli list` only when needed.
+> Only the `user-var-changed` hook is still used.
+
+~~Install a Lua module in WezTerm that communicates via Unix socket:~~
 
 ```lua
--- ~/.wezterm.lua (snippet)
+-- ~/.wezterm.lua (snippet) — DEPRECATED: update-status removed in v0.2.0
 local wa_socket = '/tmp/wa-ipc.sock'
 
-wezterm.on('update-status', function(window, pane)
-  -- Send rich status updates to wa
-  local msg = wezterm.json_encode({
-    event = 'status_update',
-    pane_id = pane:pane_id(),
-    domain = pane:get_domain_name(),
-    cursor = pane:get_cursor_position(),
-    dimensions = pane:get_dimensions(),
-    title = pane:get_title(),
-    is_alt_screen = pane:is_alt_screen_active(),
-  })
-  -- Send via socket (non-blocking)
-end)
+-- DEPRECATED: This hook was removed in v0.2.0. Do not use.
+-- wezterm.on('update-status', function(window, pane)
+--   -- Send rich status updates to wa
+--   local msg = wezterm.json_encode({
+--     event = 'status_update',
+--     pane_id = pane:pane_id(),
+--     domain = pane:get_domain_name(),
+--     cursor = pane:get_cursor_position(),
+--     dimensions = pane:get_dimensions(),
+--     title = pane:get_title(),
+--     is_alt_screen = pane:is_alt_screen_active(),
+--   })
+--   -- Send via socket (non-blocking)
+-- end)
 
+-- STILL ACTIVE: user-var-changed forwarding
 wezterm.on('user-var-changed', function(window, pane, name, value)
   if name:match('^wa%-') then
     -- Forward to wa daemon

@@ -3,6 +3,16 @@
 //! Provides idempotent patching of WezTerm configuration files and shell rc files
 //! to enable wa's user-var forwarding lane and OSC 133 prompt markers.
 //!
+//! # Architecture (v0.2.0+)
+//!
+//! The WezTerm integration uses a polling-based architecture:
+//! - **Pane metadata**: Obtained via `wezterm cli list` only when needed
+//! - **Alt-screen detection**: Via escape sequence parsing (see `screen_state.rs`)
+//! - **User-var signaling**: Via Lua `user-var-changed` hook (still active)
+//!
+//! The Lua `update-status` hook was removed in v0.2.0 due to performance issues
+//! (it fired at ~60Hz, causing continuous Lua interpreter invocations and IPC overhead).
+//!
 //! # Markers
 //!
 //! Managed blocks are identified by `WA-BEGIN` and `WA-END` markers.

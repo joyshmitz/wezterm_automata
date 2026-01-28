@@ -41,6 +41,7 @@
 pub mod accounts;
 pub mod approval;
 pub mod caut;
+pub mod circuit_breaker;
 pub mod config;
 pub mod crash;
 pub mod dry_run;

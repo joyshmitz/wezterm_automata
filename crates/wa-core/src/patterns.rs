@@ -71,6 +71,9 @@ pub struct Detection {
     pub extracted: serde_json::Value,
     /// Original matched text
     pub matched_text: String,
+    /// Byte offsets in the source text
+    #[serde(skip)]
+    pub span: (usize, usize),
 }
 
 /// Options for explain-match trace generation.
@@ -213,6 +216,8 @@ pub struct DetectionContext {
     seen_order: VecDeque<String>,
     /// Time-to-live for deduplication (default: 5 minutes)
     pub ttl: Duration,
+    /// Tail buffer from previous detection (for cross-segment matching)
+    pub tail_buffer: String,
 }
 
 impl Default for DetectionContext {
@@ -226,6 +231,8 @@ impl DetectionContext {
     const MAX_SEEN_KEYS: usize = 1000;
     /// Default deduplication TTL
     const DEFAULT_TTL: Duration = Duration::from_secs(5 * 60);
+    /// Maximum tail buffer size (2KB)
+    const MAX_TAIL_SIZE: usize = 2048;
 
     /// Create a new empty detection context
     #[must_use]
@@ -236,6 +243,7 @@ impl DetectionContext {
             seen_keys: HashMap::new(),
             seen_order: VecDeque::new(),
             ttl: Self::DEFAULT_TTL,
+            tail_buffer: String::new(),
         }
     }
 
@@ -248,6 +256,7 @@ impl DetectionContext {
             seen_keys: HashMap::new(),
             seen_order: VecDeque::new(),
             ttl: Self::DEFAULT_TTL,
+            tail_buffer: String::new(),
         }
     }
 
@@ -260,6 +269,7 @@ impl DetectionContext {
             seen_keys: HashMap::new(),
             seen_order: VecDeque::new(),
             ttl: Self::DEFAULT_TTL,
+            tail_buffer: String::new(),
         }
     }
 
@@ -1251,7 +1261,7 @@ impl PatternEngine {
         };
 
         let mut candidate_rules: HashSet<usize> = HashSet::new();
-        let mut matched_anchor_by_rule: HashMap<usize, String> = HashMap::new();
+        let mut matched_anchor_by_rule: HashMap<usize, (String, (usize, usize))> = HashMap::new();
 
         #[cfg(test)]
         {
@@ -1283,7 +1293,7 @@ impl PatternEngine {
                     candidate_rules.insert(idx);
                     matched_anchor_by_rule
                         .entry(idx)
-                        .or_insert_with(|| anchor.clone());
+                        .or_insert_with(|| (anchor.clone(), (matched.start(), matched.end())));
                 }
             }
         }
@@ -1299,7 +1309,7 @@ impl PatternEngine {
         for idx in indices {
             let compiled = &index.compiled_rules[idx];
             let rule = &compiled.def;
-            let fallback_anchor = matched_anchor_by_rule
+            let (fallback_anchor, fallback_span) = matched_anchor_by_rule
                 .get(&idx)
                 .cloned()
                 .unwrap_or_default();
@@ -1320,9 +1330,10 @@ impl PatternEngine {
                         }
                     }
 
-                    let matched_text = captures
-                        .get(0)
-                        .map_or_else(|| fallback_anchor.clone(), |m| m.as_str().to_string());
+                    let (matched_text, span) = captures.get(0).map_or_else(
+                        || (fallback_anchor.clone(), fallback_span),
+                        |m| (m.as_str().to_string(), (m.start(), m.end())),
+                    );
 
                     detections.push(Detection {
                         rule_id: rule.id.clone(),
@@ -1332,6 +1343,7 @@ impl PatternEngine {
                         confidence: 0.95,
                         extracted: serde_json::Value::Object(extracted),
                         matched_text,
+                        span,
                     });
                 }
             } else {
@@ -1343,6 +1355,7 @@ impl PatternEngine {
                     confidence: 0.6,
                     extracted: serde_json::Value::Object(serde_json::Map::new()),
                     matched_text: fallback_anchor,
+                    span: fallback_span,
                 });
             }
         }
@@ -1358,6 +1371,13 @@ impl PatternEngine {
     /// - Unknown agent type allows all rules (conservative fallback)
     ///
     /// Detections are also deduplicated based on rule_id + extracted values.
+    ///
+    /// # Cross-Segment Matching
+    ///
+    /// This method automatically handles cross-segment matching by buffering
+    /// the tail of the text in `context.tail_buffer`. The next call will
+    /// prepend this buffer to the input text to catch patterns split across segments.
+    /// Detections that fall entirely within the overlap region are filtered out.
     #[must_use]
     pub fn detect_with_context(
         &self,
@@ -1368,12 +1388,48 @@ impl PatternEngine {
             return Vec::new();
         }
 
-        // Get all potential detections first
-        let all_detections = self.detect(text);
+        // Combine with tail buffer for cross-segment matching
+        let (input_text, overlap_len) = if context.tail_buffer.is_empty() {
+            (std::borrow::Cow::Borrowed(text), 0)
+        } else {
+            let mut s = String::with_capacity(context.tail_buffer.len() + text.len());
+            s.push_str(&context.tail_buffer);
+            s.push_str(text);
+            (std::borrow::Cow::Owned(s), context.tail_buffer.len())
+        };
 
-        // Filter by agent type and dedup
+        // Update tail buffer for next time
+        // We keep the last N chars
+        let full_len = input_text.len();
+        if full_len > DetectionContext::MAX_TAIL_SIZE {
+            // Take slice from end, respecting char boundaries
+            let mut start = full_len - DetectionContext::MAX_TAIL_SIZE;
+            while !input_text.is_char_boundary(start) && start < full_len {
+                start += 1;
+            }
+            context.tail_buffer = input_text[start..].to_string();
+        } else {
+            context.tail_buffer = input_text.to_string();
+        }
+
+        // Get all potential detections first
+        let all_detections = self.detect(&input_text);
+
+        // Filter by agent type, span (overlap), and dedup
         let mut result = Vec::new();
         for detection in all_detections {
+            // Overlap filtering: skip if match is entirely within the overlap region
+            // (meaning we presumably detected it in the previous segment)
+            if overlap_len > 0 && detection.span.1 <= overlap_len {
+                continue;
+            }
+
+            // Adjust matched_text to be just the part relevant to the new segment?
+            // No, the match is valid. But if we report it, we report the full match.
+            // But wait, if we use `input_text` (Cow), `matched_text` is from that.
+            // If `matched_text` spans across overlap, it contains part of tail.
+            // This is correct.
+
             // State gating: filter by agent type if specified
             if let Some(expected_agent) = context.agent_type {
                 if !Self::rule_applies_to_agent(&detection, expected_agent) {

@@ -296,28 +296,32 @@ test_risk_decision_mapping() {
 test_risk_json_schema() {
     log_test "Risk JSON Schema Validation"
 
-    local output
-    output=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk_score_json_schema risk_factor_json_schema decision_context_risk -- --nocapture 2>&1 || true)
+    # Run each test separately since cargo test only accepts one filter
+    local output1 output2 output3 output
+    output1=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk_score_json_schema -- --nocapture 2>&1 || true)
+    output2=$(cd "$PROJECT_ROOT" && cargo test -p wa-core risk_factor_json_schema -- --nocapture 2>&1 || true)
+    output3=$(cd "$PROJECT_ROOT" && cargo test -p wa-core decision_context_risk -- --nocapture 2>&1 || true)
+    output="$output1"$'\n'"$output2"$'\n'"$output3"
 
     e2e_add_file "risk_json_schema" "schema_tests.txt" "$output"
 
     local all_passed=true
 
-    if echo "$output" | grep -q "risk_score_json_schema_has_required_fields ... ok"; then
+    if echo "$output1" | grep -q "risk_score_json_schema_has_required_fields ... ok"; then
         log_pass "RiskScore JSON has required fields (score, factors, summary)"
     else
         log_fail "RiskScore JSON schema validation failed"
         all_passed=false
     fi
 
-    if echo "$output" | grep -q "risk_factor_json_schema_has_required_fields ... ok"; then
+    if echo "$output2" | grep -q "risk_factor_json_schema_has_required_fields ... ok"; then
         log_pass "RiskFactor JSON has required fields (id, weight, explanation)"
     else
         log_fail "RiskFactor JSON schema validation failed"
         all_passed=false
     fi
 
-    if echo "$output" | grep -q "decision_context_risk_json_is_valid ... ok"; then
+    if echo "$output3" | grep -q "decision_context_risk_json_is_valid ... ok"; then
         log_pass "DecisionContext includes valid risk object"
     else
         log_fail "DecisionContext risk validation failed"

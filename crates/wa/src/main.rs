@@ -5,7 +5,7 @@
 #![forbid(unsafe_code)]
 
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -602,6 +602,32 @@ enum SetupCommands {
 
     /// Generate WezTerm config additions
     Config,
+
+    /// Patch wezterm.lua with user-var forwarding (idempotent)
+    Patch {
+        /// Remove the wa block instead of adding it
+        #[arg(long)]
+        remove: bool,
+
+        /// Custom path to wezterm.lua (auto-detected if not specified)
+        #[arg(long)]
+        config_path: Option<PathBuf>,
+    },
+
+    /// Install OSC 133 prompt markers in shell rc file (idempotent)
+    Shell {
+        /// Remove the wa block instead of adding it
+        #[arg(long)]
+        remove: bool,
+
+        /// Shell type: bash, zsh, or fish (auto-detected from $SHELL if not specified)
+        #[arg(long, value_parser = ["bash", "zsh", "fish"])]
+        shell: Option<String>,
+
+        /// Custom path to rc file (auto-detected if not specified)
+        #[arg(long)]
+        rc_path: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1088,6 +1114,24 @@ struct HumanSendData {
     verification_error: Option<String>,
     no_paste: bool,
     no_newline: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IpcPaneState {
+    pane_id: u64,
+    known: bool,
+    #[serde(default)]
+    observed: Option<bool>,
+    #[serde(default)]
+    alt_screen: Option<bool>,
+    #[serde(default)]
+    last_status_at: Option<i64>,
+    #[serde(default)]
+    in_gap: Option<bool>,
+    #[serde(default)]
+    cursor_alt_screen: Option<bool>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// Search result data for robot mode
@@ -1661,10 +1705,178 @@ async fn evaluate_robot_approve(
     })
 }
 
+const SEND_OSC_SEGMENT_LIMIT: usize = 200;
+
+struct CapabilityResolution {
+    capabilities: wa_core::policy::PaneCapabilities,
+    warnings: Vec<String>,
+}
+
+async fn derive_osc_state_from_storage(
+    storage: &wa_core::storage::StorageHandle,
+    pane_id: u64,
+) -> Result<Option<wa_core::ingest::Osc133State>, String> {
+    let segments = storage
+        .get_segments(pane_id, SEND_OSC_SEGMENT_LIMIT)
+        .await
+        .map_err(|e| format!("failed to read segments: {e}"))?;
+    if segments.is_empty() {
+        return Ok(None);
+    }
+
+    let mut state = wa_core::ingest::Osc133State::new();
+    for segment in segments.iter().rev() {
+        wa_core::ingest::process_osc133_output(&mut state, &segment.content);
+    }
+
+    if state.markers_seen == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(state))
+}
+
+#[cfg(unix)]
+async fn fetch_pane_state_from_ipc(
+    socket_path: &Path,
+    pane_id: u64,
+) -> Result<Option<IpcPaneState>, String> {
+    let client = wa_core::ipc::IpcClient::new(socket_path);
+    match client.pane_state(pane_id).await {
+        Ok(response) => {
+            if !response.ok {
+                let detail = response
+                    .error
+                    .unwrap_or_else(|| "unknown error".to_string());
+                return Err(detail);
+            }
+            if let Some(data) = response.data {
+                serde_json::from_value::<IpcPaneState>(data)
+                    .map(Some)
+                    .map_err(|e| format!("invalid pane state payload: {e}"))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn fetch_pane_state_from_ipc(
+    _socket_path: &Path,
+    _pane_id: u64,
+) -> Result<Option<IpcPaneState>, String> {
+    Err("IPC not supported on this platform".to_string())
+}
+
+fn resolve_alt_screen_state(state: &IpcPaneState) -> Option<bool> {
+    if !state.known {
+        return None;
+    }
+    if let Some(cursor_state) = state.cursor_alt_screen {
+        return Some(cursor_state);
+    }
+    if state.last_status_at.is_some() {
+        return state.alt_screen;
+    }
+    None
+}
+
+async fn resolve_pane_capabilities(
+    pane_id: u64,
+    storage: Option<&wa_core::storage::StorageHandle>,
+    ipc_socket_path: Option<&Path>,
+) -> CapabilityResolution {
+    let mut warnings = Vec::new();
+    let mut osc_state = None;
+
+    if let Some(storage) = storage {
+        match derive_osc_state_from_storage(storage, pane_id).await {
+            Ok(state) => osc_state = state,
+            Err(err) => warnings.push(format!("OSC 133 state unavailable: {err}")),
+        }
+    } else {
+        warnings.push("Storage unavailable; prompt state unknown.".to_string());
+    }
+
+    let mut alt_screen = None;
+    let mut in_gap = true;
+    let mut gap_known = false;
+
+    if let Some(socket_path) = ipc_socket_path {
+        match fetch_pane_state_from_ipc(socket_path, pane_id).await {
+            Ok(Some(state)) => {
+                if state.pane_id != pane_id {
+                    warnings.push(format!(
+                        "Watcher returned state for pane {} (expected {})",
+                        state.pane_id, pane_id
+                    ));
+                }
+                if !state.known {
+                    let reason = state
+                        .reason
+                        .as_ref()
+                        .map(String::as_str)
+                        .unwrap_or("unknown");
+                    warnings.push(format!("Watcher has no state for this pane ({reason})."));
+                } else if state.observed == Some(false) {
+                    warnings.push(
+                        "Pane is not observed by watcher; state may be incomplete.".to_string(),
+                    );
+                }
+                alt_screen = resolve_alt_screen_state(&state);
+                if state.in_gap.is_some() {
+                    gap_known = true;
+                    in_gap = state.in_gap.unwrap_or(true);
+                }
+                if alt_screen.is_none() {
+                    warnings
+                        .push("Alt-screen state unknown; approval may be required.".to_string());
+                }
+                if in_gap {
+                    if gap_known {
+                        warnings.push(
+                            "Recent capture gap detected; approval may be required.".to_string(),
+                        );
+                    } else {
+                        warnings.push(
+                            "Capture continuity unknown; treating as recent gap.".to_string(),
+                        );
+                    }
+                } else if !gap_known {
+                    warnings
+                        .push("Capture continuity unknown; treating as recent gap.".to_string());
+                }
+            }
+            Ok(None) => {
+                warnings.push("Watcher IPC returned no pane state.".to_string());
+            }
+            Err(err) => {
+                warnings.push(format!("Watcher IPC unavailable: {err}"));
+            }
+        }
+    } else {
+        warnings.push("IPC socket unavailable; alt-screen/gap unknown.".to_string());
+    }
+
+    let capabilities = wa_core::policy::PaneCapabilities::from_ingest_state(
+        osc_state.as_ref(),
+        alt_screen,
+        in_gap,
+    );
+
+    CapabilityResolution {
+        capabilities,
+        warnings,
+    }
+}
+
 fn build_send_dry_run_report(
     command_ctx: &wa_core::dry_run::CommandContext,
     pane_id: u64,
     pane_info: Option<&wa_core::wezterm::PaneInfo>,
+    capabilities: Option<&wa_core::policy::PaneCapabilities>,
     text: &str,
     no_paste: bool,
     wait_for: Option<&str>,
@@ -1695,7 +1907,10 @@ fn build_send_dry_run_report(
     }
 
     // Policy evaluation (best-effort; uses config defaults + assumed prompt state)
-    let capabilities = PaneCapabilities::prompt();
+    let capabilities_opt = capabilities;
+    let capabilities = capabilities_opt
+        .cloned()
+        .unwrap_or_else(PaneCapabilities::prompt);
     let eval = build_send_policy_evaluation(
         (0, config.safety.rate_limit_per_pane),
         capabilities.prompt_active,
@@ -1703,6 +1918,20 @@ fn build_send_dry_run_report(
         capabilities.has_recent_gap,
     );
     ctx.set_policy_evaluation(eval);
+
+    if let Some(provided_caps) = capabilities_opt {
+        if provided_caps.alt_screen == Some(true) {
+            ctx.add_warning("Pane is in alt-screen; send will be denied by policy.");
+        } else if provided_caps.alt_screen.is_none() {
+            ctx.add_warning("Alt-screen state unknown; approval may be required.");
+        }
+        if provided_caps.has_recent_gap {
+            ctx.add_warning("Recent capture gap detected; approval may be required.");
+        }
+        if config.safety.require_prompt_active && !provided_caps.prompt_active {
+            ctx.add_warning("Prompt not active; approval or denial likely.");
+        }
+    }
 
     // Expected actions
     ctx.add_action(create_send_action(1, pane_id, text.len()));
@@ -2514,7 +2743,7 @@ fn is_structured_uservar_name(name: &str) -> bool {
 
 fn validate_uservar_request(pane_id: u64, name: &str, value: &str) -> Result<(), String> {
     // Maximum message size for IPC (128KB) - mirrors wa_core::ipc::MAX_MESSAGE_SIZE
-    const MAX_MESSAGE_SIZE: usize = 131072;
+    const MAX_MESSAGE_SIZE: usize = 131_072;
 
     if name.trim().is_empty() {
         return Err("user-var name cannot be empty".to_string());
@@ -3054,24 +3283,38 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             if command_ctx.is_dry_run() {
                                 let wezterm = wa_core::wezterm::WeztermClient::new();
                                 let pane_info = wezterm.get_pane(pane_id).await.ok();
-                                let report = build_send_dry_run_report(
+                                let storage = wa_core::storage::StorageHandle::new(
+                                    &ctx.effective.paths.db_path,
+                                )
+                                .await
+                                .ok();
+                                let ipc_socket = Path::new(&ctx.effective.paths.ipc_socket_path);
+                                let resolution = resolve_pane_capabilities(
+                                    pane_id,
+                                    storage.as_ref(),
+                                    Some(ipc_socket),
+                                )
+                                .await;
+                                let mut report = build_send_dry_run_report(
                                     &command_ctx,
                                     pane_id,
                                     pane_info.as_ref(),
+                                    Some(&resolution.capabilities),
                                     &text,
                                     false,
                                     wait_for.as_deref(),
                                     timeout_secs,
                                     &config,
                                 );
+                                report.warnings.extend(resolution.warnings);
                                 let response =
                                     RobotResponse::success(report.redacted(), elapsed_ms(start));
                                 print_robot_response(&response, format, stats)?;
                             } else {
                                 use wa_core::approval::ApprovalStore;
                                 use wa_core::policy::{
-                                    ActionKind, ActorKind, InjectionResult, PaneCapabilities,
-                                    PolicyDecision, PolicyEngine, PolicyInput,
+                                    ActionKind, ActorKind, InjectionResult, PolicyDecision,
+                                    PolicyEngine, PolicyInput,
                                 };
                                 use wa_core::wezterm::{PaneWaiter, WaitMatcher, WaitOptions};
 
@@ -3122,8 +3365,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 .with_command_gate_config(config.safety.command_gate.clone())
                                 .with_policy_rules(config.safety.rules.clone());
 
-                                // NOTE: Until ingest state is wired into CLI, assume prompt state.
-                                let capabilities = PaneCapabilities::prompt();
+                                let ipc_socket = Path::new(&ctx.effective.paths.ipc_socket_path);
+                                let resolution = resolve_pane_capabilities(
+                                    pane_id,
+                                    Some(&storage),
+                                    Some(ipc_socket),
+                                )
+                                .await;
+                                let capabilities = resolution.capabilities;
 
                                 let summary = engine.redact_secrets(&text);
                                 let input =
@@ -5048,16 +5297,26 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             if command_ctx.is_dry_run() {
                 let wezterm = wa_core::wezterm::WeztermClient::new();
                 let pane_info = wezterm.get_pane(pane_id).await.ok();
-                let report = build_send_dry_run_report(
+                let db_path = layout.db_path.to_string_lossy();
+                let storage = wa_core::storage::StorageHandle::new(&db_path).await.ok();
+                let resolution = resolve_pane_capabilities(
+                    pane_id,
+                    storage.as_ref(),
+                    Some(layout.ipc_socket_path.as_path()),
+                )
+                .await;
+                let mut report = build_send_dry_run_report(
                     &command_ctx,
                     pane_id,
                     pane_info.as_ref(),
+                    Some(&resolution.capabilities),
                     &text,
                     no_paste,
                     wait_for.as_deref(),
                     timeout_secs,
                     &config,
                 );
+                report.warnings.extend(resolution.warnings);
                 if emit_json {
                     println!("{}", serde_json::to_string_pretty(&report.redacted())?);
                 } else {
@@ -5120,8 +5379,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 .with_command_gate_config(config.safety.command_gate.clone())
                 .with_policy_rules(config.safety.rules.clone());
 
-                // NOTE: Until ingest state is wired into CLI, assume prompt state.
-                let capabilities = wa_core::policy::PaneCapabilities::prompt();
+                let resolution = resolve_pane_capabilities(
+                    pane_id,
+                    Some(&storage),
+                    Some(layout.ipc_socket_path.as_path()),
+                )
+                .await;
+                let capabilities = resolution.capabilities;
 
                 let summary = engine.redact_secrets(&text);
                 let input = wa_core::policy::PolicyInput::new(
@@ -5929,6 +6193,119 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 println!("--     args = {{ 'wa', 'status' }},");
                 println!("--   }} }},");
                 println!("-- }}");
+            }
+            SetupCommands::Patch {
+                remove,
+                config_path,
+            } => {
+                use wa_core::setup;
+
+                println!("wa setup patch - WezTerm User-Var Forwarding\n");
+
+                let result = if remove {
+                    match config_path {
+                        Some(path) => setup::unpatch_wezterm_config_at(&path),
+                        None => {
+                            let path = setup::locate_wezterm_config()?;
+                            setup::unpatch_wezterm_config_at(&path)
+                        }
+                    }
+                } else {
+                    match config_path {
+                        Some(path) => setup::patch_wezterm_config_at(&path),
+                        None => setup::patch_wezterm_config(),
+                    }
+                };
+
+                match result {
+                    Ok(patch_result) => {
+                        if patch_result.modified {
+                            println!("✓ {}", patch_result.message);
+                            if let Some(backup) = patch_result.backup_path {
+                                println!("  Backup: {}", backup.display());
+                            }
+                            println!("\nRestart WezTerm to apply the changes.");
+                        } else {
+                            println!("✓ {}", patch_result.message);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            SetupCommands::Shell {
+                remove,
+                shell,
+                rc_path,
+            } => {
+                use wa_core::setup::{self, ShellType};
+
+                // Determine shell type
+                let shell_type = match shell.as_deref() {
+                    Some("bash") => ShellType::Bash,
+                    Some("zsh") => ShellType::Zsh,
+                    Some("fish") => ShellType::Fish,
+                    Some(other) => {
+                        eprintln!("Error: Unsupported shell: {other}");
+                        eprintln!("Supported shells: bash, zsh, fish");
+                        std::process::exit(1);
+                    }
+                    None => {
+                        // Auto-detect from $SHELL
+                        match ShellType::detect() {
+                            Some(st) => {
+                                println!("Detected shell: {}\n", st.name());
+                                st
+                            }
+                            None => {
+                                eprintln!("Error: Could not detect shell from $SHELL");
+                                eprintln!("Please specify --shell bash|zsh|fish");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                };
+
+                println!(
+                    "wa setup shell - OSC 133 Prompt Markers ({})\n",
+                    shell_type.name()
+                );
+
+                let result = if remove {
+                    match rc_path {
+                        Some(path) => setup::unpatch_shell_rc_at(&path),
+                        None => {
+                            let path = setup::locate_shell_rc(shell_type)?;
+                            setup::unpatch_shell_rc_at(&path)
+                        }
+                    }
+                } else {
+                    match rc_path {
+                        Some(path) => setup::patch_shell_rc_at(&path, shell_type),
+                        None => setup::patch_shell_rc(shell_type),
+                    }
+                };
+
+                match result {
+                    Ok(patch_result) => {
+                        if patch_result.modified {
+                            println!("✓ {}", patch_result.message);
+                            if let Some(backup) = patch_result.backup_path {
+                                println!("  Backup: {}", backup.display());
+                            }
+                            println!("\nSource your shell config or restart your shell to apply:");
+                            println!("  source {}", patch_result.config_path.display());
+                        } else {
+                            println!("✓ {}", patch_result.message);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
         },
 
@@ -7190,6 +7567,7 @@ mod tests {
             &command_ctx,
             1,
             None,
+            None,
             "echo hi",
             true,
             Some("READY"),
@@ -7337,6 +7715,7 @@ mod tests {
             &command_ctx,
             1,
             None,
+            None,
             "sk-abc123456789012345678901234567890123456789012345678901",
             false,
             None,
@@ -7358,7 +7737,7 @@ mod tests {
     #[test]
     fn validate_uservar_rejects_oversize_payload() {
         // MAX_MESSAGE_SIZE is 131072 (128KB) - must match validate_uservar_request
-        const MAX_MESSAGE_SIZE: usize = 131072;
+        const MAX_MESSAGE_SIZE: usize = 131_072;
         let name = "wa_event";
         let value = "a".repeat(MAX_MESSAGE_SIZE);
         let err = validate_uservar_request(1, name, &value).unwrap_err();

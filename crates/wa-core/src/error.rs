@@ -154,6 +154,10 @@ pub enum Error {
     /// Runtime errors (hot reload, channel failures, etc.)
     #[error("Runtime error: {0}")]
     Runtime(String),
+
+    /// Setup/configuration automation errors
+    #[error("Setup error: {0}")]
+    SetupError(String),
 }
 
 impl Error {
@@ -186,6 +190,12 @@ impl Error {
                 Remediation::new("Restart the watcher or retry the command.")
                     .command("Diagnostics", "wa doctor")
                     .alternative("If the issue persists, restart wa watch."),
+            ),
+            Self::SetupError(_) => Some(
+                Remediation::new("Check WezTerm configuration and filesystem permissions.")
+                    .command("Locate config", "ls -la ~/.config/wezterm/ ~/.wezterm.lua 2>/dev/null || echo 'No config found'")
+                    .command("Diagnostics", "wa doctor")
+                    .alternative("Create a wezterm.lua config file if it doesn't exist."),
             ),
         }
     }

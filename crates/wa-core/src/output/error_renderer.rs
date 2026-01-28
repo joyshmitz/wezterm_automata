@@ -74,6 +74,7 @@ impl ErrorRenderer {
             Error::Io(_) => "WA-9002",
             Error::Json(_) => "WA-9003",
             Error::Runtime(_) => "WA-9001",
+            Error::SetupError(_) => "WA-6001",
         }
     }
 

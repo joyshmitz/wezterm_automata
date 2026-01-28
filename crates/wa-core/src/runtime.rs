@@ -709,6 +709,13 @@ impl ObservationRuntime {
                                 c.pane_id = Some(pane_id);
                                 c
                             });
+
+                            // If this was a gap/discontinuity, clear the tail buffer because
+                            // previous context is no longer valid or contiguous.
+                            if persisted.gap.is_some() {
+                                ctx.tail_buffer.clear();
+                            }
+
                             let detections = pattern_engine.detect_with_context(&content, ctx);
                             drop(contexts);
                             detections

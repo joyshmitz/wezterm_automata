@@ -550,16 +550,17 @@ async fn handle_pane_state(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse
         }));
     };
 
-    let registry = registry_lock.read().await;
-    let Some(entry) = registry.get_entry(pane_id) else {
-        return IpcResponse::ok_with_data(serde_json::json!({
-            "pane_id": pane_id,
-            "known": false,
-            "reason": "unknown_pane",
-        }));
+    let (entry, cursor) = {
+        let registry = registry_lock.read().await;
+        let Some(entry) = registry.get_entry(pane_id) else {
+            return IpcResponse::ok_with_data(serde_json::json!({
+                "pane_id": pane_id,
+                "known": false,
+                "reason": "unknown_pane",
+            }));
+        };
+        (entry.clone(), registry.get_cursor(pane_id).cloned())
     };
-
-    let cursor = registry.get_cursor(pane_id);
 
     IpcResponse::ok_with_data(serde_json::json!({
         "pane_id": pane_id,
@@ -567,8 +568,8 @@ async fn handle_pane_state(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse
         "observed": entry.should_observe(),
         "alt_screen": entry.is_alt_screen,
         "last_status_at": entry.last_status_at,
-        "in_gap": cursor.map(|c| c.in_gap),
-        "cursor_alt_screen": cursor.map(|c| c.in_alt_screen),
+        "in_gap": cursor.as_ref().map(|c| c.in_gap),
+        "cursor_alt_screen": cursor.as_ref().map(|c| c.in_alt_screen),
     }))
 }
 
@@ -835,8 +836,10 @@ impl IpcClient {
 #[allow(clippy::items_after_statements, clippy::significant_drop_tightening)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::sync::RwLock;
 
     #[test]
     fn ipc_response_ok_serializes() {
@@ -871,6 +874,14 @@ mod tests {
         let request = IpcRequest::Ping;
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"type\":\"ping\""));
+    }
+
+    #[test]
+    fn ipc_request_pane_state_serializes() {
+        let request = IpcRequest::PaneState { pane_id: 42 };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"type\":\"pane_state\""));
+        assert!(json.contains("\"pane_id\":42"));
     }
 
     #[test]
@@ -915,6 +926,108 @@ mod tests {
         assert!(response.ok);
 
         // Shutdown
+        let _ = shutdown_tx.send(()).await;
+        let _ = server_handle.await;
+    }
+
+    fn make_pane_info(pane_id: u64) -> crate::wezterm::PaneInfo {
+        crate::wezterm::PaneInfo {
+            pane_id,
+            tab_id: 1,
+            window_id: 1,
+            domain_id: None,
+            domain_name: Some("local".to_string()),
+            workspace: None,
+            size: None,
+            rows: None,
+            cols: None,
+            title: None,
+            cwd: None,
+            tty_name: None,
+            cursor_x: None,
+            cursor_y: None,
+            cursor_visibility: None,
+            left_col: None,
+            top_row: None,
+            is_active: false,
+            is_zoomed: false,
+            extra: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_pane_state_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+
+        let server = IpcServer::bind(&socket_path).await.unwrap();
+        let event_bus = Arc::new(EventBus::new(100));
+        let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+
+        {
+            let mut registry = registry.write().await;
+            registry.discovery_tick(vec![make_pane_info(7)]);
+            if let Some(entry) = registry.get_entry_mut(7) {
+                entry.is_alt_screen = true;
+                entry.last_status_at = Some(123);
+            }
+            if let Some(cursor) = registry.get_cursor_mut(7) {
+                cursor.in_gap = true;
+                cursor.in_alt_screen = true;
+            }
+        }
+
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let server_handle = tokio::spawn(async move {
+            server
+                .run_with_registry(event_bus, registry, shutdown_rx)
+                .await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let client = IpcClient::new(&socket_path);
+        let response = client.pane_state(7).await.unwrap();
+        assert!(response.ok);
+        let data = response.data.unwrap();
+        assert_eq!(
+            data.get("pane_id").and_then(serde_json::Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            data.get("known").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            data.get("observed").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            data.get("alt_screen").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            data.get("cursor_alt_screen").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            data.get("in_gap").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(data.get("last_status_at").is_some());
+
+        let response = client.pane_state(999).await.unwrap();
+        assert!(response.ok);
+        let data = response.data.unwrap();
+        assert_eq!(
+            data.get("known").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            data.get("reason").and_then(|v| v.as_str()),
+            Some("unknown_pane")
+        );
+
         let _ = shutdown_tx.send(()).await;
         let _ = server_handle.await;
     }

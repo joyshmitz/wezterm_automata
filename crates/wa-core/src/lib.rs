@@ -59,6 +59,7 @@ pub mod patterns;
 pub mod plan;
 pub mod policy;
 pub mod runtime;
+pub mod setup;
 pub mod storage;
 pub mod suggestions;
 pub mod tailer;

@@ -49,8 +49,7 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Create a temp database path.
@@ -208,13 +207,9 @@ async fn populate_multi_pane(
 /// Get database file size.
 fn get_db_size(db_path: &str) -> u64 {
     // Main DB + WAL + SHM
-    let main_size = fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
-    let wal_size = fs::metadata(format!("{db_path}-wal"))
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let shm_size = fs::metadata(format!("{db_path}-shm"))
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let main_size = fs::metadata(db_path).map_or(0, |m| m.len());
+    let wal_size = fs::metadata(format!("{db_path}-wal")).map_or(0, |m| m.len());
+    let shm_size = fs::metadata(format!("{db_path}-shm")).map_or(0, |m| m.len());
     main_size + wal_size + shm_size
 }
 

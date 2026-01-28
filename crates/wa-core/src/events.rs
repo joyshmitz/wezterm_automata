@@ -769,6 +769,7 @@ mod tests {
             confidence: 0.9,
             extracted: serde_json::json!({}),
             matched_text: "anchor".to_string(),
+            span: (0, 0),
         };
 
         let _ = bus.publish(Event::PatternDetected {

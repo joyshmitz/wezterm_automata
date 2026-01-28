@@ -11,10 +11,8 @@
 //! - Server responds: `{"ok":true}\n` or `{"ok":false,"error":"..."}\n`
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{RwLock, mpsc};
@@ -28,217 +26,10 @@ pub const IPC_SOCKET_NAME: &str = "ipc.sock";
 /// Maximum message size in bytes (128KB).
 pub const MAX_MESSAGE_SIZE: usize = 131_072;
 
-/// Maximum title length in status updates (1KB).
-pub const MAX_TITLE_LENGTH: usize = 1024;
-
-/// Current schema version for status updates.
-pub const STATUS_UPDATE_SCHEMA_VERSION: u32 = 0;
-
-/// Minimum interval between status updates for rate limiting (milliseconds).
-pub const STATUS_UPDATE_MIN_INTERVAL_MS: u64 = 50;
-
-// =============================================================================
-// Status Update Schema (v0)
-// =============================================================================
-
-/// Cursor position (row and column)
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CursorPosition {
-    /// Row (0-indexed)
-    pub row: u32,
-    /// Column (0-indexed)
-    pub col: u32,
-}
-
-/// Pane dimensions (rows and columns)
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PaneDimensions {
-    /// Number of rows
-    pub rows: u32,
-    /// Number of columns
-    pub cols: u32,
-}
-
-/// Status update payload for pane state changes.
-///
-/// This is a minimal, versioned payload sent from WezTerm Lua hooks to update
-/// pane state without requiring full text capture. Useful for tracking cursor
-/// position, dimensions, and alt-screen state in real-time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatusUpdate {
-    /// Pane ID (required)
-    pub pane_id: u64,
-
-    /// Domain name (optional, e.g., "local", "SSH:hostname")
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub domain: Option<String>,
-
-    /// Pane title (optional, bounded to MAX_TITLE_LENGTH)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-
-    /// Cursor position (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<CursorPosition>,
-
-    /// Pane dimensions (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dimensions: Option<PaneDimensions>,
-
-    /// Whether pane is in alternate screen buffer (e.g., vim, less)
-    #[serde(default)]
-    pub is_alt_screen: bool,
-
-    /// Whether pane is the active/focused pane (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_active: Option<bool>,
-
-    /// Timestamp in epoch milliseconds (required)
-    pub ts: i64,
-
-    /// Schema version for forward compatibility (required)
-    pub schema_version: u32,
-}
-
-impl StatusUpdate {
-    /// Validate the status update payload.
-    ///
-    /// Returns an error message if validation fails, None if valid.
-    #[must_use]
-    pub fn validate(&self) -> Option<String> {
-        // Check schema version
-        if self.schema_version > STATUS_UPDATE_SCHEMA_VERSION {
-            return Some(format!(
-                "unsupported schema_version {}, max supported is {}",
-                self.schema_version, STATUS_UPDATE_SCHEMA_VERSION
-            ));
-        }
-
-        // Check title length
-        if let Some(ref title) = self.title {
-            if title.len() > MAX_TITLE_LENGTH {
-                return Some(format!(
-                    "title exceeds max length ({} > {})",
-                    title.len(),
-                    MAX_TITLE_LENGTH
-                ));
-            }
-        }
-
-        // Validate timestamp is reasonable (not too far in future)
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|d| i64::try_from(d.as_millis()).ok())
-            .unwrap_or(0);
-
-        // Allow up to 1 minute in the future (clock skew tolerance)
-        if self.ts > now_ms + 60_000 {
-            return Some("timestamp is too far in the future".to_string());
-        }
-
-        None
-    }
-
-    /// Check if this update contains a material state change compared to previous state.
-    ///
-    /// Material changes are:
-    /// - Alt-screen toggle
-    /// - Title change
-    /// - Significant cursor movement (more than 1 row/col)
-    #[must_use]
-    pub fn is_material_change(&self, prev: Option<&Self>) -> bool {
-        let Some(prev) = prev else {
-            return true; // First update is always material
-        };
-
-        // Alt-screen toggle is always material
-        if self.is_alt_screen != prev.is_alt_screen {
-            return true;
-        }
-
-        // Title change is material
-        if self.title != prev.title {
-            return true;
-        }
-
-        // Dimensions change is material
-        if self.dimensions != prev.dimensions {
-            return true;
-        }
-
-        // Active state change is material
-        if self.is_active != prev.is_active {
-            return true;
-        }
-
-        false
-    }
-}
-
-/// Rate limiter for status updates per pane.
-///
-/// Coalesces rapid updates to prevent event bus spam while ensuring
-/// material state changes are not dropped.
-pub struct StatusUpdateRateLimiter {
-    /// Last update time per pane (epoch instant)
-    last_update: HashMap<u64, Instant>,
-    /// Last status update per pane (for deduplication)
-    last_status: HashMap<u64, StatusUpdate>,
-    /// Minimum interval between updates
-    min_interval: std::time::Duration,
-}
-
-impl Default for StatusUpdateRateLimiter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl StatusUpdateRateLimiter {
-    /// Create a new rate limiter with default settings.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            last_update: HashMap::new(),
-            last_status: HashMap::new(),
-            min_interval: std::time::Duration::from_millis(STATUS_UPDATE_MIN_INTERVAL_MS),
-        }
-    }
-
-    /// Check if an update should be processed or coalesced.
-    ///
-    /// Returns `Some(previous)` if update should proceed (with the previous
-    /// status for comparison), or `None` if it should be dropped due to rate limiting.
-    pub fn should_process(&mut self, update: &StatusUpdate) -> Option<Option<StatusUpdate>> {
-        let pane_id = update.pane_id;
-        let now = Instant::now();
-
-        // Check rate limit
-        if let Some(last) = self.last_update.get(&pane_id) {
-            if now.duration_since(*last) < self.min_interval {
-                // Within rate limit - only process if material change
-                let prev = self.last_status.get(&pane_id);
-                if !update.is_material_change(prev) {
-                    return None; // Drop - not material and within rate limit
-                }
-            }
-        }
-
-        // Update tracking state
-        let prev = self.last_status.get(&pane_id).cloned();
-        self.last_update.insert(pane_id, now);
-        self.last_status.insert(pane_id, update.clone());
-
-        Some(prev)
-    }
-
-    /// Clear state for a pane (e.g., when pane closes).
-    pub fn clear_pane(&mut self, pane_id: u64) {
-        self.last_update.remove(&pane_id);
-        self.last_status.remove(&pane_id);
-    }
-}
+// NOTE: StatusUpdate types (CursorPosition, PaneDimensions, StatusUpdate, StatusUpdateRateLimiter)
+// were removed in v0.2.0 to eliminate Lua performance bottleneck.
+// Alt-screen detection is now handled via escape sequence parsing (see screen_state.rs).
+// Pane metadata (title, dimensions, cursor) is obtained via `wezterm cli list`.
 
 /// Request message from client to server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,8 +44,7 @@ pub enum IpcRequest {
         /// Raw value (typically base64-encoded JSON)
         value: String,
     },
-    /// Status update from WezTerm Lua hook
-    StatusUpdate(StatusUpdate),
+    // NOTE: StatusUpdate variant was removed in v0.2.0 (Lua performance optimization)
     /// Ping to check if watcher is alive
     Ping,
     /// Request current watcher status
@@ -318,10 +108,9 @@ impl IpcResponse {
 pub struct IpcHandlerContext {
     /// Event bus for publishing events
     pub event_bus: Arc<EventBus>,
-    /// Pane registry for status updates (optional for backward compatibility)
+    /// Pane registry for pane state queries (optional for backward compatibility)
     pub registry: Option<Arc<RwLock<PaneRegistry>>>,
-    /// Rate limiter for status updates
-    pub rate_limiter: Arc<std::sync::Mutex<StatusUpdateRateLimiter>>,
+    // NOTE: rate_limiter field was removed in v0.2.0 (StatusUpdate removed)
 }
 
 impl IpcHandlerContext {
@@ -331,7 +120,6 @@ impl IpcHandlerContext {
         Self {
             event_bus,
             registry: None,
-            rate_limiter: Arc::new(std::sync::Mutex::new(StatusUpdateRateLimiter::new())),
         }
     }
 
@@ -341,7 +129,6 @@ impl IpcHandlerContext {
         Self {
             event_bus,
             registry: Some(registry),
-            rate_limiter: Arc::new(std::sync::Mutex::new(StatusUpdateRateLimiter::new())),
         }
     }
 }
@@ -517,7 +304,7 @@ async fn handle_request_with_context(request: IpcRequest, ctx: &IpcHandlerContex
                 Err(e) => IpcResponse::error(e.to_string()),
             }
         }
-        IpcRequest::StatusUpdate(update) => handle_status_update(update, ctx).await,
+        // NOTE: IpcRequest::StatusUpdate was removed in v0.2.0 (Lua performance optimization)
         IpcRequest::Ping => {
             let uptime_ms = u64::try_from(ctx.event_bus.uptime().as_millis()).unwrap_or(u64::MAX);
             IpcResponse::ok_with_data(serde_json::json!({
@@ -573,134 +360,8 @@ async fn handle_pane_state(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse
     }))
 }
 
-/// Handle a status update request.
-///
-/// This function:
-/// 1. Validates the payload
-/// 2. Checks rate limits / coalesces updates
-/// 3. Checks if the pane is observed (ignores updates for filtered panes)
-/// 4. Updates pane registry state
-/// 5. Emits an event if state changed materially
-async fn handle_status_update(update: StatusUpdate, ctx: &IpcHandlerContext) -> IpcResponse {
-    let pane_id = update.pane_id;
-
-    // Step 1: Validate payload
-    if let Some(err) = update.validate() {
-        tracing::debug!(pane_id, error = %err, "Status update validation failed");
-        return IpcResponse::error(err);
-    }
-
-    // Step 2: Check rate limit / coalesce
-    let prev_update = {
-        let Some(prev) = (match ctx.rate_limiter.lock() {
-            Ok(mut guard) => guard.should_process(&update),
-            Err(e) => {
-                tracing::error!(error = %e, "Rate limiter lock poisoned");
-                return IpcResponse::error("internal error: rate limiter unavailable");
-            }
-        }) else {
-            // Dropped due to rate limiting (not material change)
-            tracing::trace!(pane_id, "Status update coalesced (rate limited)");
-            return IpcResponse::ok_with_data(serde_json::json!({
-                "processed": false,
-                "reason": "coalesced"
-            }));
-        };
-        prev
-    };
-
-    // Step 3: Check if pane is observed
-    let Some(ref registry_lock) = ctx.registry else {
-        // No registry - can still emit event but can't update state
-        let event = Event::StatusUpdateReceived {
-            pane_id,
-            alt_screen_changed: false,
-            is_alt_screen: update.is_alt_screen,
-            title_changed: false,
-            new_title: update.title,
-        };
-        let _ = ctx.event_bus.publish(event);
-        return IpcResponse::ok_with_data(serde_json::json!({
-            "processed": true,
-            "state_updated": false,
-            "reason": "no registry"
-        }));
-    };
-
-    // Read registry to check if pane is observed
-    let registry = registry_lock.read().await;
-    let entry = registry.get_entry(pane_id);
-
-    let Some(entry) = entry else {
-        // Pane not known - log warning and skip
-        tracing::warn!(pane_id, "Status update for unknown pane, ignoring");
-        return IpcResponse::ok_with_data(serde_json::json!({
-            "processed": false,
-            "reason": "unknown_pane"
-        }));
-    };
-
-    if !entry.should_observe() {
-        // Pane is ignored - drop update without processing
-        tracing::trace!(pane_id, "Status update for ignored pane, dropping");
-        return IpcResponse::ok_with_data(serde_json::json!({
-            "processed": false,
-            "reason": "pane_ignored"
-        }));
-    }
-
-    // Drop read lock before acquiring write lock
-    drop(registry);
-
-    // Step 4: Determine what changed (from rate limiter's previous state)
-    let alt_screen_changed = prev_update
-        .as_ref()
-        .is_none_or(|p| p.is_alt_screen != update.is_alt_screen);
-    let title_changed = prev_update.as_ref().is_none_or(|p| p.title != update.title);
-
-    // Step 5: Update pane registry state
-    let dimensions = update.dimensions.map(|d| (d.cols, d.rows));
-    let cursor = update.cursor.map(|c| (c.col, c.row));
-
-    {
-        let mut registry = registry_lock.write().await;
-        let _state_updated = registry.update_from_status(
-            pane_id,
-            update.title.clone(),
-            dimensions,
-            cursor,
-            update.is_alt_screen,
-            update.ts,
-        );
-        // Note: _state_updated tells us if state was actually changed in registry.
-        // We already track alt_screen_changed/title_changed from rate limiter state.
-    }
-
-    // Step 6: Emit event if material change
-    if alt_screen_changed || title_changed {
-        let event = Event::StatusUpdateReceived {
-            pane_id,
-            alt_screen_changed,
-            is_alt_screen: update.is_alt_screen,
-            title_changed,
-            new_title: update.title.clone(),
-        };
-        let subscribers = ctx.event_bus.publish(event);
-        tracing::debug!(
-            pane_id,
-            alt_screen_changed,
-            title_changed,
-            subscribers,
-            "Status update event emitted"
-        );
-    }
-
-    IpcResponse::ok_with_data(serde_json::json!({
-        "processed": true,
-        "alt_screen_changed": alt_screen_changed,
-        "title_changed": title_changed
-    }))
-}
+// NOTE: handle_status_update function was removed in v0.2.0 (Lua performance optimization)
+// Alt-screen detection is now handled via escape sequence parsing (see screen_state.rs).
 
 /// IPC client for sending requests to the watcher daemon.
 pub struct IpcClient {
@@ -769,22 +430,7 @@ impl IpcClient {
         self.send_request(IpcRequest::PaneState { pane_id }).await
     }
 
-    /// Send a status update to the watcher daemon.
-    ///
-    /// This is the client-side counterpart to the Lua `update-status` hook.
-    /// The watcher will validate, rate-limit, and process the update.
-    ///
-    /// # Arguments
-    /// * `update` - The status update payload
-    ///
-    /// # Errors
-    /// Returns error if connection or send fails.
-    pub async fn send_status_update(
-        &self,
-        update: StatusUpdate,
-    ) -> Result<IpcResponse, UserVarError> {
-        self.send_request(IpcRequest::StatusUpdate(update)).await
-    }
+    // NOTE: send_status_update method was removed in v0.2.0 (Lua performance optimization)
 
     /// Send a request and receive a response.
     async fn send_request(&self, request: IpcRequest) -> Result<IpcResponse, UserVarError> {

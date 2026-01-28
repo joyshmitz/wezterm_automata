@@ -1418,9 +1418,10 @@ impl PatternEngine {
         // Filter by agent type, span (overlap), and dedup
         let mut result = Vec::new();
         for detection in all_detections {
-            // Overlap filtering: skip if match is entirely within the overlap region
-            // (meaning we presumably detected it in the previous segment)
-            if overlap_len > 0 && detection.span.1 <= overlap_len {
+            // Overlap filtering: skip if match STARTS within the overlap region.
+            // If a detection starts in the overlap, its pattern beginning was already
+            // visible in the previous segment (even if the match extends into new text).
+            if overlap_len > 0 && detection.span.0 < overlap_len {
                 continue;
             }
 

@@ -769,6 +769,23 @@ impl IpcClient {
         self.send_request(IpcRequest::PaneState { pane_id }).await
     }
 
+    /// Send a status update to the watcher daemon.
+    ///
+    /// This is the client-side counterpart to the Lua `update-status` hook.
+    /// The watcher will validate, rate-limit, and process the update.
+    ///
+    /// # Arguments
+    /// * `update` - The status update payload
+    ///
+    /// # Errors
+    /// Returns error if connection or send fails.
+    pub async fn send_status_update(
+        &self,
+        update: StatusUpdate,
+    ) -> Result<IpcResponse, UserVarError> {
+        self.send_request(IpcRequest::StatusUpdate(update)).await
+    }
+
     /// Send a request and receive a response.
     async fn send_request(&self, request: IpcRequest) -> Result<IpcResponse, UserVarError> {
         // Check if socket exists

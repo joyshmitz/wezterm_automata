@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashSet;
+use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -213,23 +214,31 @@ enum Commands {
         unhandled: bool,
     },
 
-    /// Ingest external events (e.g., WezTerm user-var signals)
+    /// Ingest external events (e.g., WezTerm user-var or status update signals)
     Event {
         /// Event source is a WezTerm user-var change
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_status")]
         from_uservar: bool,
 
-        /// Pane ID that emitted the user-var
+        /// Event source is a WezTerm status update (from Lua update-status hook)
+        #[arg(long, conflicts_with = "from_uservar")]
+        from_status: bool,
+
+        /// Pane ID that emitted the event
         #[arg(long)]
         pane: u64,
 
-        /// User-var name (e.g., "wa_event")
-        #[arg(long)]
-        name: String,
+        /// User-var name (e.g., "wa_event") - required for --from-uservar
+        #[arg(long, required_if_eq("from_uservar", "true"))]
+        name: Option<String>,
 
-        /// Raw user-var value (typically base64-encoded JSON)
-        #[arg(long)]
-        value: String,
+        /// Raw user-var value (typically base64-encoded JSON) - required for --from-uservar
+        #[arg(long, required_if_eq("from_uservar", "true"))]
+        value: Option<String>,
+
+        /// JSON payload for status update - required for --from-status
+        #[arg(long, required_if_eq("from_status", "true"))]
+        payload: Option<String>,
     },
 
     /// Explain decisions and workflows using built-in templates
@@ -6035,66 +6044,141 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::Event {
             from_uservar,
+            from_status,
             pane,
             name,
             value,
+            payload,
         }) => {
-            if !from_uservar {
-                eprintln!("Error: only --from-uservar is supported for now.");
+            if !from_uservar && !from_status {
+                eprintln!("Error: must specify either --from-uservar or --from-status.");
                 eprintln!(
                     "Hint: use `wa event --from-uservar --pane <id> --name <name> --value <value>`"
                 );
+                eprintln!("  or: use `wa event --from-status --pane <id> --payload '<json>'`");
                 std::process::exit(1);
             }
-
-            let name_for_log = name.clone();
-            let value_len = value.len();
-
-            if let Err(message) = validate_uservar_request(pane, &name, &value) {
-                eprintln!("Error: {message}");
-                eprintln!("Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}");
-                std::process::exit(1);
-            }
-
-            tracing::debug!(
-                pane_id = pane,
-                name = %name_for_log,
-                value_len,
-                "Forwarding user-var event to watcher"
-            );
 
             #[cfg(unix)]
             {
                 let client = wa_core::ipc::IpcClient::new(&layout.ipc_socket_path);
-                match client.send_user_var(pane, name, value).await {
-                    Ok(response) => {
-                        if !response.ok {
-                            let detail = response
-                                .error
-                                .unwrap_or_else(|| "unknown error".to_string());
-                            eprintln!("Error: watcher rejected user-var event: {detail}");
+
+                if from_uservar {
+                    // Handle user-var event
+                    let name = name.expect("name required for --from-uservar");
+                    let value = value.expect("value required for --from-uservar");
+                    let name_for_log = name.clone();
+                    let value_len = value.len();
+
+                    if let Err(message) = validate_uservar_request(pane, &name, &value) {
+                        eprintln!("Error: {message}");
+                        eprintln!(
+                            "Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}"
+                        );
+                        std::process::exit(1);
+                    }
+
+                    tracing::debug!(
+                        pane_id = pane,
+                        name = %name_for_log,
+                        value_len,
+                        "Forwarding user-var event to watcher"
+                    );
+
+                    match client.send_user_var(pane, name, value).await {
+                        Ok(response) => {
+                            if !response.ok {
+                                let detail = response
+                                    .error
+                                    .unwrap_or_else(|| "unknown error".to_string());
+                                eprintln!("Error: watcher rejected user-var event: {detail}");
+                                eprintln!(
+                                    "Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}"
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                        Err(err) => {
+                            match err {
+                                wa_core::events::UserVarError::WatcherNotRunning { .. } => {
+                                    eprintln!("Error: {err}");
+                                    eprintln!(
+                                        "Hint: start the watcher with `wa watch` in this workspace."
+                                    );
+                                }
+                                _ => {
+                                    eprintln!("Error: failed to forward user-var event: {err}");
+                                }
+                            }
                             eprintln!(
                                 "Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}"
                             );
                             std::process::exit(1);
                         }
                     }
-                    Err(err) => {
-                        match err {
-                            wa_core::events::UserVarError::WatcherNotRunning { .. } => {
-                                eprintln!("Error: {err}");
-                                eprintln!(
-                                    "Hint: start the watcher with `wa watch` in this workspace."
-                                );
+                } else if from_status {
+                    // Handle status update event
+                    let payload_json = payload.expect("payload required for --from-status");
+                    let payload_len = payload_json.len();
+
+                    // Parse JSON payload into StatusUpdate
+                    let update: wa_core::ipc::StatusUpdate =
+                        match serde_json::from_str(&payload_json) {
+                            Ok(u) => u,
+                            Err(e) => {
+                                eprintln!("Error: invalid status update JSON: {e}");
+                                eprintln!("Context: pane_id={pane} payload_len={payload_len}");
+                                std::process::exit(1);
                             }
-                            _ => {
-                                eprintln!("Error: failed to forward user-var event: {err}");
-                            }
-                        }
+                        };
+
+                    // Validate pane_id matches
+                    if update.pane_id != pane {
                         eprintln!(
-                            "Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}"
+                            "Error: pane_id in payload ({}) does not match --pane ({pane})",
+                            update.pane_id
                         );
                         std::process::exit(1);
+                    }
+
+                    tracing::debug!(
+                        pane_id = pane,
+                        is_alt_screen = update.is_alt_screen,
+                        "Forwarding status update to watcher"
+                    );
+
+                    match client.send_status_update(update).await {
+                        Ok(response) => {
+                            if !response.ok {
+                                let detail = response
+                                    .error
+                                    .unwrap_or_else(|| "unknown error".to_string());
+                                eprintln!("Error: watcher rejected status update: {detail}");
+                                eprintln!("Context: pane_id={pane} payload_len={payload_len}");
+                                std::process::exit(1);
+                            }
+                            // Print response data for debugging
+                            if let Some(data) = response.data {
+                                if let Ok(json) = serde_json::to_string(&data) {
+                                    tracing::debug!(response = %json, "Status update processed");
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            match err {
+                                wa_core::events::UserVarError::WatcherNotRunning { .. } => {
+                                    eprintln!("Error: {err}");
+                                    eprintln!(
+                                        "Hint: start the watcher with `wa watch` in this workspace."
+                                    );
+                                }
+                                _ => {
+                                    eprintln!("Error: failed to forward status update: {err}");
+                                }
+                            }
+                            eprintln!("Context: pane_id={pane} payload_len={payload_len}");
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
@@ -6102,7 +6186,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             #[cfg(not(unix))]
             {
                 eprintln!("Error: IPC event forwarding is only supported on Unix platforms.");
-                eprintln!("Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}");
+                eprintln!("Context: pane_id={pane}");
                 std::process::exit(1);
             }
         }
@@ -6251,23 +6335,112 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         run_remote_setup(&host, &options)?;
                     }
                     SetupCommands::Config => {
+                        use wa_core::setup;
+
                         println!("wa setup config - Generate WezTerm Config Additions\n");
-                        println!("Add the following to your ~/.config/wezterm/wezterm.lua:\n");
-                        println!("-- wa (WezTerm Automata) recommended settings");
-                        println!("-- Ensure adequate scrollback for terminal capture");
-                        println!("config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}");
-                        println!();
-                        println!("-- Optional: Enable hyperlinks for file navigation");
-                        println!("config.hyperlink_rules = wezterm.default_hyperlink_rules()");
-                        println!();
-                        println!("-- Optional: Quick-access key for wa status");
-                        println!("-- config.keys = {{");
-                        println!(
-                            "--   {{ key = 'w', mods = 'CTRL|SHIFT', action = wezterm.action.SpawnCommandInNewTab {{"
-                        );
-                        println!("--     args = {{ 'wa', 'status' }},");
-                        println!("--   }} }},");
-                        println!("-- }}");
+                        let mut hosts = Vec::new();
+                        let mut ssh_path = None;
+                        match setup::locate_ssh_config() {
+                            Ok(path) => match setup::load_ssh_hosts(&path) {
+                                Ok(loaded) => {
+                                    hosts = loaded;
+                                    ssh_path = Some(path);
+                                }
+                                Err(err) => {
+                                    eprintln!("Warning: {err}");
+                                }
+                            },
+                            Err(err) => {
+                                eprintln!("Warning: {err}");
+                            }
+                        }
+
+                        let wa_block =
+                            setup::generate_ssh_domains_lua(&hosts, RECOMMENDED_SCROLLBACK_LINES);
+
+                        if dry_run {
+                            match setup::locate_wezterm_config() {
+                                Ok(config_path) => match fs::read_to_string(&config_path) {
+                                    Ok(content) => {
+                                        if setup::has_wa_block(&content) {
+                                            let existing = setup::extract_wa_block(&content)
+                                                .unwrap_or_default();
+                                            if existing.trim_end() == wa_block.trim_end() {
+                                                println!(
+                                                    "✓ wa block already up to date in {}",
+                                                    config_path.display()
+                                                );
+                                            } else {
+                                                println!(
+                                                    "• wa block would be updated in {}",
+                                                    config_path.display()
+                                                );
+                                            }
+                                        } else {
+                                            println!(
+                                                "• wa block would be added to {}",
+                                                config_path.display()
+                                            );
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!(
+                                            "Error: Failed to read {}: {}",
+                                            config_path.display(),
+                                            err
+                                        );
+                                        std::process::exit(1);
+                                    }
+                                },
+                                Err(err) => {
+                                    eprintln!("Warning: {err}");
+                                }
+                            }
+                            println!("\n--- Generated block (dry-run) ---\n");
+                            println!("{wa_block}");
+                            println!("Place this block before any `return config` line.");
+                            println!("Run with --apply to patch your config.");
+                        } else if apply {
+                            let config_path = match setup::locate_wezterm_config() {
+                                Ok(path) => path,
+                                Err(err) => {
+                                    eprintln!("Error: {err}");
+                                    std::process::exit(1);
+                                }
+                            };
+                            match setup::patch_wezterm_config_block_at(&config_path, &wa_block) {
+                                Ok(patch_result) => {
+                                    if patch_result.modified {
+                                        println!("✓ {}", patch_result.message);
+                                        if let Some(backup) = patch_result.backup_path {
+                                            println!("  Backup: {}", backup.display());
+                                        }
+                                        println!("\nRestart WezTerm to apply the changes.");
+                                    } else {
+                                        println!("✓ {}", patch_result.message);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Error: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        } else {
+                            println!("Add the following to your wezterm.lua:\n");
+                            if let Some(path) = ssh_path {
+                                println!(
+                                    "-- Derived {} SSH host(s) from {}",
+                                    hosts.len(),
+                                    path.display()
+                                );
+                            } else {
+                                println!("-- SSH config not found; update ssh_domains manually");
+                            }
+                            println!();
+                            println!("{wa_block}");
+                            println!("Place this block before any `return config` line.");
+                            println!("Tip: run with --apply to patch automatically.");
+                        }
                     }
                     SetupCommands::Patch {
                         remove,
@@ -7287,15 +7460,19 @@ fn print_remote_output(
     println!("  {label}: {redacted}");
 }
 
-fn run_remote_step(
+fn run_remote_step<F>(
     name: &str,
     host: &str,
     command: &str,
     timeout: std::time::Duration,
+    runner: &F,
     redactor: &wa_core::policy::Redactor,
     verbose: bool,
     require_success: bool,
-) -> anyhow::Result<RemoteCommandOutput> {
+) -> anyhow::Result<RemoteCommandOutput>
+where
+    F: Fn(&str, &str, std::time::Duration) -> anyhow::Result<RemoteCommandOutput>,
+{
     if verbose {
         let redacted_cmd = redactor.redact(command);
         println!("• {name}");
@@ -7304,7 +7481,7 @@ fn run_remote_step(
         println!("• {name}");
     }
 
-    let output = run_remote_command(host, command, timeout)?;
+    let output = runner(host, command, timeout)?;
     if require_success && !output.status.success() {
         print_remote_output(redactor, "stdout", &output.stdout, true);
         print_remote_output(redactor, "stderr", &output.stderr, true);
@@ -7322,6 +7499,17 @@ fn run_remote_step(
 }
 
 fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Result<()> {
+    run_remote_setup_with_runner(host, options, &run_remote_command)
+}
+
+fn run_remote_setup_with_runner<F>(
+    host: &str,
+    options: &RemoteSetupOptions<'_>,
+    runner: &F,
+) -> anyhow::Result<()>
+where
+    F: Fn(&str, &str, std::time::Duration) -> anyhow::Result<RemoteCommandOutput>,
+{
     use std::io::Write;
     use wa_core::policy::Redactor;
 
@@ -7355,6 +7543,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
         host,
         "true",
         timeout,
+        runner,
         &redactor,
         options.verbose,
         true,
@@ -7366,6 +7555,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
         host,
         "command -v apt-get || command -v dnf || command -v yum || command -v pacman || true",
         timeout,
+        runner,
         &redactor,
         options.verbose,
         false,
@@ -7383,6 +7573,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
         host,
         "command -v wezterm || true",
         timeout,
+        runner,
         &redactor,
         options.verbose,
         false,
@@ -7394,6 +7585,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
             host,
             "wezterm --version || true",
             timeout,
+            runner,
             &redactor,
             options.verbose,
             false,
@@ -7412,6 +7604,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
                         host,
                         "sudo apt-get update && sudo apt-get install -y wezterm",
                         timeout,
+                        runner,
                         &redactor,
                         options.verbose,
                         true,
@@ -7428,6 +7621,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
                         host,
                         "sudo dnf install -y wezterm",
                         timeout,
+                        runner,
                         &redactor,
                         options.verbose,
                         true,
@@ -7444,6 +7638,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
                         host,
                         "sudo yum install -y wezterm",
                         timeout,
+                        runner,
                         &redactor,
                         options.verbose,
                         true,
@@ -7460,6 +7655,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
                         host,
                         "sudo pacman -Sy --noconfirm wezterm",
                         timeout,
+                        runner,
                         &redactor,
                         options.verbose,
                         true,
@@ -7483,6 +7679,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
         host,
         &check_service_cmd,
         timeout,
+        runner,
         &redactor,
         options.verbose,
         false,
@@ -7501,6 +7698,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
                 host,
                 &install_cmd,
                 timeout,
+                runner,
                 &redactor,
                 options.verbose,
                 true,
@@ -7521,6 +7719,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
             host,
             "systemctl --user daemon-reload",
             timeout,
+            runner,
             &redactor,
             options.verbose,
             true,
@@ -7530,6 +7729,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
             host,
             "systemctl --user enable --now wezterm-mux-server",
             timeout,
+            runner,
             &redactor,
             options.verbose,
             true,
@@ -7544,6 +7744,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
         host,
         "systemctl --user is-active wezterm-mux-server || true",
         timeout,
+        runner,
         &redactor,
         options.verbose,
         false,
@@ -7561,6 +7762,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
         host,
         "loginctl show-user $USER -p Linger || true",
         timeout,
+        runner,
         &redactor,
         options.verbose,
         false,
@@ -7577,6 +7779,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
             host,
             "sudo loginctl enable-linger $USER",
             timeout,
+            runner,
             &redactor,
             options.verbose,
             true,
@@ -7593,6 +7796,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
                 host,
                 "mkdir -p ~/.local/bin",
                 timeout,
+                runner,
                 &redactor,
                 options.verbose,
                 true,
@@ -7614,6 +7818,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
                     host,
                     "chmod +x ~/.local/bin/wa",
                     timeout,
+                    runner,
                     &redactor,
                     options.verbose,
                     true,
@@ -7633,6 +7838,7 @@ fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Res
                     host,
                     &install_cmd,
                     timeout,
+                    runner,
                     &redactor,
                     options.verbose,
                     true,
@@ -8228,6 +8434,57 @@ mod tests {
             .and_then(|policy| policy.checks.iter().find(|check| check.name == "workflow"));
         assert!(workflow_check.is_some());
         assert!(!workflow_check.unwrap().passed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_setup_dry_run_avoids_install_commands() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::sync::Mutex;
+
+        let commands = Mutex::new(Vec::new());
+        let runner = |_: &str, command: &str, _timeout: std::time::Duration| {
+            commands.lock().unwrap().push(command.to_string());
+            let stdout = if command.contains("command -v apt-get") {
+                "/usr/bin/apt-get\n".to_string()
+            } else if command.contains("command -v wezterm") {
+                String::new()
+            } else if command.contains("systemctl --user is-active") {
+                "inactive\n".to_string()
+            } else if command.contains("loginctl show-user") {
+                "Linger=no\n".to_string()
+            } else {
+                String::new()
+            };
+
+            Ok(RemoteCommandOutput {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout,
+                stderr: String::new(),
+                duration_ms: 5,
+            })
+        };
+
+        let options = RemoteSetupOptions {
+            apply: false,
+            dry_run: true,
+            yes: true,
+            install_wa: true,
+            wa_path: None,
+            wa_version: Some("git"),
+            timeout_secs: 5,
+            verbose: false,
+        };
+
+        run_remote_setup_with_runner("example", &options, &runner).unwrap();
+
+        let cmds = { commands.lock().unwrap().clone() };
+        assert!(cmds.iter().any(|cmd| cmd == "true"));
+        assert!(cmds.iter().any(|cmd| cmd.contains("command -v apt-get")));
+        assert!(cmds.iter().any(|cmd| cmd.contains("command -v wezterm")));
+        assert!(!cmds.iter().any(|cmd| cmd.contains("apt-get install")));
+        assert!(!cmds.iter().any(|cmd| cmd.contains("cargo install")));
+        assert!(!cmds.iter().any(|cmd| cmd.contains("scp ")));
     }
 
     #[test]

@@ -85,7 +85,7 @@ wezterm.on('update-status', function(window, pane)
 
   -- Build JSON payload (inline to avoid dependencies)
   local payload = string.format(
-    '{"schema_version":1,"pane_id":%d,"domain":"%s","title":"%s",' ..
+    '{"schema_version":0,"pane_id":%d,"domain":"%s","title":"%s",' ..
     '"cursor":{"row":%d,"col":%d},"dimensions":{"rows":%d,"cols":%d},' ..
     '"is_alt_screen":%s,"ts":%d}',
     pane_id,
@@ -676,26 +676,40 @@ pub fn generate_ssh_domains_lua(hosts: &[SshHost], scrollback_lines: u64) -> Str
     output.push_str(WA_BEGIN_MARKER);
     output.push('\n');
     output.push_str("-- wa: generated ssh_domains config\n");
+    output.push_str("config = config or {}\n");
     output.push_str(&format!("config.scrollback_lines = {scrollback_lines}\n\n"));
-    output.push_str("config.ssh_domains = {\n");
+    if hosts.is_empty() {
+        output.push_str(
+            "-- No SSH hosts found; add entries manually or re-run wa setup --list-hosts\n",
+        );
+        output.push_str("config.ssh_domains = {}\n");
+    } else {
+        output.push_str("config.ssh_domains = {\n");
 
-    for host in hosts {
-        let name = lua_escape(&host.alias);
-        let remote = lua_escape(host.hostname.as_deref().unwrap_or(&host.alias));
-        output.push_str("  {\n");
-        output.push_str(&format!("    name = '{name}',\n"));
-        output.push_str(&format!("    remote_address = '{remote}',\n"));
-        if let Some(user) = host.user.as_deref() {
-            output.push_str(&format!("    username = '{}',\n", lua_escape(user)));
+        for host in hosts {
+            let name = lua_escape(&host.alias);
+            let remote = lua_escape(host.hostname.as_deref().unwrap_or(&host.alias));
+            output.push_str("  {\n");
+            output.push_str(&format!("    name = '{name}',\n"));
+            output.push_str(&format!("    remote_address = '{remote}',\n"));
+            if let Some(user) = host.user.as_deref() {
+                output.push_str(&format!("    username = '{}',\n", lua_escape(user)));
+            }
+            if let Some(port) = host.port {
+                output.push_str(&format!("    port = {},\n", port));
+            }
+            output.push_str("    multiplexing = 'WezTerm',\n");
+            output.push_str("  },\n");
         }
-        if let Some(port) = host.port {
-            output.push_str(&format!("    port = {},\n", port));
-        }
-        output.push_str("    multiplexing = 'WezTerm',\n");
-        output.push_str("  },\n");
+
+        output.push_str("}\n");
     }
-
-    output.push_str("}\n");
+    output.push('\n');
+    output.push_str(USERVAR_FORWARDING_LUA);
+    output.push('\n');
+    output.push('\n');
+    output.push_str(STATUS_UPDATE_LUA);
+    output.push('\n');
     output.push_str(WA_END_MARKER);
     output.push('\n');
     output
@@ -789,6 +803,34 @@ pub fn extract_wa_block(content: &str) -> Option<String> {
     }
 }
 
+fn find_return_line_start(content: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    let mut last_match = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed == "return" || trimmed.starts_with("return ") {
+            last_match = Some(offset);
+        }
+        offset = offset.saturating_add(line.len() + 1);
+    }
+
+    last_match
+}
+
+fn insert_wa_block(content: &str, wa_block: &str) -> String {
+    let normalized_block = wa_block.trim_end_matches('\n');
+    if let Some(return_idx) = find_return_line_start(content) {
+        let before = content[..return_idx].trim_end_matches('\n');
+        let after = content[return_idx..].trim_start_matches('\n');
+        format!("{before}\n\n{normalized_block}\n\n{after}")
+    } else if content.ends_with('\n') {
+        format!("{content}\n{normalized_block}\n")
+    } else {
+        format!("{content}\n\n{normalized_block}\n")
+    }
+}
+
 /// Create the full wa-managed block with markers
 ///
 /// Includes both user-var forwarding and status update snippets.
@@ -865,13 +907,9 @@ pub fn patch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
     // Create backup before modifying
     let backup_path = create_backup(config_path)?;
 
-    // Append the wa block
+    // Append the wa block (insert before return if present)
     let wa_block = create_wa_block();
-    let new_content = if content.ends_with('\n') {
-        format!("{content}\n{wa_block}\n")
-    } else {
-        format!("{content}\n\n{wa_block}\n")
-    };
+    let new_content = insert_wa_block(&content, &wa_block);
 
     // Write the modified content
     fs::write(config_path, &new_content).map_err(|e| {
@@ -881,6 +919,99 @@ pub fn patch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
     let backup_display = backup_path.display().to_string();
     let message = format!(
         "Added wa user-var forwarding to {}. Backup saved to {}",
+        config_path.display(),
+        backup_display
+    );
+
+    Ok(PatchResult {
+        config_path: config_path.to_path_buf(),
+        backup_path: Some(backup_path),
+        modified: true,
+        message,
+    })
+}
+
+/// Patch a WezTerm config file with a specific wa-managed block.
+///
+/// This supports idempotent updates for generated blocks (e.g., ssh_domains).
+pub fn patch_wezterm_config_block_at(config_path: &Path, wa_block: &str) -> Result<PatchResult> {
+    if !wa_block.contains(WA_BEGIN_MARKER) || !wa_block.contains(WA_END_MARKER) {
+        return Err(Error::SetupError(
+            "Generated wa block is missing WA markers.".to_string(),
+        ));
+    }
+
+    let content = fs::read_to_string(config_path).map_err(|e| {
+        Error::SetupError(format!("Failed to read {}: {}", config_path.display(), e))
+    })?;
+
+    let normalized_block = wa_block.trim_end_matches('\n');
+
+    if has_wa_block(&content) {
+        let existing = extract_wa_block(&content).unwrap_or_default();
+        let normalized_existing = existing.trim_end_matches('\n');
+        if normalized_existing == normalized_block {
+            return Ok(PatchResult {
+                config_path: config_path.to_path_buf(),
+                backup_path: None,
+                modified: false,
+                message:
+                    "WezTerm config already contains an up-to-date wa block. No changes needed."
+                        .to_string(),
+            });
+        }
+
+        let backup_path = create_backup(config_path)?;
+
+        let begin_idx = content.find(WA_BEGIN_MARKER).unwrap();
+        let end_marker_start = content.find(WA_END_MARKER).unwrap();
+        let end_idx = content[end_marker_start..]
+            .find('\n')
+            .map_or(content.len(), |i| end_marker_start + i + 1);
+
+        let return_idx = find_return_line_start(&content);
+        let new_content = if return_idx.is_some_and(|idx| begin_idx > idx) {
+            let without_block = format!("{}{}", &content[..begin_idx], &content[end_idx..]);
+            insert_wa_block(&without_block, normalized_block)
+        } else {
+            format!(
+                "{}{}\n{}",
+                &content[..begin_idx],
+                normalized_block,
+                &content[end_idx..]
+            )
+        };
+
+        fs::write(config_path, &new_content).map_err(|e| {
+            Error::SetupError(format!("Failed to write {}: {}", config_path.display(), e))
+        })?;
+
+        let backup_display = backup_path.display().to_string();
+        let message = format!(
+            "Updated wa block in {}. Backup saved to {}",
+            config_path.display(),
+            backup_display
+        );
+
+        return Ok(PatchResult {
+            config_path: config_path.to_path_buf(),
+            backup_path: Some(backup_path),
+            modified: true,
+            message,
+        });
+    }
+
+    let backup_path = create_backup(config_path)?;
+
+    let new_content = insert_wa_block(&content, normalized_block);
+
+    fs::write(config_path, &new_content).map_err(|e| {
+        Error::SetupError(format!("Failed to write {}: {}", config_path.display(), e))
+    })?;
+
+    let backup_display = backup_path.display().to_string();
+    let message = format!(
+        "Added wa block to {}. Backup saved to {}",
         config_path.display(),
         backup_display
     );
@@ -1034,6 +1165,9 @@ return config
         assert!(has_wa_block(&patched));
         assert!(patched.contains("wezterm.on('user-var-changed'"));
         assert!(patched.contains("wa%-"));
+        let wa_idx = patched.find(WA_BEGIN_MARKER).unwrap();
+        let return_idx = patched.find("return config").unwrap();
+        assert!(wa_idx < return_idx);
     }
 
     #[test]
@@ -1067,6 +1201,107 @@ return config
         // Content should be unchanged
         let content_after = fs::read_to_string(file.path()).unwrap();
         assert_eq!(original, content_after);
+    }
+
+    #[test]
+    fn test_generate_ssh_domains_block_includes_hosts_and_snippets() {
+        let hosts = vec![SshHost {
+            alias: "box".to_string(),
+            hostname: Some("box.example".to_string()),
+            user: Some("alice".to_string()),
+            port: Some(2222),
+            identity_files: Vec::new(),
+        }];
+
+        let block = generate_ssh_domains_lua(&hosts, 50_000);
+        assert!(block.contains(WA_BEGIN_MARKER));
+        assert!(block.contains("config = config or {}"));
+        assert!(block.contains("config.scrollback_lines = 50000"));
+        assert!(block.contains("config.ssh_domains = {"));
+        assert!(block.contains("name = 'box'"));
+        assert!(block.contains("remote_address = 'box.example'"));
+        assert!(block.contains("username = 'alice'"));
+        assert!(block.contains("port = 2222"));
+        assert!(block.contains("multiplexing = 'WezTerm'"));
+        assert!(block.contains(USERVAR_FORWARDING_LUA));
+        assert!(block.contains(STATUS_UPDATE_LUA));
+        assert!(block.contains(WA_END_MARKER));
+    }
+
+    #[test]
+    fn test_patch_wezterm_config_block_inserts_before_return() {
+        let original = r"local wezterm = require 'wezterm'
+local config = {}
+return config
+";
+        let file = create_temp_config(original);
+        let hosts = vec![SshHost {
+            alias: "alpha".to_string(),
+            hostname: Some("alpha.example".to_string()),
+            user: None,
+            port: None,
+            identity_files: Vec::new(),
+        }];
+        let block = generate_ssh_domains_lua(&hosts, 50_000);
+
+        let result = patch_wezterm_config_block_at(file.path(), &block).unwrap();
+        assert!(result.modified);
+
+        let patched = fs::read_to_string(file.path()).unwrap();
+        let wa_idx = patched.find(WA_BEGIN_MARKER).unwrap();
+        let return_idx = patched.find("return config").unwrap();
+        assert!(wa_idx < return_idx);
+        assert!(patched.contains("alpha.example"));
+    }
+
+    #[test]
+    fn test_patch_wezterm_config_block_updates_existing_block() {
+        let original = r"local wezterm = require 'wezterm'
+local config = {}
+";
+        let file = create_temp_config(original);
+        let old_block = generate_ssh_domains_lua(&[], 10_000);
+        let new_hosts = vec![SshHost {
+            alias: "beta".to_string(),
+            hostname: Some("beta.example".to_string()),
+            user: Some("dev".to_string()),
+            port: Some(2200),
+            identity_files: Vec::new(),
+        }];
+        let new_block = generate_ssh_domains_lua(&new_hosts, 50_000);
+
+        let _ = patch_wezterm_config_block_at(file.path(), &old_block).unwrap();
+        let result = patch_wezterm_config_block_at(file.path(), &new_block).unwrap();
+        assert!(result.modified);
+
+        let patched = fs::read_to_string(file.path()).unwrap();
+        assert_eq!(patched.matches(WA_BEGIN_MARKER).count(), 1);
+        assert!(patched.contains("beta.example"));
+        assert!(patched.contains("port = 2200"));
+    }
+
+    #[test]
+    fn test_patch_wezterm_config_block_is_idempotent() {
+        let original = r"local wezterm = require 'wezterm'
+local config = {}
+";
+        let file = create_temp_config(original);
+        let hosts = vec![SshHost {
+            alias: "gamma".to_string(),
+            hostname: Some("gamma.example".to_string()),
+            user: None,
+            port: None,
+            identity_files: Vec::new(),
+        }];
+        let block = generate_ssh_domains_lua(&hosts, 50_000);
+
+        let _ = patch_wezterm_config_block_at(file.path(), &block).unwrap();
+        let result = patch_wezterm_config_block_at(file.path(), &block).unwrap();
+        assert!(!result.modified);
+
+        let patched = fs::read_to_string(file.path()).unwrap();
+        assert_eq!(patched.matches(WA_BEGIN_MARKER).count(), 1);
+        assert!(patched.contains("gamma.example"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Policy Risk Scoring Model Design
 
-**Status:** Draft
+**Status:** Implemented
 **Bead:** wa-upg.6.1
 **Author:** RubyCat
 **Date:** 2026-01-28

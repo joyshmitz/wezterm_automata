@@ -448,15 +448,14 @@ fn all_templates_follow_naming_convention() {
         );
 
         let parts: Vec<_> = id.split('.').collect();
-        assert_eq!(
-            parts.len(),
-            2,
-            "Template ID '{}' should have exactly one dot",
+        assert!(
+            parts.len() >= 2,
+            "Template ID '{}' should have at least one dot",
             id
         );
 
         // Category must be known
-        let valid_categories = ["deny", "workflow", "event"];
+        let valid_categories = ["deny", "workflow", "event", "risk"];
         assert!(
             valid_categories.contains(&parts[0]),
             "Template '{}' has unknown category '{}'. Valid: {:?}",

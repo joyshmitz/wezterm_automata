@@ -59,6 +59,7 @@ pub mod output;
 pub mod patterns;
 pub mod plan;
 pub mod policy;
+pub mod retry;
 pub mod runtime;
 pub mod screen_state;
 pub mod setup;

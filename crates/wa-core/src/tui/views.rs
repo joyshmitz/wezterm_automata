@@ -12,6 +12,7 @@ use ratatui::{
 };
 
 use super::query::{EventView, HealthStatus, PaneView};
+use crate::circuit_breaker::CircuitStateKind;
 
 /// Available views in the TUI
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -150,7 +151,7 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Title
-            Constraint::Length(6), // Health status
+            Constraint::Length(7), // Health status
             Constraint::Min(5),    // Quick stats
             Constraint::Length(3), // Footer
         ])
@@ -190,11 +191,27 @@ pub fn render_home_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             } else {
                 Span::styled("ERROR", Style::default().fg(Color::Red))
             };
+            let circuit_status = match health.wezterm_circuit.state {
+                CircuitStateKind::Closed => {
+                    Span::styled("CLOSED", Style::default().fg(Color::Green))
+                }
+                CircuitStateKind::HalfOpen => {
+                    Span::styled("HALF-OPEN", Style::default().fg(Color::Yellow))
+                }
+                CircuitStateKind::Open => {
+                    let remaining = health.wezterm_circuit.cooldown_remaining_ms.unwrap_or(0);
+                    Span::styled(
+                        format!("OPEN ({} ms)", remaining),
+                        Style::default().fg(Color::Red),
+                    )
+                }
+            };
 
             vec![
                 Line::from(vec![Span::raw("Watcher: "), watcher_status]),
                 Line::from(vec![Span::raw("Database: "), db_status]),
                 Line::from(vec![Span::raw("WezTerm: "), wezterm_status]),
+                Line::from(vec![Span::raw("Circuit: "), circuit_status]),
                 Line::from(Span::raw(format!("Panes: {}", health.pane_count))),
             ]
         },

@@ -40,6 +40,7 @@ impl ErrorRenderer {
                 WeztermError::CommandFailed(_) => "WA-1020",
                 WeztermError::ParseError(_) => "WA-1021",
                 WeztermError::Timeout(_) => "WA-1022",
+                WeztermError::CircuitOpen { .. } => "WA-1030",
             },
             Error::Storage(e) => match e {
                 StorageError::Database(_) => "WA-2001",

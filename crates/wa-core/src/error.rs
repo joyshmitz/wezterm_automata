@@ -555,7 +555,9 @@ mod tests {
             Error::Wezterm(WeztermError::CommandFailed("boom".to_string())),
             Error::Wezterm(WeztermError::ParseError("bad json".to_string())),
             Error::Wezterm(WeztermError::Timeout(5)),
-            Error::Wezterm(WeztermError::CircuitOpen { retry_after_ms: 500 }),
+            Error::Wezterm(WeztermError::CircuitOpen {
+                retry_after_ms: 500,
+            }),
             Error::Storage(StorageError::Database("db error".to_string())),
             Error::Storage(StorageError::SequenceDiscontinuity {
                 expected: 1,

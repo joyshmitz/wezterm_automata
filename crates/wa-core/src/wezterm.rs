@@ -870,6 +870,7 @@ impl WeztermClient {
             Ok(())
         } else {
             let status = guard.status();
+            drop(guard); // Release lock before returning
             let retry_after_ms = status.cooldown_remaining_ms.unwrap_or(0);
             Err(WeztermError::CircuitOpen { retry_after_ms }.into())
         }
@@ -895,7 +896,9 @@ impl WeztermClient {
 
     async fn run_cli_with_pane_check_retry(&self, args: &[&str], pane_id: u64) -> Result<String> {
         self.circuit_guard()?;
-        let result = self.retry_with(|| self.run_cli_with_pane_check(args, pane_id)).await;
+        let result = self
+            .retry_with(|| self.run_cli_with_pane_check(args, pane_id))
+            .await;
         self.circuit_record_result(&result);
         result
     }

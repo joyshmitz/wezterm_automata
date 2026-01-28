@@ -69,6 +69,21 @@ pub struct CircuitBreakerStatus {
     pub half_open_successes: Option<u32>,
 }
 
+impl Default for CircuitBreakerStatus {
+    fn default() -> Self {
+        Self {
+            state: CircuitStateKind::Closed,
+            consecutive_failures: 0,
+            failure_threshold: 0,
+            success_threshold: 0,
+            open_cooldown_ms: 0,
+            open_for_ms: None,
+            cooldown_remaining_ms: None,
+            half_open_successes: None,
+        }
+    }
+}
+
 /// Circuit breaker state machine.
 #[derive(Debug, Clone)]
 pub struct CircuitBreaker {
@@ -197,11 +212,8 @@ mod tests {
 
     #[test]
     fn circuit_opens_after_threshold() {
-        let mut breaker = CircuitBreaker::new(CircuitBreakerConfig::new(
-            2,
-            1,
-            Duration::from_secs(10),
-        ));
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(2, 1, Duration::from_secs(10)));
 
         assert!(breaker.allow());
         breaker.record_failure();
@@ -215,11 +227,8 @@ mod tests {
 
     #[test]
     fn circuit_half_open_closes_on_success() {
-        let mut breaker = CircuitBreaker::new(CircuitBreakerConfig::new(
-            1,
-            1,
-            Duration::from_millis(0),
-        ));
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(1, 1, Duration::from_millis(0)));
 
         breaker.record_failure();
         // Cooldown is zero, so allow transitions to half-open.
@@ -232,11 +241,8 @@ mod tests {
 
     #[test]
     fn circuit_half_open_failure_reopens() {
-        let mut breaker = CircuitBreaker::new(CircuitBreakerConfig::new(
-            1,
-            2,
-            Duration::from_millis(0),
-        ));
+        let mut breaker =
+            CircuitBreaker::new(CircuitBreakerConfig::new(1, 2, Duration::from_millis(0)));
 
         breaker.record_failure();
         assert!(breaker.allow());

@@ -2715,6 +2715,12 @@ fn map_wezterm_error_to_robot(error: &wa_core::Error) -> (&'static str, Option<S
                 "robot.wezterm_timeout",
                 Some("WezTerm command timed out. The terminal may be unresponsive.".to_string()),
             ),
+            WeztermError::CircuitOpen { retry_after_ms } => (
+                "robot.circuit_open",
+                Some(format!(
+                    "WezTerm circuit breaker is open. Retry after {retry_after_ms} ms."
+                )),
+            ),
         },
         _ => (
             "robot.internal_error",
@@ -5833,9 +5839,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         print!("{output}");
                     }
                     Err(e) => {
-                        if let wa_core::Error::Wezterm(wa_core::error::WeztermError::CircuitOpen {
-                            retry_after_ms,
-                        }) = &e
+                        if let wa_core::Error::Wezterm(
+                            wa_core::error::WeztermError::CircuitOpen { retry_after_ms },
+                        ) = &e
                         {
                             if output_format.is_json() {
                                 let payload = serde_json::json!({

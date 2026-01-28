@@ -394,6 +394,7 @@ mod tests {
                 watcher_running: true,
                 db_accessible: true,
                 wezterm_accessible: true,
+                wezterm_circuit: crate::circuit_breaker::CircuitBreakerStatus::default(),
                 pane_count: 1,
                 event_count: 0,
                 last_capture_ts: None,

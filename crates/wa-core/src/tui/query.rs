@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use crate::circuit_breaker::CircuitBreakerStatus;
 use crate::config::WorkspaceLayout;
 use crate::storage::StorageHandle;
 use crate::wezterm::{PaneInfo, WeztermClient};
@@ -93,6 +94,7 @@ pub struct HealthStatus {
     pub watcher_running: bool,
     pub db_accessible: bool,
     pub wezterm_accessible: bool,
+    pub wezterm_circuit: CircuitBreakerStatus,
     pub pane_count: usize,
     pub event_count: usize,
     pub last_capture_ts: Option<i64>,
@@ -281,6 +283,7 @@ impl QueryClient for ProductionQueryClient {
             watcher_running,
             db_accessible,
             wezterm_accessible,
+            wezterm_circuit: self.wezterm.circuit_status(),
             pane_count,
             event_count: 0,
             last_capture_ts: None,
@@ -338,6 +341,7 @@ mod tests {
                 watcher_running: self.watcher_running,
                 db_accessible: true,
                 wezterm_accessible: true,
+                wezterm_circuit: CircuitBreakerStatus::default(),
                 pane_count: self.panes.len(),
                 event_count: self.events.len(),
                 last_capture_ts: None,

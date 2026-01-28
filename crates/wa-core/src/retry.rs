@@ -249,6 +249,11 @@ where
 ///
 /// If the circuit is open, returns immediately with a circuit open error.
 /// Exceeded retries count as a circuit failure.
+///
+/// Note: This function returns a `WeztermError::CircuitOpen` when the circuit
+/// is open, making it most suitable for WezTerm CLI operations. For other
+/// use cases, consider using `with_retry` and managing the circuit breaker
+/// state separately.
 pub async fn with_retry_and_circuit<T, F, Fut>(
     policy: &RetryPolicy,
     circuit: &mut CircuitBreaker,
@@ -284,7 +289,7 @@ where
 /// This function provides a heuristic for retryability.
 #[must_use]
 pub fn is_retryable(error: &Error) -> bool {
-    use crate::error::WeztermError;
+    use crate::error::{StorageError, WeztermError};
 
     match error {
         // I/O errors are generally retryable (network issues, timeouts)
@@ -300,8 +305,17 @@ pub fn is_retryable(error: &Error) -> bool {
             WeztermError::SocketNotFound(_) => true,   // Might be initializing
             WeztermError::ParseError(_) => false,      // Structural issue
         },
-        // Storage errors might be transient (lock conflicts)
-        Error::Storage(_) => true,
+        // Storage errors - only generic database errors are retryable (lock conflicts)
+        Error::Storage(e) => match e {
+            StorageError::Database(_) => true, // Might be transient lock conflict
+            StorageError::SequenceDiscontinuity { .. } => false, // Logic error
+            StorageError::MigrationFailed(_) => false, // Persistent issue
+            StorageError::SchemaTooNew { .. } => false, // Version mismatch
+            StorageError::WaTooOld { .. } => false,    // Version mismatch
+            StorageError::FtsQueryError(_) => false,   // Query syntax issue
+            StorageError::Corruption { .. } => false,  // Serious issue
+            StorageError::NotFound(_) => false,        // Item doesn't exist
+        },
         // Pattern errors are not retryable (invalid regex, etc.)
         Error::Pattern(_) => false,
         // Workflow errors are not retryable (logic errors)

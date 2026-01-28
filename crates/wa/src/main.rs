@@ -255,7 +255,11 @@ enum Commands {
     },
 
     /// Run diagnostics
-    Doctor,
+    Doctor {
+        /// Show circuit breaker status
+        #[arg(long)]
+        circuits: bool,
+    },
 
     /// Setup helpers
     Setup {
@@ -6160,7 +6164,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
-        Some(Commands::Doctor) => {
+        Some(Commands::Doctor { circuits }) => {
             println!("wa doctor - Running diagnostics...\n");
 
             let checks = run_diagnostics(&permission_warnings, &config, &layout);
@@ -6171,6 +6175,46 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
             let has_errors = checks.iter().any(|c| c.status == DiagnosticStatus::Error);
             let has_warnings = checks.iter().any(|c| c.status == DiagnosticStatus::Warning);
+
+            if circuits {
+                use wa_core::circuit_breaker::{circuit_snapshots, ensure_default_circuits, CircuitStateKind};
+
+                ensure_default_circuits();
+                let snapshots = circuit_snapshots();
+
+                if !snapshots.is_empty() {
+                    let name_width = snapshots
+                        .iter()
+                        .map(|s| s.name.len())
+                        .max()
+                        .unwrap_or(0)
+                        .max(8);
+
+                    let format_retry = |ms: Option<u64>| -> String {
+                        match ms {
+                            Some(value) if value >= 60_000 => format!("{:.1}m", value as f64 / 60_000.0),
+                            Some(value) if value >= 1_000 => format!("{:.1}s", value as f64 / 1_000.0),
+                            Some(value) => format!("{value}ms"),
+                            None => "n/a".to_string(),
+                        }
+                    };
+
+                    println!("Circuit Breaker Status:");
+                    for snapshot in snapshots {
+                        let status = match snapshot.status.state {
+                            CircuitStateKind::Closed => "CLOSED (healthy)".to_string(),
+                            CircuitStateKind::HalfOpen => "HALF-OPEN (testing)".to_string(),
+                            CircuitStateKind::Open => format!(
+                                "OPEN ({} failures, retry in {})",
+                                snapshot.status.consecutive_failures,
+                                format_retry(snapshot.status.cooldown_remaining_ms)
+                            ),
+                        };
+                        println!("  {:width$}: {status}", snapshot.name, width = name_width);
+                    }
+                    println!();
+                }
+            }
 
             println!();
             if has_errors {

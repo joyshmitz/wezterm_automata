@@ -2,9 +2,12 @@
 //!
 //! Provides a small state machine with cooldowns and status reporting.
 
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 /// Configuration for a circuit breaker.
 #[derive(Debug, Clone)]
@@ -87,6 +90,7 @@ impl Default for CircuitBreakerStatus {
 /// Circuit breaker state machine.
 #[derive(Debug, Clone)]
 pub struct CircuitBreaker {
+    name: String,
     config: CircuitBreakerConfig,
     state: CircuitState,
     consecutive_failures: u32,
@@ -96,7 +100,14 @@ impl CircuitBreaker {
     /// Create a new circuit breaker from configuration.
     #[must_use]
     pub fn new(config: CircuitBreakerConfig) -> Self {
+        Self::with_name("unnamed", config)
+    }
+
+    /// Create a new circuit breaker with a stable name.
+    #[must_use]
+    pub fn with_name(name: impl Into<String>, config: CircuitBreakerConfig) -> Self {
         Self {
+            name: name.into(),
             config,
             state: CircuitState::Closed,
             consecutive_failures: 0,
@@ -112,6 +123,10 @@ impl CircuitBreaker {
             CircuitState::Open { opened_at } => {
                 if opened_at.elapsed() >= self.config.open_cooldown {
                     self.state = CircuitState::HalfOpen { successes: 0 };
+                    info!(
+                        circuit = %self.name,
+                        "Circuit transitioned to half-open after cooldown"
+                    );
                     true
                 } else {
                     false
@@ -132,6 +147,7 @@ impl CircuitBreaker {
                 if successes >= self.config.success_threshold {
                     self.consecutive_failures = 0;
                     self.state = CircuitState::Closed;
+                    info!(circuit = %self.name, "Circuit closed after successful probe");
                 } else {
                     self.state = CircuitState::HalfOpen { successes };
                 }
@@ -151,12 +167,19 @@ impl CircuitBreaker {
                     self.state = CircuitState::Open {
                         opened_at: Instant::now(),
                     };
+                    warn!(
+                        circuit = %self.name,
+                        failures = self.consecutive_failures,
+                        threshold = self.config.failure_threshold,
+                        "Circuit opened after consecutive failures"
+                    );
                 }
             }
             CircuitState::HalfOpen { .. } => {
                 self.state = CircuitState::Open {
                     opened_at: Instant::now(),
                 };
+                warn!(circuit = %self.name, "Circuit re-opened after half-open failure");
             }
             CircuitState::Open { .. } => {
                 // Already open; keep cooldown ticking.
@@ -204,6 +227,84 @@ impl CircuitBreaker {
             },
         }
     }
+}
+
+/// Snapshot of a named circuit breaker for reporting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerSnapshot {
+    pub name: String,
+    pub status: CircuitBreakerStatus,
+}
+
+static CIRCUIT_REGISTRY: OnceLock<RwLock<BTreeMap<String, Arc<Mutex<CircuitBreaker>>>>> =
+    OnceLock::new();
+
+/// Get or register a named circuit breaker.
+#[must_use]
+pub fn get_or_register_circuit(
+    name: impl Into<String>,
+    config: CircuitBreakerConfig,
+) -> Arc<Mutex<CircuitBreaker>> {
+    let name = name.into();
+    let registry = CIRCUIT_REGISTRY.get_or_init(|| RwLock::new(BTreeMap::new()));
+
+    if let Ok(read_guard) = registry.read() {
+        if let Some(existing) = read_guard.get(&name) {
+            return Arc::clone(existing);
+        }
+    }
+
+    let mut write_guard = match registry.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    write_guard
+        .entry(name.clone())
+        .or_insert_with(|| {
+            Arc::new(Mutex::new(CircuitBreaker::with_name(
+                name.clone(),
+                config,
+            )))
+        })
+        .clone()
+}
+
+/// Ensure default circuits exist for status reporting.
+pub fn ensure_default_circuits() {
+    let defaults = [
+        "wezterm_cli",
+        "caut_cli",
+        "browser_auth",
+        "webhook",
+    ];
+    for name in defaults {
+        let _ = get_or_register_circuit(name, CircuitBreakerConfig::default());
+    }
+}
+
+/// Snapshot current circuit breaker statuses.
+#[must_use]
+pub fn circuit_snapshots() -> Vec<CircuitBreakerSnapshot> {
+    let registry = CIRCUIT_REGISTRY.get_or_init(|| RwLock::new(BTreeMap::new()));
+    let read_guard = match registry.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    read_guard
+        .iter()
+        .map(|(name, breaker)| {
+            let status = match breaker.lock() {
+                Ok(guard) => guard.status(),
+                Err(poisoned) => poisoned.into_inner().status(),
+            };
+            CircuitBreakerSnapshot {
+                name: name.clone(),
+                status,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

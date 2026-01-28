@@ -7,6 +7,10 @@
 //! - Recent state hints for temporal context
 
 use std::fmt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::accounts::AccountRecord;
+use crate::storage::StoredEvent;
 
 /// Information about a pane for suggestions.
 #[derive(Debug, Clone)]
@@ -66,7 +70,7 @@ impl fmt::Display for PaneInfo {
 pub struct StateChange {
     pub pane_id: u64,
     pub description: String,
-    pub timestamp: std::time::SystemTime,
+    pub timestamp: SystemTime,
 }
 
 impl StateChange {
@@ -76,13 +80,13 @@ impl StateChange {
         Self {
             pane_id,
             description: description.into(),
-            timestamp: std::time::SystemTime::now(),
+            timestamp: SystemTime::now(),
         }
     }
 
     /// Create with explicit timestamp.
     #[must_use]
-    pub fn with_timestamp(mut self, ts: std::time::SystemTime) -> Self {
+    pub fn with_timestamp(mut self, ts: SystemTime) -> Self {
         self.timestamp = ts;
         self
     }
@@ -112,6 +116,105 @@ impl StateChange {
                 format!("{hours} hours ago")
             }
         }
+    }
+}
+
+/// User history for detecting first-time or unused feature suggestions.
+#[derive(Debug, Clone, Default)]
+pub struct UserHistory {
+    pub used_commands: Vec<String>,
+    pub used_features: Vec<String>,
+    pub last_workflow_at: Option<SystemTime>,
+}
+
+impl UserHistory {
+    /// Record a command invocation.
+    pub fn record_command(&mut self, command: impl Into<String>) {
+        self.used_commands.push(command.into());
+    }
+
+    /// Record a feature usage.
+    pub fn record_feature(&mut self, feature: impl Into<String>) {
+        self.used_features.push(feature.into());
+    }
+
+    /// Returns true if a command substring has been used.
+    #[must_use]
+    pub fn has_used_command(&self, needle: &str) -> bool {
+        self.used_commands.iter().any(|c| c.contains(needle))
+    }
+
+    /// Returns true if a feature has been used.
+    #[must_use]
+    pub fn has_used_feature(&self, feature: &str) -> bool {
+        self.used_features.iter().any(|f| f == feature)
+    }
+}
+
+/// A feature hint for unused feature suggestions.
+#[derive(Debug, Clone)]
+pub struct FeatureHint {
+    pub feature: String,
+    pub message: String,
+    pub command: String,
+    pub used: bool,
+    pub learn_more: Option<String>,
+}
+
+impl FeatureHint {
+    /// Create a new feature hint.
+    #[must_use]
+    pub fn new(
+        feature: impl Into<String>,
+        message: impl Into<String>,
+        command: impl Into<String>,
+    ) -> Self {
+        Self {
+            feature: feature.into(),
+            message: message.into(),
+            command: command.into(),
+            used: false,
+            learn_more: None,
+        }
+    }
+
+    /// Mark the feature as used.
+    #[must_use]
+    pub fn with_used(mut self, used: bool) -> Self {
+        self.used = used;
+        self
+    }
+
+    /// Add a learn-more link.
+    #[must_use]
+    pub fn with_learn_more(mut self, url: impl Into<String>) -> Self {
+        self.learn_more = Some(url.into());
+        self
+    }
+}
+
+/// System metrics for optimization suggestions.
+#[derive(Debug, Clone, Default)]
+pub struct SystemMetrics {
+    pub poll_interval_ms: Option<u64>,
+    pub storage_size_bytes: Option<u64>,
+    pub enabled_pattern_packs: Vec<String>,
+    pub unused_pattern_packs: Vec<String>,
+}
+
+impl SystemMetrics {
+    /// Set poll interval in milliseconds.
+    #[must_use]
+    pub fn with_poll_interval_ms(mut self, poll_interval_ms: u64) -> Self {
+        self.poll_interval_ms = Some(poll_interval_ms);
+        self
+    }
+
+    /// Set storage size in bytes.
+    #[must_use]
+    pub fn with_storage_size_bytes(mut self, size_bytes: u64) -> Self {
+        self.storage_size_bytes = Some(size_bytes);
+        self
     }
 }
 
@@ -215,14 +318,26 @@ impl fmt::Display for Platform {
 pub struct SuggestionContext {
     /// Available panes in the system.
     pub available_panes: Vec<PaneInfo>,
+    /// Accounts available for usage-aware suggestions.
+    pub accounts: Vec<AccountRecord>,
     /// Available workflow names.
     pub available_workflows: Vec<String>,
+    /// Active workflow names (currently running).
+    pub active_workflows: Vec<String>,
     /// Available rule IDs.
     pub available_rules: Vec<String>,
     /// Detected platform.
     pub platform: Platform,
     /// Recent state changes for temporal hints.
     pub recent_state: Vec<StateChange>,
+    /// Recent stored events for rate-limit/error suggestions.
+    pub recent_events: Vec<StoredEvent>,
+    /// User history for first-time/unused feature hints.
+    pub user_history: UserHistory,
+    /// Feature hints for unused feature suggestions.
+    pub feature_hints: Vec<FeatureHint>,
+    /// System metrics for optimization suggestions.
+    pub system_metrics: SystemMetrics,
 }
 
 impl Default for Platform {
@@ -237,6 +352,8 @@ impl SuggestionContext {
     pub fn new() -> Self {
         Self {
             platform: Platform::detect(),
+            user_history: UserHistory::default(),
+            system_metrics: SystemMetrics::default(),
             ..Default::default()
         }
     }
@@ -246,9 +363,19 @@ impl SuggestionContext {
         self.available_panes.push(pane);
     }
 
+    /// Add an account record.
+    pub fn add_account(&mut self, account: AccountRecord) {
+        self.accounts.push(account);
+    }
+
     /// Add a workflow name.
     pub fn add_workflow(&mut self, name: impl Into<String>) {
         self.available_workflows.push(name.into());
+    }
+
+    /// Add an active workflow name.
+    pub fn add_active_workflow(&mut self, name: impl Into<String>) {
+        self.active_workflows.push(name.into());
     }
 
     /// Add a rule ID.
@@ -259,6 +386,31 @@ impl SuggestionContext {
     /// Add a state change.
     pub fn add_state_change(&mut self, change: StateChange) {
         self.recent_state.push(change);
+    }
+
+    /// Add a recent stored event.
+    pub fn add_recent_event(&mut self, event: StoredEvent) {
+        self.recent_events.push(event);
+    }
+
+    /// Record a command usage in history.
+    pub fn record_command(&mut self, command: impl Into<String>) {
+        self.user_history.record_command(command);
+    }
+
+    /// Record a feature usage in history.
+    pub fn record_feature(&mut self, feature: impl Into<String>) {
+        self.user_history.record_feature(feature);
+    }
+
+    /// Add a feature hint for unused feature suggestions.
+    pub fn add_feature_hint(&mut self, hint: FeatureHint) {
+        self.feature_hints.push(hint);
+    }
+
+    /// Set system metrics for optimization suggestions.
+    pub fn set_system_metrics(&mut self, metrics: SystemMetrics) {
+        self.system_metrics = metrics;
     }
 
     /// Find closest matching pane ID.
@@ -1016,6 +1168,12 @@ impl SuggestionEngine {
     fn default_rules() -> Vec<Box<dyn SuggestionRule>> {
         vec![
             Box::new(AltScreenWarningRule),
+            Box::new(AccountLowRule::default()),
+            Box::new(RateLimitFrequencyRule::default()),
+            Box::new(ErrorRecoveryRule),
+            Box::new(FirstWorkflowRule),
+            Box::new(UnusedFeatureRule),
+            Box::new(OptimizationRule),
             Box::new(NoPanesAvailableRule),
             Box::new(FirstTimeUserRule),
         ]
@@ -1025,6 +1183,359 @@ impl SuggestionEngine {
 // ============================================================================
 // Built-in Rules
 // ============================================================================
+
+fn now_epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn is_rate_limit_event(event: &StoredEvent) -> bool {
+    let rule = event.rule_id.as_str();
+    let event_type = event.event_type.as_str();
+    event_type.contains("rate_limit")
+        || rule.contains("rate_limit")
+        || rule.contains("usage_reached")
+}
+
+fn is_error_event(event: &StoredEvent) -> bool {
+    event.event_type.starts_with("error")
+        || event.rule_id.contains("error")
+        || event.severity.eq_ignore_ascii_case("critical")
+}
+
+fn error_code_from_event(event: &StoredEvent) -> String {
+    if let Some(ref extracted) = event.extracted {
+        if let Some(code) = extracted.get("code").and_then(|v| v.as_str()) {
+            return code.to_string();
+        }
+    }
+    if !event.rule_id.is_empty() {
+        return event.rule_id.clone();
+    }
+    event.event_type.clone()
+}
+
+/// Warns when an active account is below a usage threshold.
+#[derive(Debug, Clone)]
+struct AccountLowRule {
+    threshold_percent: f64,
+}
+
+impl Default for AccountLowRule {
+    fn default() -> Self {
+        Self {
+            threshold_percent: 20.0,
+        }
+    }
+}
+
+impl SuggestionRule for AccountLowRule {
+    fn id(&self) -> &'static str {
+        "builtin.account_low"
+    }
+
+    fn applies(&self, ctx: &SuggestionContext) -> bool {
+        ctx.accounts
+            .iter()
+            .any(|a| a.percent_remaining < self.threshold_percent)
+    }
+
+    fn generate(&self, ctx: &SuggestionContext) -> Option<Suggestion> {
+        let low_account = ctx
+            .accounts
+            .iter()
+            .filter(|a| a.percent_remaining < self.threshold_percent)
+            .min_by(|a, b| {
+                a.percent_remaining
+                    .partial_cmp(&b.percent_remaining)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+        let account = low_account?;
+        let name = account
+            .name
+            .as_deref()
+            .unwrap_or(account.account_id.as_str());
+        let percent = account.percent_remaining.round() as i64;
+
+        Some(
+            Suggestion::new(
+                format!("account_low:{}", account.account_id),
+                SuggestionType::Warning,
+                format!(
+                    "Account \"{name}\" is at {percent}% - consider switching before it runs out."
+                ),
+                self.id(),
+            )
+            .with_priority(Priority::High)
+            .with_action(SuggestedAction::new("Switch account", "wa accounts switch")),
+        )
+    }
+
+    fn priority(&self) -> Priority {
+        Priority::High
+    }
+}
+
+/// Warns when rate limits are frequent within the last hour.
+#[derive(Debug, Clone)]
+struct RateLimitFrequencyRule {
+    max_hits_per_hour: u32,
+}
+
+impl Default for RateLimitFrequencyRule {
+    fn default() -> Self {
+        Self {
+            max_hits_per_hour: 3,
+        }
+    }
+}
+
+impl SuggestionRule for RateLimitFrequencyRule {
+    fn id(&self) -> &'static str {
+        "builtin.rate_limit_frequency"
+    }
+
+    fn applies(&self, ctx: &SuggestionContext) -> bool {
+        if ctx.recent_events.is_empty() {
+            return false;
+        }
+        let now_ms = now_epoch_ms();
+        let cutoff = now_ms.saturating_sub(60 * 60 * 1000);
+        let count = ctx
+            .recent_events
+            .iter()
+            .filter(|e| e.detected_at >= cutoff && is_rate_limit_event(e))
+            .count();
+        count as u32 > self.max_hits_per_hour
+    }
+
+    fn generate(&self, ctx: &SuggestionContext) -> Option<Suggestion> {
+        let now_ms = now_epoch_ms();
+        let cutoff = now_ms.saturating_sub(60 * 60 * 1000);
+        let count = ctx
+            .recent_events
+            .iter()
+            .filter(|e| e.detected_at >= cutoff && is_rate_limit_event(e))
+            .count();
+
+        Some(
+            Suggestion::new(
+                "rate_limit_frequency",
+                SuggestionType::Optimization,
+                format!(
+                    "Frequent rate limits detected ({count} in the last hour). Consider slowing polling or pacing workflows."
+                ),
+                self.id(),
+            )
+            .with_priority(Priority::Medium)
+            .with_action(SuggestedAction::new(
+                "Adjust polling",
+                "wa config set ingest.poll_interval_ms 200",
+            )),
+        )
+    }
+
+    fn priority(&self) -> Priority {
+        Priority::Medium
+    }
+}
+
+/// Suggests using dry-run when the first workflow is active.
+struct FirstWorkflowRule;
+
+impl SuggestionRule for FirstWorkflowRule {
+    fn id(&self) -> &'static str {
+        "builtin.first_workflow"
+    }
+
+    fn applies(&self, ctx: &SuggestionContext) -> bool {
+        !ctx.active_workflows.is_empty() && !ctx.user_history.has_used_command("workflow")
+    }
+
+    fn generate(&self, ctx: &SuggestionContext) -> Option<Suggestion> {
+        let workflow = ctx.active_workflows.first()?;
+        Some(
+            Suggestion::new(
+                "first_workflow",
+                SuggestionType::Tip,
+                "This looks like your first automated workflow. Try a dry-run preview before executing.",
+                self.id(),
+            )
+            .with_priority(Priority::Low)
+            .with_action(SuggestedAction::new(
+                "Preview workflow",
+                format!("wa workflow run \"{workflow}\" --dry-run"),
+            ))
+            .with_dismissable(true),
+        )
+    }
+
+    fn priority(&self) -> Priority {
+        Priority::Low
+    }
+}
+
+/// Suggests recovery steps when recent error events are detected.
+struct ErrorRecoveryRule;
+
+impl SuggestionRule for ErrorRecoveryRule {
+    fn id(&self) -> &'static str {
+        "builtin.error_recovery"
+    }
+
+    fn applies(&self, ctx: &SuggestionContext) -> bool {
+        ctx.recent_events.iter().any(is_error_event)
+    }
+
+    fn generate(&self, ctx: &SuggestionContext) -> Option<Suggestion> {
+        let event = ctx.recent_events.iter().find(|e| is_error_event(e))?;
+        let code = error_code_from_event(event);
+        Some(
+            Suggestion::new(
+                format!("error_recovery:{code}"),
+                SuggestionType::Recovery,
+                format!("Error {code} occurred. Run `wa why {code}` to understand what happened and how to fix it."),
+                self.id(),
+            )
+            .with_priority(Priority::High)
+            .with_action(SuggestedAction::new("Explain error", format!("wa why {code}"))),
+        )
+    }
+
+    fn priority(&self) -> Priority {
+        Priority::High
+    }
+}
+
+/// Suggests unused features based on available hints.
+struct UnusedFeatureRule;
+
+impl SuggestionRule for UnusedFeatureRule {
+    fn id(&self) -> &'static str {
+        "builtin.unused_feature"
+    }
+
+    fn applies(&self, ctx: &SuggestionContext) -> bool {
+        ctx.feature_hints.iter().any(|h| !h.used)
+    }
+
+    fn generate(&self, ctx: &SuggestionContext) -> Option<Suggestion> {
+        let hint = ctx.feature_hints.iter().find(|h| !h.used)?;
+        let mut suggestion = Suggestion::new(
+            format!("unused_feature:{}", hint.feature),
+            SuggestionType::Tip,
+            hint.message.clone(),
+            self.id(),
+        )
+        .with_priority(Priority::Low)
+        .with_action(SuggestedAction::new(
+            format!("Try {}", hint.feature),
+            hint.command.clone(),
+        ))
+        .with_dismissable(true);
+
+        if let Some(ref url) = hint.learn_more {
+            suggestion = suggestion.with_learn_more(url.clone());
+        }
+
+        Some(suggestion)
+    }
+
+    fn priority(&self) -> Priority {
+        Priority::Low
+    }
+}
+
+/// Suggests optimizations based on system metrics.
+struct OptimizationRule;
+
+impl SuggestionRule for OptimizationRule {
+    fn id(&self) -> &'static str {
+        "builtin.optimization"
+    }
+
+    fn applies(&self, ctx: &SuggestionContext) -> bool {
+        let metrics = &ctx.system_metrics;
+        let poll_too_fast = metrics
+            .poll_interval_ms
+            .is_some_and(|ms| ms < 100);
+        let storage_large = metrics
+            .storage_size_bytes
+            .is_some_and(|bytes| bytes > 500 * 1024 * 1024);
+        let unused_packs = !metrics.unused_pattern_packs.is_empty();
+        poll_too_fast || storage_large || unused_packs
+    }
+
+    fn generate(&self, ctx: &SuggestionContext) -> Option<Suggestion> {
+        let metrics = &ctx.system_metrics;
+        if let Some(ms) = metrics.poll_interval_ms {
+            if ms < 100 {
+                return Some(
+                    Suggestion::new(
+                        "optimization.poll_interval",
+                        SuggestionType::Optimization,
+                        format!(
+                            "Your poll interval is very low ({ms}ms). Increasing it can reduce CPU usage."
+                        ),
+                        self.id(),
+                    )
+                    .with_priority(Priority::Medium)
+                    .with_action(SuggestedAction::new(
+                        "Adjust polling",
+                        "wa config set ingest.poll_interval_ms 200",
+                    )),
+                );
+            }
+        }
+
+        if !metrics.unused_pattern_packs.is_empty() {
+            let message = format!(
+                "Some pattern packs appear unused: {}. Disabling them can reduce overhead.",
+                metrics.unused_pattern_packs.join(", ")
+            );
+            return Some(
+                Suggestion::new(
+                    "optimization.unused_packs",
+                    SuggestionType::Optimization,
+                    message,
+                    self.id(),
+                )
+                .with_priority(Priority::Low)
+                .with_action(SuggestedAction::new(
+                    "Review pattern packs",
+                    "wa config show --effective",
+                )),
+            );
+        }
+
+        if let Some(bytes) = metrics.storage_size_bytes {
+            if bytes > 500 * 1024 * 1024 {
+                return Some(
+                    Suggestion::new(
+                        "optimization.storage_size",
+                        SuggestionType::Optimization,
+                        "Your wa database is large. Consider reducing retention days to save disk space.",
+                        self.id(),
+                    )
+                    .with_priority(Priority::Low)
+                    .with_action(SuggestedAction::new(
+                        "Adjust retention",
+                        "wa config set storage.retention_days 30",
+                    )),
+                );
+            }
+        }
+
+        None
+    }
+
+    fn priority(&self) -> Priority {
+        Priority::Medium
+    }
+}
 
 /// Warns when a pane is in AltScreen mode.
 struct AltScreenWarningRule;

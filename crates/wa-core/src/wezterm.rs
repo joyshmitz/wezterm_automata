@@ -434,7 +434,7 @@ impl WeztermClient {
     /// This uses WezTerm's paste mode which is efficient for sending multiple
     /// characters at once. For control characters, use `send_control` instead.
     pub async fn send_text(&self, pane_id: u64, text: &str) -> Result<()> {
-        self.send_text_impl(pane_id, text, false).await
+        self.send_text_impl(pane_id, text, false, false).await
     }
 
     /// Send text to a pane character by character (no paste mode)
@@ -442,7 +442,22 @@ impl WeztermClient {
     /// This is slower but necessary for some applications that don't handle
     /// paste mode well, or for simulating interactive typing.
     pub async fn send_text_no_paste(&self, pane_id: u64, text: &str) -> Result<()> {
-        self.send_text_impl(pane_id, text, true).await
+        self.send_text_impl(pane_id, text, true, false).await
+    }
+
+    /// Send text with explicit options (paste/newline control).
+    ///
+    /// Use this when the caller needs to control paste mode and newline behavior
+    /// (e.g., `wa send --no-paste --no-newline`).
+    pub async fn send_text_with_options(
+        &self,
+        pane_id: u64,
+        text: &str,
+        no_paste: bool,
+        no_newline: bool,
+    ) -> Result<()> {
+        self.send_text_impl(pane_id, text, no_paste, no_newline)
+            .await
     }
 
     /// Send a control character to a pane
@@ -459,7 +474,7 @@ impl WeztermClient {
     /// ```
     pub async fn send_control(&self, pane_id: u64, control_char: &str) -> Result<()> {
         // Control characters MUST use no-paste mode
-        self.send_text_impl(pane_id, control_char, true).await
+        self.send_text_impl(pane_id, control_char, true, true).await
     }
 
     /// Send Ctrl+C (interrupt) to a pane
@@ -727,11 +742,20 @@ impl WeztermClient {
     }
 
     /// Internal implementation for send_text with paste mode option
-    async fn send_text_impl(&self, pane_id: u64, text: &str, no_paste: bool) -> Result<()> {
+    async fn send_text_impl(
+        &self,
+        pane_id: u64,
+        text: &str,
+        no_paste: bool,
+        no_newline: bool,
+    ) -> Result<()> {
         let pane_id_str = pane_id.to_string();
         let mut args = vec!["cli", "send-text", "--pane-id", &pane_id_str];
         if no_paste {
             args.push("--no-paste");
+        }
+        if no_newline {
+            args.push("--no-newline");
         }
         args.push("--");
         args.push(text);

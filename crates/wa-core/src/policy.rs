@@ -2274,6 +2274,7 @@ impl PolicyEngine {
     }
 
     /// Analyze command text for content-based risk factors
+    #[allow(clippy::items_after_statements)]
     fn analyze_content_risk(&self, text: &str, factors: &mut Vec<AppliedRiskFactor>) {
         let text_lower = text.to_lowercase();
 
@@ -2294,10 +2295,7 @@ impl PolicyEngine {
             "dd if=",
         ];
 
-        if DESTRUCTIVE_PATTERNS
-            .iter()
-            .any(|p| text_lower.contains(p))
-        {
+        if DESTRUCTIVE_PATTERNS.iter().any(|p| text_lower.contains(p)) {
             self.add_factor(
                 factors,
                 "content.destructive_tokens",
@@ -2389,6 +2387,12 @@ impl PolicyEngine {
     /// ```
     pub fn authorize(&mut self, input: &PolicyInput) -> PolicyDecision {
         let mut context = DecisionContext::from_input(input);
+
+        // Calculate and attach risk score (wa-upg.6.3)
+        let risk = self.calculate_risk(input);
+        if risk.score > 0 {
+            context.set_risk(risk);
+        }
 
         // Check rate limit for configured action kinds
         if input.action.is_rate_limited() {
@@ -2733,6 +2737,51 @@ impl PolicyEngine {
         static REDACTOR: LazyLock<Redactor> = LazyLock::new(Redactor::new);
         REDACTOR.contains_secrets(text)
     }
+}
+
+const AUDIT_PREVIEW_CHARS: usize = 80;
+
+/// Redacted summary metadata for SendText audit entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendTextAuditSummary {
+    /// Original text length (bytes).
+    pub text_length: usize,
+    /// Redacted preview of the text (truncated).
+    pub text_preview_redacted: String,
+    /// Stable hash of the original text.
+    pub text_hash: String,
+    /// Whether the text looks like a shell command.
+    pub command_candidate: bool,
+    /// Workflow execution ID, if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_execution_id: Option<String>,
+    /// Parent audit action ID (workflow start), if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_action_id: Option<i64>,
+}
+
+fn redacted_preview(text: &str) -> String {
+    static REDACTOR: LazyLock<Redactor> = LazyLock::new(Redactor::new);
+    let redacted = REDACTOR.redact(text);
+    redacted.chars().take(AUDIT_PREVIEW_CHARS).collect()
+}
+
+/// Build a structured, redacted summary for SendText audit records.
+#[must_use]
+pub fn build_send_text_audit_summary(
+    text: &str,
+    workflow_execution_id: Option<&str>,
+    parent_action_id: Option<i64>,
+) -> String {
+    let summary = SendTextAuditSummary {
+        text_length: text.len(),
+        text_preview_redacted: redacted_preview(text),
+        text_hash: format!("{:016x}", crate::wezterm::stable_hash(text.as_bytes())),
+        command_candidate: is_command_candidate(text),
+        workflow_execution_id: workflow_execution_id.map(str::to_string),
+        parent_action_id,
+    };
+    serde_json::to_string(&summary).unwrap_or_else(|_| "send_text_summary_unavailable".to_string())
 }
 
 // ============================================================================
@@ -3290,15 +3339,39 @@ impl PolicyGatedInjector {
             },
         };
 
+        let storage_for_summary = self.storage.clone();
+        let mut audit_summary = None;
+        if action == ActionKind::SendText {
+            if let Some(storage) = storage_for_summary.as_ref() {
+                let parent_action_id = if actor == ActorKind::Workflow {
+                    if let Some(id) = workflow_id {
+                        find_workflow_start_action_id(storage, id).await
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                audit_summary = Some(build_send_text_audit_summary(
+                    text,
+                    workflow_id,
+                    parent_action_id,
+                ));
+            }
+        }
+
         // Emit audit record if storage is configured (wa-4vx.8.7)
         // Audit is emitted for ALL outcomes: allow, deny, require_approval, and error
         // Capture the audit ID for workflow step correlation (wa-nu4.1.1.11)
         if let Some(ref storage) = self.storage {
-            let audit_record = result.to_audit_record(
+            let mut audit_record = result.to_audit_record(
                 actor,
                 workflow_id.map(String::from),
                 None, // domain - could be derived from pane info if available
             );
+            if let Some(summary) = audit_summary {
+                audit_record.input_summary = Some(summary);
+            }
             match storage.record_audit_action_redacted(audit_record).await {
                 Ok(audit_id) => {
                     result.set_audit_action_id(audit_id);
@@ -3321,6 +3394,23 @@ impl PolicyGatedInjector {
     pub fn redact(&self, text: &str) -> String {
         self.engine.redact_secrets(text)
     }
+}
+
+async fn find_workflow_start_action_id(
+    storage: &crate::storage::StorageHandle,
+    execution_id: &str,
+) -> Option<i64> {
+    let query = crate::storage::AuditQuery {
+        limit: Some(1),
+        actor_id: Some(execution_id.to_string()),
+        action_kind: Some("workflow_start".to_string()),
+        ..Default::default()
+    };
+    storage
+        .get_audit_actions(query)
+        .await
+        .ok()
+        .and_then(|mut rows| rows.pop().map(|row| row.id))
 }
 
 #[cfg(test)]
@@ -5052,5 +5142,647 @@ mod tests {
         assert!(glob_match("*vim*", "neovim"));
         assert!(glob_match("test?", "test1"));
         assert!(!glob_match("test?", "test12"));
+    }
+
+    // ========================================================================
+    // Risk Scoring Tests
+    // ========================================================================
+
+    #[test]
+    fn risk_score_zero_for_safe_action() {
+        let engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Human)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt());
+
+        let risk = engine.calculate_risk(&input);
+        assert!(risk.is_low());
+        assert!(risk.factors.is_empty());
+    }
+
+    #[test]
+    fn risk_score_elevated_for_alt_screen() {
+        let engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::alt_screen());
+
+        let risk = engine.calculate_risk(&input);
+        assert!(risk.score >= 60); // Alt-screen has weight 60
+        assert!(risk.factors.iter().any(|f| f.id == "state.alt_screen"));
+    }
+
+    #[test]
+    fn risk_score_unknown_alt_screen() {
+        let engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::unknown());
+
+        let risk = engine.calculate_risk(&input);
+        assert!(
+            risk.factors
+                .iter()
+                .any(|f| f.id == "state.alt_screen_unknown")
+        );
+    }
+
+    #[test]
+    fn risk_score_includes_destructive_content() {
+        let engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("rm -rf /tmp/test");
+
+        let risk = engine.calculate_risk(&input);
+        assert!(
+            risk.factors
+                .iter()
+                .any(|f| f.id == "content.destructive_tokens")
+        );
+    }
+
+    #[test]
+    fn risk_score_includes_sudo() {
+        let engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt())
+            .with_command_text("sudo apt update");
+
+        let risk = engine.calculate_risk(&input);
+        assert!(
+            risk.factors
+                .iter()
+                .any(|f| f.id == "content.sudo_elevation")
+        );
+    }
+
+    #[test]
+    fn risk_score_accumulates_factors() {
+        let engine = PolicyEngine::permissive();
+
+        // Multiple risk factors: untrusted actor + mutating action + command running
+        let mut caps = PaneCapabilities::default();
+        caps.command_running = true;
+        caps.alt_screen = Some(false);
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(caps);
+
+        let risk = engine.calculate_risk(&input);
+        // Should have: action.is_mutating (10) + context.actor_untrusted (15) + state.command_running (25)
+        assert!(risk.score >= 50);
+        assert!(risk.factors.len() >= 3);
+    }
+
+    #[test]
+    fn risk_config_can_disable_factors() {
+        let mut config = RiskConfig::default();
+        config.disabled.insert("state.alt_screen".to_string());
+
+        let engine = PolicyEngine::permissive().with_risk_config(config);
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::alt_screen());
+
+        let risk = engine.calculate_risk(&input);
+        // Alt-screen factor should not be present
+        assert!(!risk.factors.iter().any(|f| f.id == "state.alt_screen"));
+    }
+
+    #[test]
+    fn risk_config_can_override_weights() {
+        let mut config = RiskConfig::default();
+        config.weights.insert("state.alt_screen".to_string(), 10); // Reduce from 60 to 10
+
+        let engine = PolicyEngine::permissive().with_risk_config(config);
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::alt_screen());
+
+        let risk = engine.calculate_risk(&input);
+        let alt_factor = risk.factors.iter().find(|f| f.id == "state.alt_screen");
+        assert!(alt_factor.is_some());
+        assert_eq!(alt_factor.unwrap().weight, 10);
+    }
+
+    #[test]
+    fn risk_to_decision_allow_for_low() {
+        let engine = PolicyEngine::permissive();
+        let risk = RiskScore {
+            score: 20,
+            factors: vec![],
+            summary: "Low risk".to_string(),
+        };
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Human);
+
+        let decision = engine.risk_to_decision(&risk, &input);
+        assert!(decision.is_allowed());
+    }
+
+    #[test]
+    fn risk_to_decision_require_approval_for_elevated() {
+        let engine = PolicyEngine::permissive();
+        let risk = RiskScore {
+            score: 60,
+            factors: vec![],
+            summary: "Elevated risk".to_string(),
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+
+        let decision = engine.risk_to_decision(&risk, &input);
+        assert!(decision.requires_approval());
+    }
+
+    #[test]
+    fn risk_to_decision_deny_for_high() {
+        let engine = PolicyEngine::permissive();
+        let risk = RiskScore {
+            score: 80,
+            factors: vec![],
+            summary: "High risk".to_string(),
+        };
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+
+        let decision = engine.risk_to_decision(&risk, &input);
+        assert!(decision.is_denied());
+    }
+
+    #[test]
+    fn risk_score_deterministic() {
+        let engine = PolicyEngine::permissive();
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::alt_screen())
+            .with_command_text("sudo rm -rf /tmp");
+
+        let risk1 = engine.calculate_risk(&input);
+        let risk2 = engine.calculate_risk(&input);
+
+        assert_eq!(risk1.score, risk2.score);
+        assert_eq!(risk1.factors.len(), risk2.factors.len());
+    }
+
+    #[test]
+    fn risk_score_capped_at_100() {
+        // Create a scenario with many risk factors that would exceed 100
+        let engine = PolicyEngine::permissive();
+
+        let mut caps = PaneCapabilities::default();
+        caps.alt_screen = Some(true); // 60
+        caps.has_recent_gap = true; // 35
+        caps.is_reserved = true; // 50
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot) // +10 mutating +15 untrusted
+            .with_pane(1)
+            .with_capabilities(caps)
+            .with_command_text("sudo rm -rf /"); // +30 sudo +40 destructive
+
+        let risk = engine.calculate_risk(&input);
+        assert!(risk.score <= 100);
+    }
+
+    // wa-upg.6.3: Verify risk flows through authorize() into decision context
+    #[test]
+    fn authorize_attaches_risk_to_context() {
+        let mut engine = PolicyEngine::permissive();
+
+        // Create input with some risk factors
+        let mut caps = PaneCapabilities::default();
+        caps.prompt_active = true;
+        caps.command_running = true; // Adds risk: command_running (25)
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot) // +10 mutating +15 untrusted
+            .with_pane(1)
+            .with_capabilities(caps);
+
+        let decision = engine.authorize(&input);
+
+        // Decision should have context with risk
+        let context = decision.context().expect("Decision should have context");
+        let risk = context
+            .risk
+            .as_ref()
+            .expect("Context should have risk score");
+
+        // Should have accumulated some risk factors
+        assert!(risk.score > 0, "Risk score should be > 0 for this input");
+        assert!(
+            !risk.factors.is_empty(),
+            "Should have contributing risk factors"
+        );
+    }
+
+    #[test]
+    fn authorize_risk_included_in_serialized_output() {
+        let mut engine = PolicyEngine::permissive();
+
+        let mut caps = PaneCapabilities::default();
+        caps.prompt_active = true;
+        caps.command_running = true;
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(caps)
+            .with_command_text("sudo apt update"); // Adds sudo risk
+
+        let decision = engine.authorize(&input);
+
+        // Serialize to JSON and verify risk is included
+        let json = serde_json::to_string(&decision).expect("Decision should serialize");
+
+        // Risk should be in the serialized output
+        assert!(
+            json.contains("\"risk\""),
+            "Serialized decision should include risk object"
+        );
+        assert!(
+            json.contains("\"score\""),
+            "Serialized decision should include risk score"
+        );
+        assert!(
+            json.contains("\"factors\""),
+            "Serialized decision should include risk factors"
+        );
+    }
+
+    // ========================================================================
+    // wa-upg.6.4: Risk Scoring Matrix Tests
+    // ========================================================================
+
+    /// Test risk scoring matrix with representative condition combinations
+    #[test]
+    fn risk_matrix_safe_read_action() {
+        // ReadOutput action doesn't add action-specific risk factors
+        let engine = PolicyEngine::permissive();
+
+        let mut caps = PaneCapabilities::default();
+        caps.prompt_active = true; // Safe state
+
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(caps);
+
+        let risk = engine.calculate_risk(&input);
+        // Read actions don't add mutating/destructive risk factors
+        assert!(
+            !risk.factors.iter().any(|f| f.id == "action.is_mutating"),
+            "Read action should not have mutating factor"
+        );
+        assert!(
+            !risk.factors.iter().any(|f| f.id == "action.is_destructive"),
+            "Read action should not have destructive factor"
+        );
+    }
+
+    #[test]
+    fn risk_matrix_human_actor_trusted() {
+        // Human actors don't get the "untrusted actor" penalty
+        let engine = PolicyEngine::permissive();
+
+        let mut caps = PaneCapabilities::default();
+        caps.prompt_active = true;
+
+        let robot_input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(caps.clone());
+
+        let human_input = PolicyInput::new(ActionKind::SendText, ActorKind::Human)
+            .with_pane(1)
+            .with_capabilities(caps);
+
+        let robot_risk = engine.calculate_risk(&robot_input);
+        let human_risk = engine.calculate_risk(&human_input);
+
+        // Robot gets untrusted actor penalty (15), human doesn't
+        assert!(
+            robot_risk.score > human_risk.score,
+            "Robot should have higher risk than human"
+        );
+        assert!(
+            robot_risk
+                .factors
+                .iter()
+                .any(|f| f.id == "context.actor_untrusted"),
+            "Robot should have untrusted actor factor"
+        );
+        assert!(
+            !human_risk
+                .factors
+                .iter()
+                .any(|f| f.id == "context.actor_untrusted"),
+            "Human should not have untrusted actor factor"
+        );
+    }
+
+    #[test]
+    fn risk_matrix_combined_state_factors() {
+        // Test accumulation of multiple state factors
+        let engine = PolicyEngine::permissive();
+
+        // Combine: alt_screen (60) + command_running (25) + has_recent_gap (35)
+        let mut caps = PaneCapabilities::default();
+        caps.alt_screen = Some(true);
+        caps.command_running = true;
+        caps.has_recent_gap = true;
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(caps);
+
+        let risk = engine.calculate_risk(&input);
+
+        // Should be capped at 100 but have multiple factors
+        assert_eq!(risk.score, 100, "Combined state factors should cap at 100");
+        assert!(
+            risk.factors.len() >= 3,
+            "Should have at least 3 state factors"
+        );
+    }
+
+    #[test]
+    fn risk_matrix_content_analysis() {
+        // Test content analysis factors
+        let engine = PolicyEngine::permissive();
+
+        let mut caps = PaneCapabilities::default();
+        caps.prompt_active = true;
+
+        // Test various dangerous commands
+        let test_cases = vec![
+            ("rm -rf /", "content.destructive_tokens"),
+            ("sudo apt update", "content.sudo_elevation"),
+            // Pipe chain requires 2+ pipes
+            ("echo 'hello' | grep test | wc -l", "content.pipe_chain"),
+            ("cat <<EOF\nline1\nline2\nEOF", "content.multiline_complex"),
+        ];
+
+        for (command, expected_factor) in test_cases {
+            let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                .with_pane(1)
+                .with_capabilities(caps.clone())
+                .with_command_text(command);
+
+            let risk = engine.calculate_risk(&input);
+            assert!(
+                risk.factors.iter().any(|f| f.id == expected_factor),
+                "Command '{}' should trigger factor '{}'",
+                command,
+                expected_factor
+            );
+        }
+    }
+
+    #[test]
+    fn risk_matrix_reserved_pane() {
+        // Test reserved pane scenarios
+        let engine = PolicyEngine::permissive();
+
+        let mut caps = PaneCapabilities::default();
+        caps.prompt_active = true;
+        caps.is_reserved = true;
+        caps.reserved_by = Some("other-workflow".to_string());
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(caps);
+
+        let risk = engine.calculate_risk(&input);
+        assert!(
+            risk.factors.iter().any(|f| f.id == "state.is_reserved"),
+            "Should have reserved pane factor"
+        );
+    }
+
+    // ========================================================================
+    // wa-upg.6.4: Factor Ordering Stability Tests
+    // ========================================================================
+
+    #[test]
+    fn risk_factors_have_stable_ordering() {
+        // Factors should be in deterministic order across multiple calls
+        let engine = PolicyEngine::permissive();
+
+        let mut caps = PaneCapabilities::default();
+        caps.alt_screen = Some(true);
+        caps.command_running = true;
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(caps)
+            .with_command_text("sudo rm -rf /tmp");
+
+        // Calculate risk multiple times
+        let risk1 = engine.calculate_risk(&input);
+        let risk2 = engine.calculate_risk(&input);
+        let risk3 = engine.calculate_risk(&input);
+
+        // Extract factor IDs in order
+        let ids1: Vec<_> = risk1.factors.iter().map(|f| &f.id).collect();
+        let ids2: Vec<_> = risk2.factors.iter().map(|f| &f.id).collect();
+        let ids3: Vec<_> = risk3.factors.iter().map(|f| &f.id).collect();
+
+        assert_eq!(ids1, ids2, "Factor ordering should be stable (run 1 vs 2)");
+        assert_eq!(ids2, ids3, "Factor ordering should be stable (run 2 vs 3)");
+    }
+
+    #[test]
+    fn risk_factor_weights_are_stable() {
+        // Each factor should have the same weight across calls
+        let engine = PolicyEngine::permissive();
+
+        let mut caps = PaneCapabilities::default();
+        caps.alt_screen = Some(true);
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(caps);
+
+        let risk1 = engine.calculate_risk(&input);
+        let risk2 = engine.calculate_risk(&input);
+
+        for (f1, f2) in risk1.factors.iter().zip(risk2.factors.iter()) {
+            assert_eq!(f1.id, f2.id, "Factor IDs should match");
+            assert_eq!(f1.weight, f2.weight, "Factor weights should be stable");
+            assert_eq!(
+                f1.explanation, f2.explanation,
+                "Factor explanations should be stable"
+            );
+        }
+    }
+
+    // ========================================================================
+    // wa-upg.6.4: JSON Schema Validation Tests
+    // ========================================================================
+
+    #[test]
+    fn risk_score_json_schema_has_required_fields() {
+        let engine = PolicyEngine::permissive();
+
+        let mut caps = PaneCapabilities::default();
+        caps.command_running = true;
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(caps)
+            .with_command_text("sudo test");
+
+        let risk = engine.calculate_risk(&input);
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&risk).unwrap()).unwrap();
+
+        // Verify top-level fields
+        assert!(
+            json.get("score").is_some(),
+            "JSON should have 'score' field"
+        );
+        assert!(
+            json.get("factors").is_some(),
+            "JSON should have 'factors' field"
+        );
+        assert!(
+            json.get("summary").is_some(),
+            "JSON should have 'summary' field"
+        );
+
+        // Verify score is a number
+        assert!(
+            json["score"].is_number(),
+            "score should be a number, got {:?}",
+            json["score"]
+        );
+
+        // Verify factors is an array
+        assert!(
+            json["factors"].is_array(),
+            "factors should be an array, got {:?}",
+            json["factors"]
+        );
+
+        // Verify summary is a string
+        assert!(
+            json["summary"].is_string(),
+            "summary should be a string, got {:?}",
+            json["summary"]
+        );
+    }
+
+    #[test]
+    fn risk_factor_json_schema_has_required_fields() {
+        let engine = PolicyEngine::permissive();
+
+        let mut caps = PaneCapabilities::default();
+        caps.alt_screen = Some(true);
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(caps);
+
+        let risk = engine.calculate_risk(&input);
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&risk).unwrap()).unwrap();
+
+        let factors = json["factors"].as_array().expect("factors should be array");
+        assert!(!factors.is_empty(), "Should have at least one factor");
+
+        for factor in factors {
+            // Each factor must have: id, weight, explanation
+            assert!(
+                factor.get("id").is_some(),
+                "Factor should have 'id' field: {:?}",
+                factor
+            );
+            assert!(
+                factor.get("weight").is_some(),
+                "Factor should have 'weight' field: {:?}",
+                factor
+            );
+            assert!(
+                factor.get("explanation").is_some(),
+                "Factor should have 'explanation' field: {:?}",
+                factor
+            );
+
+            // Verify types
+            assert!(factor["id"].is_string(), "id should be string");
+            assert!(factor["weight"].is_number(), "weight should be number");
+            assert!(
+                factor["explanation"].is_string(),
+                "explanation should be string"
+            );
+        }
+    }
+
+    #[test]
+    fn decision_context_risk_json_is_valid() {
+        let mut engine = PolicyEngine::permissive();
+
+        let mut caps = PaneCapabilities::default();
+        caps.prompt_active = true;
+        caps.command_running = true;
+
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(caps)
+            .with_command_text("sudo test");
+
+        let decision = engine.authorize(&input);
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&decision).unwrap()).unwrap();
+
+        // Navigate to context.risk
+        let context = json.get("context").expect("Decision should have context");
+        let risk = context.get("risk").expect("Context should have risk");
+
+        // Verify risk structure
+        assert!(risk.get("score").is_some(), "Risk should have score");
+        assert!(risk.get("factors").is_some(), "Risk should have factors");
+        assert!(risk.get("summary").is_some(), "Risk should have summary");
+
+        // Verify score range
+        let score = risk["score"].as_u64().expect("score should be number");
+        assert!(score <= 100, "Score should be <= 100, got {}", score);
+    }
+
+    #[test]
+    fn risk_summary_matches_score_range() {
+        // Test each risk level
+        let test_cases = vec![
+            (0, "Low risk"),
+            (20, "Low risk"),
+            (21, "Medium risk"),
+            (50, "Medium risk"),
+            (51, "Elevated risk"),
+            (70, "Elevated risk"),
+            (71, "High risk"),
+            (100, "High risk"),
+        ];
+
+        for (score, expected_summary) in test_cases {
+            let risk = RiskScore {
+                score,
+                factors: vec![],
+                summary: risk_summary(score),
+            };
+
+            assert_eq!(
+                risk.summary, expected_summary,
+                "Score {} should have summary '{}'",
+                score, expected_summary
+            );
+        }
+    }
+
+    fn risk_summary(score: u8) -> String {
+        match score {
+            0..=20 => "Low risk".to_string(),
+            21..=50 => "Medium risk".to_string(),
+            51..=70 => "Elevated risk".to_string(),
+            71..=100 => "High risk".to_string(),
+            _ => unreachable!(),
+        }
     }
 }

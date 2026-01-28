@@ -7,7 +7,7 @@
 //! - Recent state hints for temporal context
 
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::accounts::AccountRecord;
 use crate::storage::StoredEvent;
@@ -1459,9 +1459,7 @@ impl SuggestionRule for OptimizationRule {
 
     fn applies(&self, ctx: &SuggestionContext) -> bool {
         let metrics = &ctx.system_metrics;
-        let poll_too_fast = metrics
-            .poll_interval_ms
-            .is_some_and(|ms| ms < 100);
+        let poll_too_fast = metrics.poll_interval_ms.is_some_and(|ms| ms < 100);
         let storage_large = metrics
             .storage_size_bytes
             .is_some_and(|bytes| bytes > 500 * 1024 * 1024);
@@ -1665,6 +1663,50 @@ impl SuggestionRule for FirstTimeUserRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn make_event(
+        event_type: &str,
+        rule_id: &str,
+        detected_at: i64,
+        extracted: Option<serde_json::Value>,
+    ) -> StoredEvent {
+        StoredEvent {
+            id: 1,
+            pane_id: 1,
+            rule_id: rule_id.to_string(),
+            agent_type: "codex".to_string(),
+            event_type: event_type.to_string(),
+            severity: "info".to_string(),
+            confidence: 0.9,
+            extracted,
+            matched_text: None,
+            segment_id: None,
+            detected_at,
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }
+    }
+
+    fn make_account(account_id: &str, percent: f64) -> AccountRecord {
+        let now_ms = now_epoch_ms();
+        AccountRecord {
+            id: 1,
+            account_id: account_id.to_string(),
+            service: "openai".to_string(),
+            name: Some(account_id.to_string()),
+            percent_remaining: percent,
+            reset_at: None,
+            tokens_used: None,
+            tokens_remaining: None,
+            tokens_limit: None,
+            last_refreshed_at: now_ms,
+            last_used_at: None,
+            created_at: now_ms,
+            updated_at: now_ms,
+        }
+    }
 
     #[test]
     fn test_levenshtein_distance_identical() {
@@ -2199,5 +2241,97 @@ mod tests {
         assert_eq!(format!("{}", SuggestionType::NextStep), "Next Step");
         assert_eq!(format!("{}", SuggestionType::Warning), "Warning");
         assert_eq!(format!("{}", SuggestionType::Recovery), "Recovery");
+    }
+
+    #[test]
+    fn test_account_low_rule_triggers() {
+        let rule = AccountLowRule::default();
+        let mut ctx = SuggestionContext::new();
+        ctx.add_account(make_account("acct-1", 10.0));
+
+        assert!(rule.applies(&ctx));
+        let suggestion = rule.generate(&ctx).expect("expected suggestion");
+        assert_eq!(suggestion.suggestion_type, SuggestionType::Warning);
+        assert!(suggestion.message.contains("10"));
+        assert!(suggestion.action.is_some());
+    }
+
+    #[test]
+    fn test_rate_limit_frequency_rule_triggers() {
+        let rule = RateLimitFrequencyRule::default();
+        let mut ctx = SuggestionContext::new();
+        let now_ms = now_epoch_ms();
+
+        for _ in 0..4 {
+            ctx.add_recent_event(make_event(
+                "rate_limit",
+                "core.codex:rate_limit",
+                now_ms,
+                None,
+            ));
+        }
+
+        assert!(rule.applies(&ctx));
+        let suggestion = rule.generate(&ctx).expect("expected suggestion");
+        assert_eq!(suggestion.suggestion_type, SuggestionType::Optimization);
+    }
+
+    #[test]
+    fn test_first_workflow_rule_triggers() {
+        let rule = FirstWorkflowRule;
+        let mut ctx = SuggestionContext::new();
+        ctx.add_active_workflow("handle_compaction");
+
+        assert!(rule.applies(&ctx));
+        let suggestion = rule.generate(&ctx).expect("expected suggestion");
+        assert_eq!(suggestion.suggestion_type, SuggestionType::Tip);
+    }
+
+    #[test]
+    fn test_error_recovery_rule_triggers() {
+        let rule = ErrorRecoveryRule;
+        let mut ctx = SuggestionContext::new();
+        let now_ms = now_epoch_ms();
+        ctx.add_recent_event(make_event(
+            "error.timeout",
+            "core.codex:error_timeout",
+            now_ms,
+            Some(json!({"code": "WA-4001"})),
+        ));
+
+        assert!(rule.applies(&ctx));
+        let suggestion = rule.generate(&ctx).expect("expected suggestion");
+        assert_eq!(suggestion.suggestion_type, SuggestionType::Recovery);
+        assert!(suggestion.message.contains("WA-4001"));
+    }
+
+    #[test]
+    fn test_unused_feature_rule_triggers() {
+        let rule = UnusedFeatureRule;
+        let mut ctx = SuggestionContext::new();
+        ctx.add_feature_hint(
+            FeatureHint::new(
+                "wa search",
+                "Try full-text search to find recent errors.",
+                "wa search \"error\"",
+            )
+            .with_used(false),
+        );
+
+        assert!(rule.applies(&ctx));
+        let suggestion = rule.generate(&ctx).expect("expected suggestion");
+        assert_eq!(suggestion.suggestion_type, SuggestionType::Tip);
+        assert!(suggestion.action.is_some());
+    }
+
+    #[test]
+    fn test_optimization_rule_poll_interval() {
+        let rule = OptimizationRule;
+        let mut ctx = SuggestionContext::new();
+        ctx.set_system_metrics(SystemMetrics::default().with_poll_interval_ms(50));
+
+        assert!(rule.applies(&ctx));
+        let suggestion = rule.generate(&ctx).expect("expected suggestion");
+        assert_eq!(suggestion.suggestion_type, SuggestionType::Optimization);
     }
 }

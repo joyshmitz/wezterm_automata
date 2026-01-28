@@ -2616,7 +2616,8 @@ EOF
 
     # Step 2: Start a dedicated wezterm instance with the config
     step_start "start_wezterm"
-    WA_E2E_WA_BINARY="$WA_BINARY" WEZTERM_UNIX_SOCKET="$wezterm_socket" \
+    WA_E2E_WA_BINARY="$WA_BINARY" WA_WORKSPACE="$temp_workspace" \
+        WA_DATA_DIR="$WA_DATA_DIR" WEZTERM_UNIX_SOCKET="$wezterm_socket" \
         wezterm start --always-new-process --config-file "$config_file" \
         --workspace "wa-e2e-status" > "$scenario_dir/wezterm.log" 2>&1 &
     wezterm_pid=$!

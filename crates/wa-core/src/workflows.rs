@@ -6874,6 +6874,7 @@ mod tests {
             confidence: 0.9,
             matched_text: "Auto-compact: compacted".to_string(),
             extracted: serde_json::json!({}),
+            span: (0, 0),
         };
 
         // Should find compaction workflow
@@ -6890,6 +6891,7 @@ mod tests {
             confidence: 0.8,
             matched_text: "less than 25%".to_string(),
             extracted: serde_json::json!({}),
+            span: (0, 0),
         };
 
         // Should find usage limit workflow
@@ -7266,6 +7268,7 @@ mod tests {
             confidence: 1.0,
             extracted: serde_json::Value::Null,
             matched_text: "test".to_string(),
+            span: (0, 0),
         };
         assert!(workflow.handles(&detection_event_type));
 
@@ -7278,6 +7281,7 @@ mod tests {
             confidence: 1.0,
             extracted: serde_json::Value::Null,
             matched_text: "test".to_string(),
+            span: (0, 0),
         };
         assert!(workflow.handles(&detection_rule_id));
 
@@ -7290,6 +7294,7 @@ mod tests {
             confidence: 1.0,
             extracted: serde_json::Value::Null,
             matched_text: "test".to_string(),
+            span: (0, 0),
         };
         assert!(!workflow.handles(&detection_unrelated));
     }
@@ -7450,6 +7455,7 @@ mod tests {
                     "tokens_after": 25_000
                 }),
                 matched_text: "Auto-compact: compacted 150,000 tokens to 25,000 tokens".to_string(),
+                span: (0, 0),
             };
 
             // Verify HandleCompaction handles this detection

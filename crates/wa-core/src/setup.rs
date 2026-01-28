@@ -826,8 +826,14 @@ after";
 
         assert!(block.starts_with(WA_BEGIN_MARKER));
         assert!(block.ends_with(WA_END_MARKER));
+        // User-var forwarding snippet
         assert!(block.contains("user-var-changed"));
         assert!(block.contains("wa%-"));
+        // Status update snippet
+        assert!(block.contains("update-status"));
+        assert!(block.contains("wa_last_status_update"));
+        assert!(block.contains("WA_STATUS_UPDATE_INTERVAL_MS"));
+        assert!(block.contains("--from-status"));
     }
 
     // =========================================================================

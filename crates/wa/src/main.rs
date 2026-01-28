@@ -214,15 +214,14 @@ enum Commands {
         unhandled: bool,
     },
 
-    /// Ingest external events (e.g., WezTerm user-var or status update signals)
+    /// Ingest external events (e.g., WezTerm user-var signals from shell hooks)
     Event {
-        /// Event source is a WezTerm user-var change
-        #[arg(long, conflicts_with = "from_status")]
+        /// Event source is a WezTerm user-var change (currently the only supported source)
+        #[arg(long)]
         from_uservar: bool,
 
-        /// Event source is a WezTerm status update (from Lua update-status hook)
-        #[arg(long, conflicts_with = "from_uservar")]
-        from_status: bool,
+        // NOTE: --from-status was removed in v0.2.0 (Lua performance optimization)
+        // Alt-screen detection is now handled via escape sequence parsing (see screen_state.rs).
 
         /// Pane ID that emitted the event
         #[arg(long)]
@@ -235,10 +234,6 @@ enum Commands {
         /// Raw user-var value (typically base64-encoded JSON) - required for --from-uservar
         #[arg(long, required_if_eq("from_uservar", "true"))]
         value: Option<String>,
-
-        /// JSON payload for status update - required for --from-status
-        #[arg(long, required_if_eq("from_status", "true"))]
-        payload: Option<String>,
     },
 
     /// Explain decisions and workflows using built-in templates
@@ -6044,18 +6039,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::Event {
             from_uservar,
-            from_status,
             pane,
             name,
             value,
-            payload,
         }) => {
-            if !from_uservar && !from_status {
-                eprintln!("Error: must specify either --from-uservar or --from-status.");
+            // NOTE: --from-status was removed in v0.2.0 (Lua performance optimization)
+            // Alt-screen detection is now handled via escape sequence parsing.
+            if !from_uservar {
+                eprintln!("Error: must specify --from-uservar.");
                 eprintln!(
                     "Hint: use `wa event --from-uservar --pane <id> --name <name> --value <value>`"
                 );
-                eprintln!("  or: use `wa event --from-status --pane <id> --payload '<json>'`");
                 std::process::exit(1);
             }
 
@@ -6063,122 +6057,56 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             {
                 let client = wa_core::ipc::IpcClient::new(&layout.ipc_socket_path);
 
-                if from_uservar {
-                    // Handle user-var event
-                    let name = name.expect("name required for --from-uservar");
-                    let value = value.expect("value required for --from-uservar");
-                    let name_for_log = name.clone();
-                    let value_len = value.len();
+                // Handle user-var event
+                let name = name.expect("name required for --from-uservar");
+                let value = value.expect("value required for --from-uservar");
+                let name_for_log = name.clone();
+                let value_len = value.len();
 
-                    if let Err(message) = validate_uservar_request(pane, &name, &value) {
-                        eprintln!("Error: {message}");
-                        eprintln!(
-                            "Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}"
-                        );
-                        std::process::exit(1);
-                    }
-
-                    tracing::debug!(
-                        pane_id = pane,
-                        name = %name_for_log,
-                        value_len,
-                        "Forwarding user-var event to watcher"
+                if let Err(message) = validate_uservar_request(pane, &name, &value) {
+                    eprintln!("Error: {message}");
+                    eprintln!(
+                        "Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}"
                     );
+                    std::process::exit(1);
+                }
 
-                    match client.send_user_var(pane, name, value).await {
-                        Ok(response) => {
-                            if !response.ok {
-                                let detail = response
-                                    .error
-                                    .unwrap_or_else(|| "unknown error".to_string());
-                                eprintln!("Error: watcher rejected user-var event: {detail}");
-                                eprintln!(
-                                    "Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}"
-                                );
-                                std::process::exit(1);
-                            }
-                        }
-                        Err(err) => {
-                            match err {
-                                wa_core::events::UserVarError::WatcherNotRunning { .. } => {
-                                    eprintln!("Error: {err}");
-                                    eprintln!(
-                                        "Hint: start the watcher with `wa watch` in this workspace."
-                                    );
-                                }
-                                _ => {
-                                    eprintln!("Error: failed to forward user-var event: {err}");
-                                }
-                            }
+                tracing::debug!(
+                    pane_id = pane,
+                    name = %name_for_log,
+                    value_len,
+                    "Forwarding user-var event to watcher"
+                );
+
+                match client.send_user_var(pane, name, value).await {
+                    Ok(response) => {
+                        if !response.ok {
+                            let detail = response
+                                .error
+                                .unwrap_or_else(|| "unknown error".to_string());
+                            eprintln!("Error: watcher rejected user-var event: {detail}");
                             eprintln!(
                                 "Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}"
                             );
                             std::process::exit(1);
                         }
                     }
-                } else if from_status {
-                    // Handle status update event
-                    let payload_json = payload.expect("payload required for --from-status");
-                    let payload_len = payload_json.len();
-
-                    // Parse JSON payload into StatusUpdate
-                    let update: wa_core::ipc::StatusUpdate =
-                        match serde_json::from_str(&payload_json) {
-                            Ok(u) => u,
-                            Err(e) => {
-                                eprintln!("Error: invalid status update JSON: {e}");
-                                eprintln!("Context: pane_id={pane} payload_len={payload_len}");
-                                std::process::exit(1);
+                    Err(err) => {
+                        match err {
+                            wa_core::events::UserVarError::WatcherNotRunning { .. } => {
+                                eprintln!("Error: {err}");
+                                eprintln!(
+                                    "Hint: start the watcher with `wa watch` in this workspace."
+                                );
                             }
-                        };
-
-                    // Validate pane_id matches
-                    if update.pane_id != pane {
+                            _ => {
+                                eprintln!("Error: failed to forward user-var event: {err}");
+                            }
+                        }
                         eprintln!(
-                            "Error: pane_id in payload ({}) does not match --pane ({pane})",
-                            update.pane_id
+                            "Context: pane_id={pane} name=\"{name_for_log}\" value_len={value_len}"
                         );
                         std::process::exit(1);
-                    }
-
-                    tracing::debug!(
-                        pane_id = pane,
-                        is_alt_screen = update.is_alt_screen,
-                        "Forwarding status update to watcher"
-                    );
-
-                    match client.send_status_update(update).await {
-                        Ok(response) => {
-                            if !response.ok {
-                                let detail = response
-                                    .error
-                                    .unwrap_or_else(|| "unknown error".to_string());
-                                eprintln!("Error: watcher rejected status update: {detail}");
-                                eprintln!("Context: pane_id={pane} payload_len={payload_len}");
-                                std::process::exit(1);
-                            }
-                            // Print response data for debugging
-                            if let Some(data) = response.data {
-                                if let Ok(json) = serde_json::to_string(&data) {
-                                    tracing::debug!(response = %json, "Status update processed");
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            match err {
-                                wa_core::events::UserVarError::WatcherNotRunning { .. } => {
-                                    eprintln!("Error: {err}");
-                                    eprintln!(
-                                        "Hint: start the watcher with `wa watch` in this workspace."
-                                    );
-                                }
-                                _ => {
-                                    eprintln!("Error: failed to forward status update: {err}");
-                                }
-                            }
-                            eprintln!("Context: pane_id={pane} payload_len={payload_len}");
-                            std::process::exit(1);
-                        }
                     }
                 }
             }

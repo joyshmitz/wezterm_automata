@@ -273,43 +273,9 @@ impl PaneEntry {
         self.last_seen_at = epoch_ms();
     }
 
-    /// Update from a status update (from Lua hooks)
-    ///
-    /// Updates title, dimensions, cursor, and alt-screen state from the IPC payload.
-    /// Returns whether the alt-screen state changed.
-    pub fn update_from_status(
-        &mut self,
-        title: Option<String>,
-        dimensions: Option<(u32, u32)>,
-        cursor: Option<(u32, u32)>,
-        is_alt_screen: bool,
-        ts: i64,
-    ) -> bool {
-        let alt_changed = self.is_alt_screen != is_alt_screen;
-
-        // Update title if provided
-        if let Some(new_title) = title {
-            self.info.title = Some(new_title);
-        }
-
-        // Update dimensions if provided
-        if let Some((cols, rows)) = dimensions {
-            self.info.cols = Some(cols);
-            self.info.rows = Some(rows);
-        }
-
-        // Update cursor if provided
-        if let Some((col, row)) = cursor {
-            self.info.cursor_x = Some(col);
-            self.info.cursor_y = Some(row);
-        }
-
-        self.is_alt_screen = is_alt_screen;
-        self.last_status_at = Some(ts);
-        self.last_seen_at = epoch_ms();
-
-        alt_changed
-    }
+    // NOTE: update_from_status was removed in v0.2.0 to eliminate Lua performance bottleneck.
+    // Alt-screen detection is now handled via escape sequence parsing (see screen_state.rs).
+    // Pane metadata (title, dimensions, cursor) is obtained via `wezterm cli list`.
 
     /// Check if this pane should be observed
     #[must_use]
@@ -870,40 +836,9 @@ impl PaneRegistry {
             .collect()
     }
 
-    /// Update pane state from a status update (from Lua IPC hooks).
-    ///
-    /// This updates the in-memory pane entry with title, dimensions, cursor,
-    /// and alt-screen state from the status update payload.
-    ///
-    /// Returns `Some(alt_changed)` if the pane was updated, or `None` if:
-    /// - The pane is unknown (not tracked)
-    /// - The pane is ignored (not observed)
-    ///
-    /// # Arguments
-    /// * `pane_id` - The pane ID to update
-    /// * `title` - New title (if provided)
-    /// * `dimensions` - New (cols, rows) (if provided)
-    /// * `cursor` - New (col, row) cursor position (if provided)
-    /// * `is_alt_screen` - Whether pane is in alt-screen mode
-    /// * `ts` - Timestamp of the status update (epoch ms)
-    pub fn update_from_status(
-        &mut self,
-        pane_id: u64,
-        title: Option<String>,
-        dimensions: Option<(u32, u32)>,
-        cursor: Option<(u32, u32)>,
-        is_alt_screen: bool,
-        ts: i64,
-    ) -> Option<bool> {
-        let entry = self.entries.get_mut(&pane_id)?;
-
-        // Don't update ignored panes
-        if !entry.should_observe() {
-            return None;
-        }
-
-        Some(entry.update_from_status(title, dimensions, cursor, is_alt_screen, ts))
-    }
+    // NOTE: update_from_status was removed in v0.2.0 to eliminate Lua performance bottleneck.
+    // Alt-screen detection is now handled via escape sequence parsing (see screen_state.rs).
+    // Pane metadata (title, dimensions, cursor) is obtained via `wezterm cli list`.
 
     /// Get the alt-screen state for a pane
     #[must_use]

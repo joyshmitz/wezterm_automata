@@ -192,19 +192,9 @@ pub enum Event {
         name: String,
         payload: UserVarPayload,
     },
-
-    /// Status update received via IPC from WezTerm Lua hook
-    StatusUpdateReceived {
-        pane_id: u64,
-        /// Whether alt-screen state changed
-        alt_screen_changed: bool,
-        /// New alt-screen state (if changed)
-        is_alt_screen: bool,
-        /// Whether title changed
-        title_changed: bool,
-        /// New title (if changed)
-        new_title: Option<String>,
-    },
+    // NOTE: StatusUpdateReceived was removed in v0.2.0 to eliminate Lua performance bottleneck.
+    // Alt-screen detection is now handled via escape sequence parsing (see screen_state.rs).
+    // Pane metadata (title, dimensions, cursor) is obtained via `wezterm cli list`.
 }
 
 impl Event {
@@ -221,7 +211,6 @@ impl Event {
             Self::WorkflowStep { .. } => "workflow_step",
             Self::WorkflowCompleted { .. } => "workflow_completed",
             Self::UserVarReceived { .. } => "user_var_received",
-            Self::StatusUpdateReceived { .. } => "status_update_received",
         }
     }
 
@@ -235,8 +224,7 @@ impl Event {
             | Self::PaneDiscovered { pane_id, .. }
             | Self::PaneDisappeared { pane_id }
             | Self::WorkflowStarted { pane_id, .. }
-            | Self::UserVarReceived { pane_id, .. }
-            | Self::StatusUpdateReceived { pane_id, .. } => Some(*pane_id),
+            | Self::UserVarReceived { pane_id, .. } => Some(*pane_id),
             Self::WorkflowStep { .. } | Self::WorkflowCompleted { .. } => None,
         }
     }
@@ -432,8 +420,7 @@ impl EventBus {
             | Event::WorkflowStarted { .. }
             | Event::WorkflowStep { .. }
             | Event::WorkflowCompleted { .. }
-            | Event::UserVarReceived { .. }
-            | Event::StatusUpdateReceived { .. } => {
+            | Event::UserVarReceived { .. } => {
                 self.send_routed(event, &self.signal_sender, &self.signal_times)
             }
         };

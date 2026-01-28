@@ -838,14 +838,50 @@ pub fn patch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
         Error::SetupError(format!("Failed to read {}: {}", config_path.display(), e))
     })?;
 
+    let wa_block = create_wa_block();
+
     // Check if already patched
     if has_wa_block(&content) {
+        let existing = extract_wa_block(&content).unwrap_or_default();
+        let normalized_existing = existing.trim_end_matches('\n');
+        let normalized_new = wa_block.trim_end_matches('\n');
+
+        if normalized_existing == normalized_new {
+            return Ok(PatchResult {
+                config_path: config_path.to_path_buf(),
+                backup_path: None,
+                modified: false,
+                message:
+                    "WezTerm config already contains wa user-var forwarding. No changes needed."
+                        .to_string(),
+            });
+        }
+
+        let contains_config_block = existing.contains("config.ssh_domains")
+            || existing.contains("config.scrollback_lines")
+            || existing.contains("config = config or {}");
+
+        if contains_config_block {
+            return Ok(PatchResult {
+                config_path: config_path.to_path_buf(),
+                backup_path: None,
+                modified: false,
+                message: "WezTerm config already contains a wa block managed by `wa setup config`. Re-run `wa setup config --apply` to update it."
+                    .to_string(),
+            });
+        }
+
+        let legacy_status =
+            existing.contains("update-status") || existing.contains("--from-status");
+        if legacy_status {
+            return patch_wezterm_config_block_at(config_path, &wa_block);
+        }
+
         return Ok(PatchResult {
             config_path: config_path.to_path_buf(),
             backup_path: None,
             modified: false,
-            message: "WezTerm config already contains wa user-var forwarding. No changes needed."
-                .to_string(),
+            message: "WezTerm config already contains a wa block. No changes needed.".to_string(),
         });
     }
 
@@ -853,7 +889,6 @@ pub fn patch_wezterm_config_at(config_path: &Path) -> Result<PatchResult> {
     let backup_path = create_backup(config_path)?;
 
     // Append the wa block (insert before return if present)
-    let wa_block = create_wa_block();
     let new_content = insert_wa_block(&content, &wa_block);
 
     // Write the modified content
@@ -1146,6 +1181,44 @@ return config
         // Content should be unchanged
         let content_after = fs::read_to_string(file.path()).unwrap();
         assert_eq!(original, content_after);
+    }
+
+    #[test]
+    fn test_patch_upgrades_legacy_status_update_block() {
+        let original = r"local wezterm = require 'wezterm'
+local config = {}
+
+-- WA-BEGIN (do not edit this block)
+-- Forward user-var events to wa daemon
+wezterm.on('user-var-changed', function(window, pane, name, value)
+  if name:match('^wa%-') then
+    wezterm.background_child_process {
+      'wa', 'event', '--from-uservar',
+      '--pane', tostring(pane:pane_id()),
+      '--name', name,
+      '--value', value
+    }
+  end
+end)
+-- Forward pane status updates to wa daemon (rate-limited)
+wezterm.on('update-status', function(window, pane)
+  wezterm.background_child_process { 'wa', 'event', '--from-status' }
+end)
+-- WA-END
+
+return config
+";
+        let file = create_temp_config(original);
+
+        let result = patch_wezterm_config_at(file.path()).unwrap();
+
+        assert!(result.modified);
+        assert!(result.backup_path.is_some());
+
+        let content_after = fs::read_to_string(file.path()).unwrap();
+        assert!(content_after.contains("user-var-changed"));
+        assert!(!content_after.contains("update-status"));
+        assert!(!content_after.contains("--from-status"));
     }
 
     #[test]

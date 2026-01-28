@@ -13,7 +13,7 @@
 //!
 //! Converts repeated snapshots into minimal deltas using overlap matching.
 
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::hash::Hash;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1111,7 +1111,8 @@ struct PaneCacheState {
 pub struct OutputCache {
     config: OutputCacheConfig,
     global_hashes: HashMap<u64, i64>,
-    lru_order: Vec<u64>,
+    /// LRU order tracking - uses VecDeque for O(1) removal from front
+    lru_order: VecDeque<u64>,
     pane_states: HashMap<u64, PaneCacheState>,
     hits: u64,
     misses: u64,
@@ -1124,7 +1125,7 @@ impl OutputCache {
         Self {
             config,
             global_hashes: HashMap::new(),
-            lru_order: Vec::new(),
+            lru_order: VecDeque::new(),
             pane_states: HashMap::new(),
             hits: 0,
             misses: 0,
@@ -1187,15 +1188,15 @@ impl OutputCache {
             return;
         }
 
+        // Evict oldest entries if at capacity - O(1) with VecDeque
         while self.lru_order.len() >= self.config.global_lru_capacity {
-            if let Some(oldest_hash) = self.lru_order.first().copied() {
-                self.lru_order.remove(0);
+            if let Some(oldest_hash) = self.lru_order.pop_front() {
                 self.global_hashes.remove(&oldest_hash);
             }
         }
 
         self.global_hashes.insert(hash, now);
-        self.lru_order.push(hash);
+        self.lru_order.push_back(hash);
     }
 
     /// Prune stale per-pane entries older than max_age.

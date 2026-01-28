@@ -259,6 +259,14 @@ enum Commands {
         #[arg(long = "list-hosts")]
         list_hosts: bool,
 
+        /// Apply setup changes automatically (non-destructive)
+        #[arg(long, global = true)]
+        apply: bool,
+
+        /// Show what would change without modifying files
+        #[arg(long, global = true)]
+        dry_run: bool,
+
         #[command(subcommand)]
         command: Option<SetupCommands>,
     },
@@ -603,6 +611,26 @@ enum SetupCommands {
     Remote {
         /// SSH host (from ~/.ssh/config)
         host: String,
+
+        /// Skip interactive confirmation (only with --apply)
+        #[arg(long)]
+        yes: bool,
+
+        /// Install wa on the remote host
+        #[arg(long)]
+        install_wa: bool,
+
+        /// Path to local wa binary for scp
+        #[arg(long)]
+        wa_path: Option<PathBuf>,
+
+        /// Install wa from git (optional tag or revision)
+        #[arg(long)]
+        wa_version: Option<String>,
+
+        /// Timeout per remote command (seconds)
+        #[arg(long, default_value = "30")]
+        timeout_secs: u64,
     },
 
     /// Generate WezTerm config additions
@@ -6106,6 +6134,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::Setup {
             list_hosts,
+            apply,
+            dry_run,
             command,
         }) => {
             if list_hosts {
@@ -6200,20 +6230,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         );
                         println!("\nRun 'wa doctor' to verify your configuration.");
                     }
-                    SetupCommands::Remote { host } => {
-                        println!("wa setup remote - Remote Host Setup for '{host}'\n");
-                        println!("Remote setup is not yet implemented.\n");
-                        println!("For now, ensure the remote host has:");
-                        println!("  1. WezTerm SSH domain configured in your wezterm.lua");
-                        println!("  2. Adequate scrollback_lines setting");
-                        println!("\nExample SSH domain configuration:");
-                        println!("  config.ssh_domains = {{");
-                        println!("    {{");
-                        println!("      name = '{host}',");
-                        println!("      remote_address = '{host}.example.com',");
-                        println!("      username = 'your_user',");
-                        println!("    }},");
-                        println!("  }}");
+                    SetupCommands::Remote {
+                        host,
+                        yes,
+                        install_wa,
+                        wa_path,
+                        wa_version,
+                        timeout_secs,
+                    } => {
+                        let options = RemoteSetupOptions {
+                            apply,
+                            dry_run,
+                            yes,
+                            install_wa,
+                            wa_path: wa_path.as_deref(),
+                            wa_version: wa_version.as_deref(),
+                            timeout_secs,
+                            verbose: cli.verbose,
+                        };
+                        run_remote_setup(&host, &options)?;
                     }
                     SetupCommands::Config => {
                         println!("wa setup config - Generate WezTerm Config Additions\n");
@@ -6344,9 +6379,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 }
             } else {
-                eprintln!("Error: Missing setup subcommand.");
-                eprintln!("Run `wa setup --help` for usage.");
-                std::process::exit(1);
+                run_guided_setup(apply, dry_run, cli.verbose)?;
             }
         }
 
@@ -6979,6 +7012,655 @@ fn check_wezterm_scrollback() -> Result<(u64, std::path::PathBuf), String> {
         "No WezTerm config file found (~/.config/wezterm/wezterm.lua or ~/.wezterm.lua)"
             .to_string(),
     )
+}
+
+fn detect_wezterm_version() -> Option<String> {
+    let output = std::process::Command::new("wezterm")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = stdout.trim();
+    if text.is_empty() {
+        let text = stderr.trim();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        }
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn format_backup_hint(path: &Path) -> String {
+    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+    let backup_name = format!("{filename}.bak.<timestamp>");
+    path.with_file_name(backup_name).display().to_string()
+}
+
+fn run_guided_setup(apply: bool, dry_run: bool, verbose: bool) -> anyhow::Result<()> {
+    use wa_core::setup::{self, ShellType};
+
+    let apply_changes = apply && !dry_run;
+
+    println!("wa setup - Guided setup\n");
+    if dry_run {
+        println!("(dry run) No changes will be made.\n");
+    } else if apply_changes {
+        println!("Applying non-destructive changes where needed.\n");
+    } else {
+        println!("Run with --apply to make changes automatically.\n");
+    }
+
+    // Step 1: WezTerm CLI availability
+    if let Some(version) = detect_wezterm_version() {
+        println!("✓ WezTerm CLI detected: {version}");
+    } else {
+        println!("⚠ WezTerm CLI not detected in PATH.");
+        println!("  Install WezTerm and ensure `wezterm` is available.");
+    }
+
+    // Step 2: scrollback configuration
+    match check_wezterm_scrollback() {
+        Ok((lines, path)) => {
+            if verbose {
+                println!("  WezTerm config: {}", path.display());
+            }
+            if lines >= RECOMMENDED_SCROLLBACK_LINES {
+                println!("✓ scrollback_lines = {} (ok)", lines);
+            } else {
+                println!(
+                    "⚠ scrollback_lines = {} (recommended ≥ {})",
+                    lines, RECOMMENDED_SCROLLBACK_LINES
+                );
+                println!(
+                    "  Add to {}: config.scrollback_lines = {}",
+                    path.display(),
+                    RECOMMENDED_SCROLLBACK_LINES
+                );
+            }
+        }
+        Err(err) => {
+            println!("⚠ scrollback_lines check: {err}");
+            println!("  Add: config.scrollback_lines = {RECOMMENDED_SCROLLBACK_LINES}");
+        }
+    }
+
+    // Step 3: WezTerm user-var forwarding + status update block
+    match setup::locate_wezterm_config() {
+        Ok(path) => {
+            if verbose {
+                println!("  WezTerm config path: {}", path.display());
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    if setup::has_wa_block(&content) {
+                        println!("✓ wezterm.lua already patched (wa block present)");
+                    } else if apply_changes {
+                        let result = setup::patch_wezterm_config_at(&path)?;
+                        println!("✓ {}", result.message);
+                        if let Some(backup) = result.backup_path {
+                            println!("  Backup: {}", backup.display());
+                        }
+                    } else {
+                        println!("⚠ wezterm.lua missing wa block: {}", path.display());
+                        println!(
+                            "  Would patch and create backup: {}",
+                            format_backup_hint(&path)
+                        );
+                        println!("  Run: wa setup patch");
+                    }
+                }
+                Err(err) => {
+                    println!("⚠ Failed to read {}: {}", path.display(), err);
+                }
+            }
+        }
+        Err(err) => {
+            println!("⚠ WezTerm config not found: {err}");
+            println!("  Create ~/.config/wezterm/wezterm.lua then run: wa setup patch");
+        }
+    }
+
+    // Step 4: Shell OSC 133 integration
+    match ShellType::detect() {
+        Some(shell_type) => match setup::locate_shell_rc(shell_type) {
+            Ok(rc_path) => {
+                if verbose {
+                    println!("  Shell rc path: {}", rc_path.display());
+                }
+                let content = if rc_path.exists() {
+                    std::fs::read_to_string(&rc_path).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                if setup::has_shell_wa_block(&content) {
+                    println!("✓ shell rc already patched ({})", shell_type.name());
+                } else if apply_changes {
+                    let result = setup::patch_shell_rc_at(&rc_path, shell_type)?;
+                    println!("✓ {}", result.message);
+                    if let Some(backup) = result.backup_path {
+                        println!("  Backup: {}", backup.display());
+                    }
+                } else {
+                    println!("⚠ shell rc missing OSC 133 markers ({})", shell_type.name());
+                    if rc_path.exists() {
+                        println!(
+                            "  Would patch and create backup: {}",
+                            format_backup_hint(&rc_path)
+                        );
+                    } else {
+                        println!("  Would create {}", rc_path.display());
+                    }
+                    println!("  Run: wa setup shell");
+                }
+            }
+            Err(err) => {
+                println!("⚠ Shell rc not found: {err}");
+            }
+        },
+        None => {
+            println!("⚠ Could not detect shell from $SHELL (skip OSC 133 setup)");
+        }
+    }
+
+    // Step 5: SSH hosts (optional)
+    match setup::locate_ssh_config() {
+        Ok(path) => match setup::load_ssh_hosts(&path) {
+            Ok(hosts) => {
+                println!(
+                    "✓ SSH config found: {} ({} host(s))",
+                    path.display(),
+                    hosts.len()
+                );
+                println!("  Run: wa setup --list-hosts");
+            }
+            Err(err) => {
+                println!("⚠ Failed to parse SSH config: {err}");
+            }
+        },
+        Err(_) => {
+            println!("• No SSH config detected (optional).");
+        }
+    }
+
+    println!("\nNext steps:");
+    println!("  wa daemon start");
+    println!("  wa status");
+    println!("  wa robot state");
+
+    Ok(())
+}
+
+const REMOTE_MUX_SERVICE_UNIT: &str = r"[Unit]
+Description=WezTerm Mux Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/wezterm-mux-server --daemonize=false
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+";
+
+struct RemoteCommandOutput {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+    duration_ms: u128,
+}
+
+struct RemoteSetupOptions<'a> {
+    apply: bool,
+    dry_run: bool,
+    yes: bool,
+    install_wa: bool,
+    wa_path: Option<&'a Path>,
+    wa_version: Option<&'a str>,
+    timeout_secs: u64,
+    verbose: bool,
+}
+
+fn run_remote_command(
+    host: &str,
+    command: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<RemoteCommandOutput> {
+    use std::process::{Command, Stdio};
+    use std::thread::sleep;
+
+    let start = std::time::Instant::now();
+    let mut child = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg(format!("ConnectTimeout={}", timeout.as_secs()))
+        .arg(host)
+        .arg(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    loop {
+        if let Some(_status) = child.try_wait()? {
+            break;
+        }
+        if start.elapsed() > timeout {
+            let _ = child.kill();
+            anyhow::bail!("timeout after {}s", timeout.as_secs());
+        }
+        sleep(std::time::Duration::from_millis(100));
+    }
+
+    let output = child.wait_with_output()?;
+    Ok(RemoteCommandOutput {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        duration_ms: start.elapsed().as_millis(),
+    })
+}
+
+fn print_remote_output(
+    redactor: &wa_core::policy::Redactor,
+    label: &str,
+    text: &str,
+    verbose: bool,
+) {
+    if !verbose {
+        return;
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let redacted = redactor.redact(trimmed);
+    println!("  {label}: {redacted}");
+}
+
+fn run_remote_step(
+    name: &str,
+    host: &str,
+    command: &str,
+    timeout: std::time::Duration,
+    redactor: &wa_core::policy::Redactor,
+    verbose: bool,
+    require_success: bool,
+) -> anyhow::Result<RemoteCommandOutput> {
+    if verbose {
+        let redacted_cmd = redactor.redact(command);
+        println!("• {name}");
+        println!("  cmd: {redacted_cmd}");
+    } else {
+        println!("• {name}");
+    }
+
+    let output = run_remote_command(host, command, timeout)?;
+    if require_success && !output.status.success() {
+        print_remote_output(redactor, "stdout", &output.stdout, true);
+        print_remote_output(redactor, "stderr", &output.stderr, true);
+        anyhow::bail!(
+            "{} failed (exit {:?})",
+            name,
+            output.status.code().unwrap_or(-1)
+        );
+    }
+
+    print_remote_output(redactor, "stdout", &output.stdout, verbose);
+    print_remote_output(redactor, "stderr", &output.stderr, verbose);
+    println!("  ✓ done in {} ms", output.duration_ms);
+    Ok(output)
+}
+
+fn run_remote_setup(host: &str, options: &RemoteSetupOptions<'_>) -> anyhow::Result<()> {
+    use std::io::Write;
+    use wa_core::policy::Redactor;
+
+    let timeout = std::time::Duration::from_secs(options.timeout_secs.max(5));
+    let apply_changes = options.apply && !options.dry_run;
+    let redactor = Redactor::new();
+
+    println!("wa setup remote - Remote Host Setup for '{host}'\n");
+    if options.dry_run || !apply_changes {
+        println!("(dry run) No changes will be made.\n");
+    } else {
+        println!("Applying non-destructive changes.\n");
+    }
+
+    if apply_changes && !options.yes {
+        println!("This will run remote commands on {host}.");
+        print!("Proceed? [y/N]: ");
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        let confirmed = matches!(input.trim().to_lowercase().as_str(), "y" | "yes");
+        if !confirmed {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    // Step 1: Connectivity check
+    run_remote_step(
+        "Check SSH connectivity",
+        host,
+        "true",
+        timeout,
+        &redactor,
+        options.verbose,
+        true,
+    )?;
+
+    // Step 2: Detect package manager
+    let pkg_output = run_remote_step(
+        "Detect package manager",
+        host,
+        "command -v apt-get || command -v dnf || command -v yum || command -v pacman || true",
+        timeout,
+        &redactor,
+        options.verbose,
+        false,
+    )?;
+    let pkg_manager = pkg_output
+        .stdout
+        .lines()
+        .next()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty());
+
+    // Step 3: Detect WezTerm
+    let wezterm_output = run_remote_step(
+        "Detect WezTerm",
+        host,
+        "command -v wezterm || true",
+        timeout,
+        &redactor,
+        options.verbose,
+        false,
+    )?;
+    let wezterm_installed = !wezterm_output.stdout.trim().is_empty();
+    if wezterm_installed {
+        let version_output = run_remote_step(
+            "WezTerm version",
+            host,
+            "wezterm --version || true",
+            timeout,
+            &redactor,
+            options.verbose,
+            false,
+        )?;
+        if !version_output.stdout.trim().is_empty() {
+            println!("  Version: {}", version_output.stdout.trim());
+        }
+    }
+
+    if !wezterm_installed {
+        match pkg_manager.as_deref() {
+            Some(path) if path.contains("apt-get") => {
+                if apply_changes {
+                    run_remote_step(
+                        "Install WezTerm (apt)",
+                        host,
+                        "sudo apt-get update && sudo apt-get install -y wezterm",
+                        timeout,
+                        &redactor,
+                        options.verbose,
+                        true,
+                    )?;
+                } else {
+                    println!("• Would install WezTerm via apt");
+                    println!("  cmd: sudo apt-get update && sudo apt-get install -y wezterm");
+                }
+            }
+            Some(path) if path.contains("dnf") => {
+                if apply_changes {
+                    run_remote_step(
+                        "Install WezTerm (dnf)",
+                        host,
+                        "sudo dnf install -y wezterm",
+                        timeout,
+                        &redactor,
+                        options.verbose,
+                        true,
+                    )?;
+                } else {
+                    println!("• Would install WezTerm via dnf");
+                    println!("  cmd: sudo dnf install -y wezterm");
+                }
+            }
+            Some(path) if path.contains("yum") => {
+                if apply_changes {
+                    run_remote_step(
+                        "Install WezTerm (yum)",
+                        host,
+                        "sudo yum install -y wezterm",
+                        timeout,
+                        &redactor,
+                        options.verbose,
+                        true,
+                    )?;
+                } else {
+                    println!("• Would install WezTerm via yum");
+                    println!("  cmd: sudo yum install -y wezterm");
+                }
+            }
+            Some(path) if path.contains("pacman") => {
+                if apply_changes {
+                    run_remote_step(
+                        "Install WezTerm (pacman)",
+                        host,
+                        "sudo pacman -Sy --noconfirm wezterm",
+                        timeout,
+                        &redactor,
+                        options.verbose,
+                        true,
+                    )?;
+                } else {
+                    println!("• Would install WezTerm via pacman");
+                    println!("  cmd: sudo pacman -Sy --noconfirm wezterm");
+                }
+            }
+            _ => {
+                println!("⚠ No supported package manager detected; install WezTerm manually.");
+            }
+        }
+    }
+
+    // Step 4: Install mux-server user service unit
+    let service_path = "~/.config/systemd/user/wezterm-mux-server.service";
+    let check_service_cmd = format!("cat {service_path} 2>/dev/null || true");
+    let service_output = run_remote_step(
+        "Check mux service unit",
+        host,
+        &check_service_cmd,
+        timeout,
+        &redactor,
+        options.verbose,
+        false,
+    )?;
+    let existing_service = service_output.stdout.trim();
+    let expected_service = REMOTE_MUX_SERVICE_UNIT.trim();
+    if existing_service == expected_service {
+        println!("✓ mux service unit already up to date");
+    } else if existing_service.is_empty() {
+        if apply_changes {
+            let install_cmd = format!(
+                "mkdir -p ~/.config/systemd/user && cat > {service_path} <<'EOF'\n{REMOTE_MUX_SERVICE_UNIT}EOF"
+            );
+            run_remote_step(
+                "Install mux service unit",
+                host,
+                &install_cmd,
+                timeout,
+                &redactor,
+                options.verbose,
+                true,
+            )?;
+        } else {
+            println!("• Would install mux service unit at {service_path}");
+        }
+    } else {
+        println!("⚠ mux service unit exists but differs; leaving unchanged.");
+        if apply_changes {
+            println!("  Remove or update {service_path} manually if desired.");
+        }
+    }
+
+    if apply_changes {
+        run_remote_step(
+            "systemctl --user daemon-reload",
+            host,
+            "systemctl --user daemon-reload",
+            timeout,
+            &redactor,
+            options.verbose,
+            true,
+        )?;
+        run_remote_step(
+            "Enable mux service",
+            host,
+            "systemctl --user enable --now wezterm-mux-server",
+            timeout,
+            &redactor,
+            options.verbose,
+            true,
+        )?;
+    } else {
+        println!("• Would run: systemctl --user daemon-reload");
+        println!("• Would run: systemctl --user enable --now wezterm-mux-server");
+    }
+
+    let status_output = run_remote_step(
+        "Check mux service status",
+        host,
+        "systemctl --user is-active wezterm-mux-server || true",
+        timeout,
+        &redactor,
+        options.verbose,
+        false,
+    )?;
+    let status = status_output.stdout.trim();
+    if status == "active" {
+        println!("✓ mux service is active");
+    } else if !status.is_empty() {
+        println!("⚠ mux service status: {status}");
+    }
+
+    // Step 5: Enable linger
+    let linger_output = run_remote_step(
+        "Check linger",
+        host,
+        "loginctl show-user $USER -p Linger || true",
+        timeout,
+        &redactor,
+        options.verbose,
+        false,
+    )?;
+    let linger_enabled = linger_output
+        .stdout
+        .lines()
+        .any(|line| line.trim_end() == "Linger=yes");
+    if linger_enabled {
+        println!("✓ linger already enabled");
+    } else if apply_changes {
+        run_remote_step(
+            "Enable linger",
+            host,
+            "sudo loginctl enable-linger $USER",
+            timeout,
+            &redactor,
+            options.verbose,
+            true,
+        )?;
+    } else {
+        println!("• Would run: sudo loginctl enable-linger $USER");
+    }
+
+    // Step 6: Optional wa install
+    if options.install_wa {
+        if apply_changes {
+            run_remote_step(
+                "Ensure ~/.local/bin exists",
+                host,
+                "mkdir -p ~/.local/bin",
+                timeout,
+                &redactor,
+                options.verbose,
+                true,
+            )?;
+
+            if let Some(path) = options.wa_path {
+                if !path.exists() {
+                    anyhow::bail!("wa_path does not exist: {}", path.display());
+                }
+                let scp_status = std::process::Command::new("scp")
+                    .arg(path)
+                    .arg(format!("{host}:~/.local/bin/wa"))
+                    .status()?;
+                if !scp_status.success() {
+                    anyhow::bail!("scp failed with status {:?}", scp_status.code());
+                }
+                run_remote_step(
+                    "chmod +x ~/.local/bin/wa",
+                    host,
+                    "chmod +x ~/.local/bin/wa",
+                    timeout,
+                    &redactor,
+                    options.verbose,
+                    true,
+                )?;
+            } else if let Some(version) = options.wa_version {
+                let install_cmd = if version.eq_ignore_ascii_case("git") {
+                    "cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git wa"
+                        .to_string()
+                } else {
+                    format!(
+                        "cargo install --git https://github.com/Dicklesworthstone/wezterm_automata.git --tag {} wa",
+                        version
+                    )
+                };
+                run_remote_step(
+                    "Install wa via cargo",
+                    host,
+                    &install_cmd,
+                    timeout,
+                    &redactor,
+                    options.verbose,
+                    true,
+                )?;
+            } else {
+                println!("⚠ --install-wa set but no --wa-path or --wa-version provided.");
+            }
+        } else {
+            println!("• Would install wa on remote host");
+            if let Some(path) = options.wa_path {
+                println!("  Would scp {}", path.display());
+            } else if let Some(version) = options.wa_version {
+                println!("  Would cargo install wa ({version})");
+            } else {
+                println!("  Provide --wa-path or --wa-version to install wa");
+            }
+        }
+    }
+
+    println!("\nRemote setup summary:");
+    println!("  Host: {host}");
+    println!(
+        "  Mode: {}",
+        if apply_changes { "apply" } else { "dry-run" }
+    );
+    println!("  Next: verify with `ssh {host} 'systemctl --user status wezterm-mux-server'`");
+
+    Ok(())
 }
 
 /// Diagnostic result for a single check

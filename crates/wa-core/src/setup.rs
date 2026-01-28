@@ -662,9 +662,50 @@ fn redact_identity_path(path: &str) -> String {
         .unwrap_or("redacted");
     if path.starts_with('~') {
         format!("~/{}", filename)
-    } else {
+    } else if path.contains('/') || path.contains('\\') {
         format!(".../{}", filename)
+    } else {
+        path.to_string()
     }
+}
+
+/// Generate a WA-managed wezterm.lua block for ssh_domains.
+#[must_use]
+pub fn generate_ssh_domains_lua(hosts: &[SshHost], scrollback_lines: u64) -> String {
+    let mut output = String::new();
+    output.push_str(WA_BEGIN_MARKER);
+    output.push('\n');
+    output.push_str("-- wa: generated ssh_domains config\n");
+    output.push_str(&format!("config.scrollback_lines = {scrollback_lines}\n\n"));
+    output.push_str("config.ssh_domains = {\n");
+
+    for host in hosts {
+        let name = lua_escape(&host.alias);
+        let remote = lua_escape(host.hostname.as_deref().unwrap_or(&host.alias));
+        output.push_str("  {\n");
+        output.push_str(&format!("    name = '{name}',\n"));
+        output.push_str(&format!("    remote_address = '{remote}',\n"));
+        if let Some(user) = host.user.as_deref() {
+            output.push_str(&format!("    username = '{}',\n", lua_escape(user)));
+        }
+        if let Some(port) = host.port {
+            output.push_str(&format!("    port = {},\n", port));
+        }
+        output.push_str("    multiplexing = 'WezTerm',\n");
+        output.push_str("  },\n");
+    }
+
+    output.push_str("}\n");
+    output.push_str(WA_END_MARKER);
+    output.push('\n');
+    output
+}
+
+fn lua_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
 }
 
 // =============================================================================
@@ -912,6 +953,28 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    fn setup_fixture(name: &str) -> &'static str {
+        match name {
+            "wezterm_missing.lua" => include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/setup/wezterm_missing.lua"
+            )),
+            "wezterm_present.lua" => include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/setup/wezterm_present.lua"
+            )),
+            "shell_missing.bashrc" => include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/setup/shell_missing.bashrc"
+            )),
+            "shell_present.bashrc" => include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/setup/shell_present.bashrc"
+            )),
+            _ => panic!("Unknown setup fixture: {name}"),
+        }
+    }
+
     fn create_temp_config(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
         write!(file, "{}", content).unwrap();
@@ -1002,6 +1065,35 @@ return config
         assert!(result.backup_path.is_none());
 
         // Content should be unchanged
+        let content_after = fs::read_to_string(file.path()).unwrap();
+        assert_eq!(original, content_after);
+    }
+
+    #[test]
+    fn test_patch_fixture_missing_inserts_once() {
+        let original = setup_fixture("wezterm_missing.lua");
+        let file = create_temp_config(original);
+
+        let result = patch_wezterm_config_at(file.path()).unwrap();
+
+        assert!(result.modified);
+        assert!(result.backup_path.is_some());
+
+        let patched = fs::read_to_string(file.path()).unwrap();
+        assert_eq!(patched.matches(WA_BEGIN_MARKER).count(), 1);
+        assert_eq!(patched.matches(WA_END_MARKER).count(), 1);
+    }
+
+    #[test]
+    fn test_patch_fixture_present_is_idempotent() {
+        let original = setup_fixture("wezterm_present.lua");
+        let file = create_temp_config(original);
+
+        let result = patch_wezterm_config_at(file.path()).unwrap();
+
+        assert!(!result.modified);
+        assert!(result.backup_path.is_none());
+
         let content_after = fs::read_to_string(file.path()).unwrap();
         assert_eq!(original, content_after);
     }
@@ -1165,6 +1257,35 @@ alias ll='ls -la'
         assert!(result.backup_path.is_none());
 
         // Content should be unchanged
+        let content_after = fs::read_to_string(file.path()).unwrap();
+        assert_eq!(original, content_after);
+    }
+
+    #[test]
+    fn test_shell_patch_fixture_missing_inserts_once() {
+        let original = setup_fixture("shell_missing.bashrc");
+        let file = create_temp_config(original);
+
+        let result = patch_shell_rc_at(file.path(), ShellType::Bash).unwrap();
+
+        assert!(result.modified);
+        assert!(result.backup_path.is_some());
+
+        let patched = fs::read_to_string(file.path()).unwrap();
+        assert_eq!(patched.matches(WA_BEGIN_MARKER_SHELL).count(), 1);
+        assert_eq!(patched.matches(WA_END_MARKER_SHELL).count(), 1);
+    }
+
+    #[test]
+    fn test_shell_patch_fixture_present_is_idempotent() {
+        let original = setup_fixture("shell_present.bashrc");
+        let file = create_temp_config(original);
+
+        let result = patch_shell_rc_at(file.path(), ShellType::Bash).unwrap();
+
+        assert!(!result.modified);
+        assert!(result.backup_path.is_none());
+
         let content_after = fs::read_to_string(file.path()).unwrap();
         assert_eq!(original, content_after);
     }

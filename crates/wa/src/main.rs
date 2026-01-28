@@ -215,13 +215,14 @@ enum Commands {
     },
 
     /// Ingest external events (e.g., WezTerm user-var signals from shell hooks)
+    ///
+    /// Note: --from-status was removed in v0.2.0 (Lua performance optimization).
+    /// Alt-screen detection is now handled via escape sequence parsing.
     Event {
         /// Event source is a WezTerm user-var change (currently the only supported source)
         #[arg(long)]
         from_uservar: bool,
 
-        // NOTE: --from-status was removed in v0.2.0 (Lua performance optimization)
-        // Alt-screen detection is now handled via escape sequence parsing (see screen_state.rs).
         /// Pane ID that emitted the event
         #[arg(long)]
         pane: u64,

@@ -209,9 +209,17 @@ pub struct PaneEntry {
     pub decision_at: i64,
     /// Generation number (increments when fingerprint changes)
     pub generation: u32,
-    /// Whether pane is in alternate screen buffer (from Lua status updates)
+    /// Whether pane is in alternate screen buffer.
+    ///
+    /// DEPRECATED: This field was populated by Lua status updates which were removed
+    /// in v0.2.0. The authoritative source for alt-screen state is now
+    /// `PaneCursor.in_alt_screen` which is populated via escape sequence detection.
+    /// This field is kept for backward compatibility but is always `false`.
     pub is_alt_screen: bool,
-    /// Timestamp of last status update (epoch ms)
+    /// Timestamp of last status update (epoch ms).
+    ///
+    /// DEPRECATED: This field was populated by Lua status updates which were removed
+    /// in v0.2.0. It is now always `None`. Kept for backward compatibility.
     pub last_status_at: Option<i64>,
 }
 

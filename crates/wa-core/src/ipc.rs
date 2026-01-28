@@ -349,14 +349,16 @@ async fn handle_pane_state(pane_id: u64, ctx: &IpcHandlerContext) -> IpcResponse
         (entry.clone(), registry.get_cursor(pane_id).cloned())
     };
 
+    // Note: "alt_screen" and "last_status_at" are deprecated fields (always false/null since v0.2.0).
+    // Use "cursor_alt_screen" for authoritative alt-screen state from escape sequence detection.
     IpcResponse::ok_with_data(serde_json::json!({
         "pane_id": pane_id,
         "known": true,
         "observed": entry.should_observe(),
-        "alt_screen": entry.is_alt_screen,
-        "last_status_at": entry.last_status_at,
+        "alt_screen": entry.is_alt_screen,  // DEPRECATED: always false, use cursor_alt_screen
+        "last_status_at": entry.last_status_at,  // DEPRECATED: always null
         "in_gap": cursor.as_ref().map(|c| c.in_gap),
-        "cursor_alt_screen": cursor.as_ref().map(|c| c.in_alt_screen),
+        "cursor_alt_screen": cursor.as_ref().map(|c| c.in_alt_screen),  // Authoritative alt-screen state
     }))
 }
 
@@ -631,6 +633,9 @@ mod tests {
             let mut registry = registry.write().await;
             registry.discovery_tick(vec![make_pane_info(7)]);
             if let Some(entry) = registry.get_entry_mut(7) {
+                // Note: These fields are deprecated and manually set here only for testing
+                // field serialization. In production, is_alt_screen is always false and
+                // last_status_at is always None since Lua status updates were removed in v0.2.0.
                 entry.is_alt_screen = true;
                 entry.last_status_at = Some(123);
             }

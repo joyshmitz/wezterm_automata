@@ -479,6 +479,30 @@ SEE ALSO:
         circuits: bool,
     },
 
+    /// Export an incident bundle for sharing or analysis
+    #[command(after_help = r#"EXAMPLES:
+    wa reproduce                      Export latest crash as incident bundle
+    wa reproduce --kind manual        Export a manual incident bundle
+    wa reproduce --out /tmp/bundle    Export to specific directory
+    wa reproduce --format json        Machine-readable output
+
+SEE ALSO:
+    wa doctor     Run diagnostics
+    wa status     System and pane overview"#)]
+    Reproduce {
+        /// Incident kind to export
+        #[arg(long, default_value = "crash")]
+        kind: String,
+
+        /// Output directory for the bundle (default: crash_dir)
+        #[arg(long)]
+        out: Option<PathBuf>,
+
+        /// Output format (text or json)
+        #[arg(short = 'f', long, default_value = "text")]
+        format: String,
+    },
+
     /// Setup helpers
     #[command(after_help = r#"EXAMPLES:
     wa setup --list-hosts             List SSH hosts from ~/.ssh/config
@@ -7115,6 +7139,60 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 );
             } else {
                 println!("All checks passed! wa is ready to use.");
+            }
+        }
+
+        Some(Commands::Reproduce { kind, out, format }) => {
+            use wa_core::crash::{IncidentKind, export_incident_bundle};
+
+            let incident_kind = match kind.to_lowercase().as_str() {
+                "crash" => IncidentKind::Crash,
+                "manual" => IncidentKind::Manual,
+                other => {
+                    eprintln!("Error: Unknown incident kind '{other}'. Use 'crash' or 'manual'.");
+                    std::process::exit(1);
+                }
+            };
+
+            let out_dir = out.unwrap_or_else(|| layout.crash_dir.clone());
+            let config_path = wa_core::config::resolve_config_path(None);
+
+            match export_incident_bundle(
+                &layout.crash_dir,
+                config_path.as_deref(),
+                &out_dir,
+                incident_kind,
+            ) {
+                Ok(result) => {
+                    if format.to_lowercase() == "json" {
+                        let json = serde_json::to_string_pretty(&result)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        println!("{json}");
+                    } else {
+                        println!("wa reproduce - Incident bundle exported\n");
+                        println!("  Kind:    {}", result.kind);
+                        println!("  Path:    {}", result.path.display());
+                        println!("  Files:   {}", result.files.len());
+                        println!("  Size:    {} bytes", result.total_size_bytes);
+                        println!("  Version: {}", result.wa_version);
+                        println!("  Time:    {}", result.exported_at);
+                        if !result.files.is_empty() {
+                            println!("\nIncluded files:");
+                            for f in &result.files {
+                                println!("  - {f}");
+                            }
+                        }
+                        println!("\nNext steps:");
+                        println!("  1. Review the bundle for sensitive data");
+                        println!("  2. Share the bundle directory for analysis");
+                        println!("  3. Run 'wa doctor' to check system health");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: Failed to export incident bundle: {e}");
+                    eprintln!("Run 'wa doctor' to check system health.");
+                    std::process::exit(1);
+                }
             }
         }
 

@@ -459,6 +459,144 @@ pub fn latest_crash_bundle(crash_dir: &Path) -> Option<CrashBundleSummary> {
 }
 
 // ---------------------------------------------------------------------------
+// Incident bundle export
+// ---------------------------------------------------------------------------
+
+/// Kind of incident to export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncidentKind {
+    Crash,
+    Manual,
+}
+
+impl std::fmt::Display for IncidentKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Crash => write!(f, "crash"),
+            Self::Manual => write!(f, "manual"),
+        }
+    }
+}
+
+/// Result of exporting an incident bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncidentBundleResult {
+    /// Path to the produced bundle directory
+    pub path: PathBuf,
+    /// Kind of incident
+    pub kind: IncidentKind,
+    /// Files included in the bundle
+    pub files: Vec<String>,
+    /// Total size in bytes
+    pub total_size_bytes: u64,
+    /// wa version
+    pub wa_version: String,
+    /// Timestamp of export
+    pub exported_at: String,
+}
+
+/// Export an incident bundle to `out_dir`.
+///
+/// Gathers the most recent crash bundle (if `kind` is `Crash`), configuration
+/// summary, and a redacted manifest into a self-contained directory.
+///
+/// Returns the path and metadata for the exported bundle.
+pub fn export_incident_bundle(
+    crash_dir: &Path,
+    config_path: Option<&Path>,
+    out_dir: &Path,
+    kind: IncidentKind,
+) -> std::io::Result<IncidentBundleResult> {
+    let ts = epoch_secs();
+    let ts_str = format_timestamp(ts);
+    let bundle_name = format!("wa_incident_{kind}_{ts_str}");
+    let bundle_dir = out_dir.join(&bundle_name);
+
+    fs::create_dir_all(&bundle_dir)?;
+
+    let redactor = Redactor::new();
+    let mut files = Vec::new();
+    let mut total_size: u64 = 0;
+
+    // 1. Include latest crash bundle contents (if crash kind)
+    if kind == IncidentKind::Crash {
+        if let Some(crash) = latest_crash_bundle(crash_dir) {
+            // Copy crash report
+            if let Some(ref report) = crash.report {
+                let json = serde_json::to_string_pretty(report)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                let redacted = redactor.redact(&json);
+                let bytes = redacted.as_bytes();
+                total_size += bytes.len() as u64;
+                write_file_sync(&bundle_dir.join("crash_report.json"), bytes)?;
+                files.push("crash_report.json".to_string());
+            }
+
+            // Copy crash manifest
+            if let Some(ref manifest) = crash.manifest {
+                let json = serde_json::to_string_pretty(manifest)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                let bytes = json.as_bytes();
+                total_size += bytes.len() as u64;
+                write_file_sync(&bundle_dir.join("crash_manifest.json"), bytes)?;
+                files.push("crash_manifest.json".to_string());
+            }
+
+            // Copy health snapshot if present in crash bundle
+            let health_path = crash.path.join("health_snapshot.json");
+            if health_path.exists() {
+                if let Ok(contents) = fs::read_to_string(&health_path) {
+                    let redacted = redactor.redact(&contents);
+                    let bytes = redacted.as_bytes();
+                    total_size += bytes.len() as u64;
+                    write_file_sync(
+                        &bundle_dir.join("health_snapshot.json"),
+                        bytes,
+                    )?;
+                    files.push("health_snapshot.json".to_string());
+                }
+            }
+        }
+    }
+
+    // 2. Include config summary (redacted) if available
+    if let Some(cfg_path) = config_path {
+        if cfg_path.exists() {
+            if let Ok(contents) = fs::read_to_string(cfg_path) {
+                let redacted = redactor.redact(&contents);
+                let bytes = redacted.as_bytes();
+                // Limit config to 64 KiB
+                if bytes.len() <= 64 * 1024 {
+                    total_size += bytes.len() as u64;
+                    write_file_sync(&bundle_dir.join("config_summary.toml"), bytes)?;
+                    files.push("config_summary.toml".to_string());
+                }
+            }
+        }
+    }
+
+    // 3. Write incident manifest
+    let result = IncidentBundleResult {
+        path: bundle_dir.clone(),
+        kind,
+        files: files.clone(),
+        total_size_bytes: total_size,
+        wa_version: crate::VERSION.to_string(),
+        exported_at: format_iso8601(ts),
+    };
+
+    let manifest_json = serde_json::to_string_pretty(&result)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    write_file_sync(
+        &bundle_dir.join("incident_manifest.json"),
+        manifest_json.as_bytes(),
+    )?;
+
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
 // Helpers (continued)
 // ---------------------------------------------------------------------------
 
@@ -1154,5 +1292,94 @@ mod tests {
 
         let latest = latest_crash_bundle(crash_dir).unwrap();
         assert_eq!(latest.report.as_ref().unwrap().message, "newer");
+    }
+
+    // -----------------------------------------------------------------------
+    // Incident bundle export tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn export_incident_bundle_crash_with_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+        let out_dir = tmp.path().join("out");
+
+        let report = test_report();
+        write_crash_bundle(&crash_dir, &report, Some(&test_snapshot())).unwrap();
+
+        let result =
+            export_incident_bundle(&crash_dir, None, &out_dir, IncidentKind::Crash).unwrap();
+
+        assert_eq!(result.kind, IncidentKind::Crash);
+        assert!(result.path.exists());
+        assert!(result.files.contains(&"crash_report.json".to_string()));
+        assert!(result.files.contains(&"crash_manifest.json".to_string()));
+        assert!(result.files.contains(&"health_snapshot.json".to_string()));
+        assert!(result.total_size_bytes > 0);
+
+        let manifest_path = result.path.join("incident_manifest.json");
+        assert!(manifest_path.exists());
+    }
+
+    #[test]
+    fn export_incident_bundle_crash_without_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+        let out_dir = tmp.path().join("out");
+
+        let result =
+            export_incident_bundle(&crash_dir, None, &out_dir, IncidentKind::Crash).unwrap();
+
+        assert_eq!(result.kind, IncidentKind::Crash);
+        assert!(result.path.exists());
+        assert!(result.files.is_empty());
+    }
+
+    #[test]
+    fn export_incident_bundle_manual_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+        let out_dir = tmp.path().join("out");
+
+        let result =
+            export_incident_bundle(&crash_dir, None, &out_dir, IncidentKind::Manual).unwrap();
+
+        assert_eq!(result.kind, IncidentKind::Manual);
+        assert!(result
+            .path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("wa_incident_manual_"));
+    }
+
+    #[test]
+    fn export_incident_bundle_includes_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+        let out_dir = tmp.path().join("out");
+        let config_path = tmp.path().join("config.toml");
+
+        fs::write(&config_path, "[ingest]\nbuffer_size = 1024\n").unwrap();
+
+        let result = export_incident_bundle(
+            &crash_dir,
+            Some(&config_path),
+            &out_dir,
+            IncidentKind::Manual,
+        )
+        .unwrap();
+
+        assert!(result.files.contains(&"config_summary.toml".to_string()));
+        let config_content =
+            fs::read_to_string(result.path.join("config_summary.toml")).unwrap();
+        assert!(config_content.contains("buffer_size"));
+    }
+
+    #[test]
+    fn incident_kind_display() {
+        assert_eq!(format!("{}", IncidentKind::Crash), "crash");
+        assert_eq!(format!("{}", IncidentKind::Manual), "manual");
     }
 }

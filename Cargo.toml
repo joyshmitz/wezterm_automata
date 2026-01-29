@@ -116,6 +116,12 @@ useless_format = "allow"
 derivable_impls = "allow"
 # if not else sometimes clearer
 if_not_else = "allow"
+# Literal strings with format args acceptable for template patterns
+literal_string_with_formatting_args = "allow"
+# Let return acceptable for clarity
+let_and_return = "allow"
+# Useless conversion acceptable for type clarity
+useless_conversion = "allow"
 # Long literals acceptable for constants
 unreadable_literal = "allow"
 # assert_eq with bool acceptable for clarity

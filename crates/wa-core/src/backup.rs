@@ -431,7 +431,7 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
                 "Failed to query tables: {e}"
             )))
         })?
-        .filter_map(std::result::Result::ok)
+        .filter_map(|r| r.ok())
         .collect();
 
     for (name, create_sql) in &tables {
@@ -494,7 +494,7 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
                 "Failed to query indexes: {e}"
             )))
         })?
-        .filter_map(std::result::Result::ok)
+        .filter_map(|r| r.ok())
         .collect();
 
     if !indexes.is_empty() {
@@ -616,13 +616,12 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 
 /// Compute total size of a directory.
 fn dir_size(path: &Path) -> u64 {
-    fs::read_dir(path)
-        .map_or(0, |entries| {
-            entries
-                .filter_map(std::result::Result::ok)
-                .map(|e| e.metadata().map_or(0, |m| m.len()))
-                .sum()
-        })
+    fs::read_dir(path).map_or(0, |entries| {
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e: std::fs::DirEntry| e.metadata().map_or(0, |m| m.len()))
+            .sum()
+    })
 }
 
 #[cfg(test)]

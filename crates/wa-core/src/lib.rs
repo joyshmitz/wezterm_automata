@@ -82,6 +82,7 @@ pub mod webhook;
 pub mod wezterm;
 pub mod workflows;
 
+#[cfg(feature = "vendored")]
 pub mod vendored;
 
 #[cfg(feature = "browser")]

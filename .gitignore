@@ -54,5 +54,8 @@ doc/
 # E2E test artifacts (runtime)
 e2e-artifacts/
 
+# Local wa runtime/config
+.wa/
+
 # Fuzzing artifacts
 fuzz/artifacts/

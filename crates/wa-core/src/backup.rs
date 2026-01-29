@@ -101,7 +101,7 @@ pub fn export_backup(
     // Determine output path
     let output_dir = match &opts.output {
         Some(p) => p.clone(),
-        None => default_backup_path(workspace_root)?,
+        None => default_backup_path(workspace_root),
     };
 
     // Create output directory
@@ -323,7 +323,7 @@ pub fn import_backup(
     // Dry-run: report what would happen and return
     if opts.dry_run {
         let safety_backup_path = if target_db_path.exists() && !opts.no_safety_backup {
-            let path = default_backup_path(workspace_root)?;
+            let path = default_backup_path(workspace_root);
             Some(path.display().to_string())
         } else {
             None
@@ -563,7 +563,7 @@ fn sha256_bytes(data: &[u8]) -> String {
 }
 
 /// Generate default backup path based on timestamp.
-fn default_backup_path(workspace_root: &Path) -> Result<PathBuf> {
+fn default_backup_path(workspace_root: &Path) -> PathBuf {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
@@ -572,7 +572,7 @@ fn default_backup_path(workspace_root: &Path) -> Result<PathBuf> {
         .join(".wa")
         .join("backups")
         .join(format!("wa_backup_{ts}"));
-    Ok(backup_dir)
+    backup_dir
 }
 
 /// Format epoch seconds as compact timestamp: YYYYMMDD_HHMMSS
@@ -769,7 +769,7 @@ mod tests {
     #[test]
     fn default_backup_path_contains_timestamp() {
         let tmp = TempDir::new().unwrap();
-        let path = default_backup_path(tmp.path()).unwrap();
+        let path = default_backup_path(tmp.path());
         let name = path.file_name().unwrap().to_string_lossy();
         assert!(name.starts_with("wa_backup_"));
     }

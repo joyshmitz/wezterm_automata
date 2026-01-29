@@ -154,7 +154,7 @@ pub struct CrashManifest {
 ///
 /// If `crash_dir` is `None` the hook still prints the panic to stderr but
 /// does not write any files.
-pub fn install_panic_hook(config: CrashConfig) {
+pub fn install_panic_hook(config: &CrashConfig) {
     let include_backtrace = config.include_backtrace;
     let crash_dir = config.crash_dir.clone();
 
@@ -262,8 +262,8 @@ pub fn write_crash_bundle(
             pid: report.pid,
             thread_name: report.thread_name.clone(),
         };
-        let json = serde_json::to_string_pretty(&redacted_report)
-            .map_err(|e| std::io::Error::other(e))?;
+        let json =
+            serde_json::to_string_pretty(&redacted_report).map_err(std::io::Error::other)?;
         let bytes = json.as_bytes();
         total_size += bytes.len() as u64;
         if total_size <= MAX_BUNDLE_SIZE as u64 {
@@ -274,8 +274,7 @@ pub fn write_crash_bundle(
 
     // 2. Write health_snapshot.json (if available)
     let has_health = if let Some(snap) = health {
-        let json = serde_json::to_string_pretty(snap)
-            .map_err(|e| std::io::Error::other(e))?;
+        let json = serde_json::to_string_pretty(snap).map_err(std::io::Error::other)?;
         let bytes = json.as_bytes();
         total_size += bytes.len() as u64;
         if total_size <= MAX_BUNDLE_SIZE as u64 {
@@ -298,8 +297,7 @@ pub fn write_crash_bundle(
             has_health_snapshot: has_health,
             bundle_size_bytes: total_size,
         };
-        let json = serde_json::to_string_pretty(&manifest)
-            .map_err(|e| std::io::Error::other(e))?;
+        let json = serde_json::to_string_pretty(&manifest).map_err(std::io::Error::other)?;
         write_file_sync(&tmp_dir.join("manifest.json"), json.as_bytes())?;
         // manifest doesn't count toward the privacy budget
     }
@@ -526,7 +524,7 @@ pub fn export_incident_bundle(
             // Copy crash report
             if let Some(ref report) = crash.report {
                 let json = serde_json::to_string_pretty(report)
-                    .map_err(|e| std::io::Error::other(e))?;
+                    .map_err(std::io::Error::other)?;
                 let redacted = redactor.redact(&json);
                 let bytes = redacted.as_bytes();
                 total_size += bytes.len() as u64;
@@ -537,7 +535,7 @@ pub fn export_incident_bundle(
             // Copy crash manifest
             if let Some(ref manifest) = crash.manifest {
                 let json = serde_json::to_string_pretty(manifest)
-                    .map_err(|e| std::io::Error::other(e))?;
+                    .map_err(std::io::Error::other)?;
                 let bytes = json.as_bytes();
                 total_size += bytes.len() as u64;
                 write_file_sync(&bundle_dir.join("crash_manifest.json"), bytes)?;
@@ -588,7 +586,7 @@ pub fn export_incident_bundle(
     };
 
     let manifest_json = serde_json::to_string_pretty(&result)
-        .map_err(|e| std::io::Error::other(e))?;
+        .map_err(std::io::Error::other)?;
     write_file_sync(
         &bundle_dir.join("incident_manifest.json"),
         manifest_json.as_bytes(),

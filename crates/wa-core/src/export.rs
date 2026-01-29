@@ -27,6 +27,7 @@ pub enum ExportKind {
 
 impl ExportKind {
     /// Parse from a string (case-insensitive).
+    #[must_use]
     pub fn from_str_loose(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "segments" | "segment" | "output" => Some(Self::Segments),
@@ -40,6 +41,7 @@ impl ExportKind {
         }
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Segments => "segments",
@@ -53,6 +55,7 @@ impl ExportKind {
     }
 
     /// All valid kind strings for help text.
+    #[must_use]
     pub fn all_names() -> &'static [&'static str] {
         &[
             "segments",

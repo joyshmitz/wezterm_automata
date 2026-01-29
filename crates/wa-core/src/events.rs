@@ -739,8 +739,7 @@ impl EventDeduplicator {
     #[must_use]
     pub fn suppressed_count(&self, key: &str) -> u64 {
         self.get(key)
-            .map(|e| e.count.saturating_sub(1))
-            .unwrap_or(0)
+            .map_or(0, |e| e.count.saturating_sub(1))
     }
 
     /// Number of tracked keys (including expired ones not yet evicted).

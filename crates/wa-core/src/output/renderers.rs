@@ -1260,17 +1260,17 @@ impl HealthSnapshotRenderer {
         });
 
         // DB writability
-        if !snapshot.db_writable {
-            checks.push(HealthDiagnostic {
-                name: "database health",
-                status: HealthDiagnosticStatus::Error,
-                detail: "database is NOT writable".to_string(),
-            });
-        } else {
+        if snapshot.db_writable {
             checks.push(HealthDiagnostic {
                 name: "database health",
                 status: HealthDiagnosticStatus::Ok,
                 detail: "writable".to_string(),
+            });
+        } else {
+            checks.push(HealthDiagnostic {
+                name: "database health",
+                status: HealthDiagnosticStatus::Error,
+                detail: "database is NOT writable".to_string(),
             });
         }
 

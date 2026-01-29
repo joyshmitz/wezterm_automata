@@ -44,6 +44,7 @@ pub mod caut;
 pub mod circuit_breaker;
 pub mod config;
 pub mod crash;
+pub mod degradation;
 pub mod dry_run;
 pub mod error;
 pub mod error_codes;

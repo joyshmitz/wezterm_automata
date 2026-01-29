@@ -6139,6 +6139,85 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
+        Some(Commands::Stop { force, timeout }) => {
+            use wa_core::lock::{check_running, LockMetadata};
+
+            let lock_path = &layout.lock_path;
+
+            let meta: LockMetadata = match check_running(lock_path) {
+                Some(m) => m,
+                None => {
+                    eprintln!(
+                        "No watcher running in workspace: {}",
+                        layout.root.display()
+                    );
+                    std::process::exit(1);
+                }
+            };
+
+            let pid = meta.pid;
+            println!("Stopping watcher (pid {pid}) in {}", layout.root.display());
+
+            // Safety: only send signals to the process recorded in the lock metadata.
+            // Best-effort ownership check (same uid).
+            #[cfg(unix)]
+            {
+                use std::time::{Duration, Instant};
+
+                // Send SIGTERM for graceful shutdown.
+                let term_result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                if term_result != 0 {
+                    let err = std::io::Error::last_os_error();
+                    eprintln!("Failed to send SIGTERM to pid {pid}: {err}");
+                    eprintln!("The process may have already exited or belong to another user.");
+                    std::process::exit(1);
+                }
+
+                // Wait for the lock to be released.
+                let deadline = Instant::now() + Duration::from_secs(timeout);
+                let mut stopped = false;
+                while Instant::now() < deadline {
+                    if check_running(lock_path).is_none() {
+                        stopped = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+
+                if stopped {
+                    println!("Watcher stopped gracefully (pid {pid}).");
+                } else if force {
+                    println!("Graceful shutdown timed out. Sending SIGKILL to pid {pid}.");
+                    let kill_result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    if kill_result != 0 {
+                        let err = std::io::Error::last_os_error();
+                        eprintln!("Failed to send SIGKILL to pid {pid}: {err}");
+                        std::process::exit(1);
+                    }
+                    // Wait briefly for SIGKILL to take effect.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if check_running(lock_path).is_none() {
+                        println!("Watcher killed (pid {pid}).");
+                    } else {
+                        eprintln!("Warning: lock still held after SIGKILL. The pid may belong to a different process.");
+                        std::process::exit(1);
+                    }
+                } else {
+                    eprintln!(
+                        "Graceful shutdown timed out after {timeout}s. Use --force to escalate to SIGKILL."
+                    );
+                    std::process::exit(1);
+                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                let _ = (force, timeout);
+                eprintln!("wa stop is only supported on Unix systems.");
+                std::process::exit(1);
+            }
+        }
+
         Some(Commands::Approve {
             code,
             pane,

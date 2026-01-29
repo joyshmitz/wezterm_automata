@@ -858,11 +858,13 @@ const BACKPRESSURE_WARN_RATIO: f64 = 0.75;
 
 impl RuntimeHandle {
     /// Current capture channel queue depth (pending items waiting for persistence).
+    #[must_use]
     pub fn capture_queue_depth(&self) -> usize {
         self.capture_tx.max_capacity() - self.capture_tx.capacity()
     }
 
     /// Maximum capture channel capacity.
+    #[must_use]
     pub fn capture_queue_capacity(&self) -> usize {
         self.capture_tx.max_capacity()
     }
@@ -986,6 +988,7 @@ impl RuntimeHandle {
             let wd = storage_guard.write_queue_depth();
             let wc = storage_guard.write_queue_capacity();
             let writable = storage_guard.is_writable().await;
+            drop(storage_guard);
             (wd, wc, writable)
         };
 

@@ -245,12 +245,14 @@ impl DegradationManager {
     /// perform any of its functions.
     pub fn enter_unavailable(&mut self, subsystem: Subsystem, reason: String) {
         let prev_attempts = match self.states.get(&subsystem) {
-            Some(DegradationLevel::Degraded {
-                recovery_attempts, ..
-            })
-            | Some(DegradationLevel::Unavailable {
-                recovery_attempts, ..
-            }) => *recovery_attempts,
+            Some(
+                DegradationLevel::Degraded {
+                    recovery_attempts, ..
+                }
+                | DegradationLevel::Unavailable {
+                    recovery_attempts, ..
+                },
+            ) => *recovery_attempts,
             _ => 0,
         };
 
@@ -318,7 +320,7 @@ impl DegradationManager {
     pub fn is_degraded(&self, subsystem: Subsystem) -> bool {
         matches!(
             self.states.get(&subsystem),
-            Some(DegradationLevel::Degraded { .. }) | Some(DegradationLevel::Unavailable { .. })
+            Some(DegradationLevel::Degraded { .. } | DegradationLevel::Unavailable { .. })
         )
     }
 
@@ -542,13 +544,10 @@ fn affected_capabilities(s: Subsystem) -> Vec<String> {
 /// Returns `true` if the global manager is not initialized (fail-open).
 #[must_use]
 pub fn is_operational(subsystem: Subsystem) -> bool {
-    DegradationManager::global()
-        .map(|dm| {
-            dm.read()
-                .map(|guard| !guard.is_degraded(subsystem))
-                .unwrap_or(true)
-        })
-        .unwrap_or(true)
+    DegradationManager::global().is_none_or(|dm| {
+        dm.read()
+            .map_or(true, |guard| !guard.is_degraded(subsystem))
+    })
 }
 
 /// Check if DB writes are currently possible.

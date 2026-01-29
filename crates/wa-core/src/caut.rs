@@ -360,4 +360,295 @@ mod tests {
         assert!(!redacted.contains("sk-"));
         assert!(redacted.contains("[REDACTED]"));
     }
+
+    // =========================================================================
+    // Fixture-based parsing tests (wa-nu4.1.5.3)
+    // =========================================================================
+
+    #[test]
+    fn parse_usage_multiple_accounts_different_quotas() {
+        let payload = json!({
+            "service": "openai",
+            "generated_at": "2026-01-28T12:00:00Z",
+            "accounts": [
+                {
+                    "id": "acc-1",
+                    "name": "Primary",
+                    "percent_remaining": 85.0,
+                    "tokens_used": 1500,
+                    "tokens_remaining": 8500,
+                    "tokens_limit": 10000,
+                    "reset_at": "2026-02-01T00:00:00Z"
+                },
+                {
+                    "id": "acc-2",
+                    "name": "Backup",
+                    "percent_remaining": 20.0,
+                    "tokens_used": 8000,
+                    "tokens_remaining": 2000,
+                    "tokens_limit": 10000
+                },
+                {
+                    "id": "acc-3",
+                    "name": "Depleted",
+                    "percent_remaining": 0.0,
+                    "tokens_used": 10000,
+                    "tokens_remaining": 0,
+                    "tokens_limit": 10000
+                }
+            ]
+        });
+
+        let parsed: CautUsage = parse_json(&payload.to_string(), 4096).expect("should parse");
+        assert_eq!(parsed.accounts.len(), 3);
+        assert!((parsed.accounts[0].percent_remaining.unwrap() - 85.0).abs() < 0.001);
+        assert!((parsed.accounts[1].percent_remaining.unwrap() - 20.0).abs() < 0.001);
+        assert!((parsed.accounts[2].percent_remaining.unwrap()).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_usage_camel_case_aliases() {
+        let payload = json!({
+            "service": "openai",
+            "accounts": [
+                {
+                    "id": "acc-1",
+                    "name": "CamelCase",
+                    "percentRemaining": 42.5,
+                    "limitHours": 24,
+                    "resetAt": "2026-02-01T00:00:00Z",
+                    "tokensUsed": 5750,
+                    "tokensRemaining": 4250,
+                    "tokensLimit": 10000
+                }
+            ]
+        });
+
+        let parsed: CautUsage = parse_json(&payload.to_string(), 4096).expect("should parse");
+        let acct = &parsed.accounts[0];
+        assert!((acct.percent_remaining.unwrap() - 42.5).abs() < 0.001);
+        assert_eq!(acct.limit_hours, Some(24));
+        assert_eq!(acct.reset_at.as_deref(), Some("2026-02-01T00:00:00Z"));
+        assert_eq!(acct.tokens_used, Some(5750));
+        assert_eq!(acct.tokens_remaining, Some(4250));
+        assert_eq!(acct.tokens_limit, Some(10000));
+    }
+
+    #[test]
+    fn parse_usage_missing_optional_fields() {
+        // Account with only required fields — all Optional fields absent
+        let payload = json!({
+            "service": "openai",
+            "accounts": [
+                {}
+            ]
+        });
+
+        let parsed: CautUsage = parse_json(&payload.to_string(), 4096).expect("should parse");
+        let acct = &parsed.accounts[0];
+        assert!(acct.id.is_none());
+        assert!(acct.name.is_none());
+        assert!(acct.percent_remaining.is_none());
+        assert!(acct.limit_hours.is_none());
+        assert!(acct.reset_at.is_none());
+        assert!(acct.tokens_used.is_none());
+        assert!(acct.tokens_remaining.is_none());
+        assert!(acct.tokens_limit.is_none());
+    }
+
+    #[test]
+    fn parse_usage_null_fields() {
+        let payload = json!({
+            "service": "openai",
+            "accounts": [
+                {
+                    "id": null,
+                    "name": null,
+                    "percent_remaining": null,
+                    "tokens_used": null,
+                    "tokens_remaining": null,
+                    "tokens_limit": null,
+                    "reset_at": null
+                }
+            ]
+        });
+
+        let parsed: CautUsage = parse_json(&payload.to_string(), 4096).expect("should parse");
+        let acct = &parsed.accounts[0];
+        assert!(acct.id.is_none());
+        assert!(acct.name.is_none());
+        assert!(acct.percent_remaining.is_none());
+        assert!(acct.tokens_used.is_none());
+    }
+
+    #[test]
+    fn parse_usage_empty_accounts_array() {
+        let payload = json!({
+            "service": "openai",
+            "generated_at": "2026-01-28T12:00:00Z",
+            "accounts": []
+        });
+
+        let parsed: CautUsage = parse_json(&payload.to_string(), 4096).expect("should parse");
+        assert!(parsed.accounts.is_empty());
+        assert_eq!(parsed.service.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn parse_usage_extra_account_fields_captured() {
+        let payload = json!({
+            "service": "openai",
+            "accounts": [
+                {
+                    "id": "acc-1",
+                    "name": "Test",
+                    "percent_remaining": 50.0,
+                    "custom_field": "hello",
+                    "nested_data": { "deep": true }
+                }
+            ]
+        });
+
+        let parsed: CautUsage = parse_json(&payload.to_string(), 4096).expect("should parse");
+        let acct = &parsed.accounts[0];
+        assert!(acct.extra.contains_key("custom_field"));
+        assert!(acct.extra.contains_key("nested_data"));
+    }
+
+    #[test]
+    fn parse_refresh_with_multiple_accounts() {
+        let payload = json!({
+            "service": "openai",
+            "refreshed_at": "2026-01-28T12:00:00Z",
+            "accounts": [
+                { "id": "acc-1", "name": "Alpha", "percent_remaining": 90.0 },
+                { "id": "acc-2", "name": "Beta", "percent_remaining": 10.0 }
+            ]
+        });
+
+        let parsed: CautRefresh = parse_json(&payload.to_string(), 4096).expect("should parse");
+        assert_eq!(parsed.accounts.len(), 2);
+        assert_eq!(parsed.refreshed_at.as_deref(), Some("2026-01-28T12:00:00Z"));
+    }
+
+    #[test]
+    fn parse_minimal_valid_json_object() {
+        // Bare minimum: empty object with defaults
+        let parsed: CautUsage = parse_json("{}", 4096).expect("should parse");
+        assert!(parsed.service.is_none());
+        assert!(parsed.accounts.is_empty());
+    }
+
+    #[test]
+    fn parse_error_preview_truncated_at_limit() {
+        let long_input = "x".repeat(500);
+        let err = parse_json::<CautUsage>(&long_input, 50).expect_err("should error");
+        match err {
+            CautError::InvalidJson { preview, .. } => {
+                // Preview should be truncated + "..."
+                assert!(preview.len() <= 54); // 50 chars + "..."
+                assert!(preview.ends_with("..."));
+            }
+            other => panic!("Expected InvalidJson, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_deterministic_across_calls() {
+        let payload = json!({
+            "service": "openai",
+            "accounts": [
+                { "id": "a", "percent_remaining": 50.0, "tokens_used": 100 },
+                { "id": "b", "percent_remaining": 30.0, "tokens_used": 200 }
+            ]
+        });
+        let input = payload.to_string();
+
+        let p1: CautUsage = parse_json(&input, 4096).expect("first parse");
+        let p2: CautUsage = parse_json(&input, 4096).expect("second parse");
+
+        assert_eq!(p1.accounts.len(), p2.accounts.len());
+        for (a, b) in p1.accounts.iter().zip(p2.accounts.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.percent_remaining, b.percent_remaining);
+            assert_eq!(a.tokens_used, b.tokens_used);
+        }
+    }
+
+    #[test]
+    fn caut_service_display() {
+        assert_eq!(CautService::OpenAI.as_str(), "openai");
+        assert_eq!(format!("{}", CautService::OpenAI), "openai");
+    }
+
+    #[test]
+    fn caut_error_remediation_not_installed() {
+        let err = CautError::NotInstalled;
+        let rem = err.remediation();
+        assert!(!rem.summary.is_empty());
+        assert!(!rem.commands.is_empty());
+    }
+
+    #[test]
+    fn caut_error_remediation_timeout() {
+        let err = CautError::Timeout { timeout_secs: 10 };
+        let rem = err.remediation();
+        assert!(rem.summary.contains("10s"));
+    }
+
+    #[test]
+    fn caut_error_remediation_non_zero_exit() {
+        let err = CautError::NonZeroExit {
+            status: 1,
+            stderr: "auth failed".to_string(),
+        };
+        let rem = err.remediation();
+        assert!(!rem.summary.is_empty());
+    }
+
+    #[test]
+    fn caut_error_remediation_output_too_large() {
+        let err = CautError::OutputTooLarge {
+            bytes: 500_000,
+            max_bytes: 256_000,
+        };
+        let rem = err.remediation();
+        assert!(!rem.summary.is_empty());
+    }
+
+    #[test]
+    fn caut_error_remediation_invalid_json() {
+        let err = CautError::InvalidJson {
+            message: "expected value".to_string(),
+            preview: "{bad".to_string(),
+        };
+        let rem = err.remediation();
+        assert!(!rem.summary.is_empty());
+    }
+
+    #[test]
+    fn caut_error_remediation_io() {
+        let err = CautError::Io {
+            message: "permission denied".to_string(),
+        };
+        let rem = err.remediation();
+        assert!(!rem.summary.is_empty());
+    }
+
+    #[test]
+    fn categorize_not_found_as_not_installed() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let caut_err = categorize_io_error(&io_err);
+        assert!(matches!(caut_err, CautError::NotInstalled));
+    }
+
+    #[test]
+    fn categorize_other_io_as_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let caut_err = categorize_io_error(&io_err);
+        match caut_err {
+            CautError::Io { message } => assert!(message.contains("denied")),
+            other => panic!("Expected Io, got: {other:?}"),
+        }
+    }
 }

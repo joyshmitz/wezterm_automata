@@ -481,4 +481,220 @@ mod tests {
         assert!((record.percent_remaining - 75.5).abs() < 0.001);
         assert_eq!(record.tokens_used, Some(1000));
     }
+
+    // =========================================================================
+    // Fixture-based tests: from_caut edge cases (wa-nu4.1.5.3)
+    // =========================================================================
+
+    #[test]
+    fn from_caut_missing_id_uses_name() {
+        let caut_usage = CautAccountUsage {
+            id: None,
+            name: Some("FallbackName".to_string()),
+            percent_remaining: Some(50.0),
+            ..Default::default()
+        };
+
+        let record = AccountRecord::from_caut(&caut_usage, CautService::OpenAI, 1000);
+        assert_eq!(record.account_id, "FallbackName");
+    }
+
+    #[test]
+    fn from_caut_missing_id_and_name_uses_unknown() {
+        let caut_usage = CautAccountUsage {
+            id: None,
+            name: None,
+            percent_remaining: Some(50.0),
+            ..Default::default()
+        };
+
+        let record = AccountRecord::from_caut(&caut_usage, CautService::OpenAI, 42);
+        assert_eq!(record.account_id, "unknown-42");
+    }
+
+    #[test]
+    fn from_caut_missing_percent_defaults_to_zero() {
+        let caut_usage = CautAccountUsage {
+            id: Some("acc-1".to_string()),
+            percent_remaining: None,
+            ..Default::default()
+        };
+
+        let record = AccountRecord::from_caut(&caut_usage, CautService::OpenAI, 1000);
+        assert!((record.percent_remaining).abs() < 0.001);
+    }
+
+    #[test]
+    fn from_caut_all_fields_round_trip() {
+        let caut_usage = CautAccountUsage {
+            id: Some("acc-full".to_string()),
+            name: Some("Full Account".to_string()),
+            percent_remaining: Some(88.8),
+            limit_hours: Some(48),
+            reset_at: Some("2026-03-01T00:00:00Z".to_string()),
+            tokens_used: Some(1120),
+            tokens_remaining: Some(8880),
+            tokens_limit: Some(10000),
+            extra: std::collections::HashMap::default(),
+        };
+
+        let record = AccountRecord::from_caut(&caut_usage, CautService::OpenAI, 5000);
+
+        assert_eq!(record.id, 0);
+        assert_eq!(record.account_id, "acc-full");
+        assert_eq!(record.service, "openai");
+        assert_eq!(record.name.as_deref(), Some("Full Account"));
+        assert!((record.percent_remaining - 88.8).abs() < 0.001);
+        assert_eq!(record.reset_at.as_deref(), Some("2026-03-01T00:00:00Z"));
+        assert_eq!(record.tokens_used, Some(1120));
+        assert_eq!(record.tokens_remaining, Some(8880));
+        assert_eq!(record.tokens_limit, Some(10000));
+        assert_eq!(record.last_refreshed_at, 5000);
+        assert!(record.last_used_at.is_none());
+        assert_eq!(record.created_at, 5000);
+        assert_eq!(record.updated_at, 5000);
+    }
+
+    // =========================================================================
+    // Selection edge cases (wa-nu4.1.5.3)
+    // =========================================================================
+
+    #[test]
+    fn select_at_exact_threshold_included() {
+        // Account at exactly threshold should be included (>= check)
+        let accounts = vec![
+            make_account("alpha", 5.0, None),  // exactly at threshold
+            make_account("beta", 4.99, None),  // just below
+        ];
+        let config = AccountSelectionConfig {
+            threshold_percent: 5.0,
+        };
+
+        let result = select_account(&accounts, &config);
+
+        assert!(result.selected.is_some());
+        assert_eq!(result.selected.unwrap().account_id, "alpha");
+        assert_eq!(result.explanation.filtered_out.len(), 1);
+        assert_eq!(result.explanation.filtered_out[0].account_id, "beta");
+    }
+
+    #[test]
+    fn select_zero_percent_below_default_threshold() {
+        let accounts = vec![make_account("depleted", 0.0, None)];
+        let config = AccountSelectionConfig::default(); // threshold = 5.0
+
+        let result = select_account(&accounts, &config);
+
+        assert!(result.selected.is_none());
+        assert_eq!(result.explanation.filtered_out.len(), 1);
+    }
+
+    #[test]
+    fn select_zero_threshold_includes_zero_percent() {
+        let accounts = vec![make_account("depleted", 0.0, None)];
+        let config = AccountSelectionConfig {
+            threshold_percent: 0.0,
+        };
+
+        let result = select_account(&accounts, &config);
+
+        assert!(result.selected.is_some());
+        assert_eq!(result.selected.unwrap().account_id, "depleted");
+    }
+
+    #[test]
+    fn select_many_accounts_deterministic() {
+        // 50 accounts with varying quotas — same result every time
+        let accounts: Vec<AccountRecord> = (0..50)
+            .map(|i| {
+                let pct = (i as f64 * 2.0) % 100.0;
+                let last_used = if i % 3 == 0 { None } else { Some(i as i64 * 100) };
+                make_account(&format!("acct-{i:03}"), pct, last_used)
+            })
+            .collect();
+        let config = AccountSelectionConfig::default();
+
+        let r1 = select_account(&accounts, &config);
+        let r2 = select_account(&accounts, &config);
+        let r3 = select_account(&accounts, &config);
+
+        let id1 = r1.selected.as_ref().map(|a| a.account_id.clone());
+        let id2 = r2.selected.as_ref().map(|a| a.account_id.clone());
+        let id3 = r3.selected.as_ref().map(|a| a.account_id.clone());
+        assert_eq!(id1, id2);
+        assert_eq!(id2, id3);
+    }
+
+    #[test]
+    fn select_all_same_percent_and_last_used_is_stable() {
+        // All identical — sort should still produce stable output
+        let accounts: Vec<AccountRecord> = (0..5)
+            .map(|i| make_account(&format!("same-{i}"), 50.0, Some(1000)))
+            .collect();
+        let config = AccountSelectionConfig::default();
+
+        let r1 = select_account(&accounts, &config);
+        let r2 = select_account(&accounts, &config);
+
+        assert_eq!(
+            r1.selected.as_ref().map(|a| &a.account_id),
+            r2.selected.as_ref().map(|a| &a.account_id)
+        );
+    }
+
+    #[test]
+    fn explanation_includes_all_candidates() {
+        let accounts = vec![
+            make_account("alpha", 80.0, None),
+            make_account("beta", 60.0, None),
+            make_account("gamma", 3.0, None), // filtered
+        ];
+        let config = AccountSelectionConfig::default();
+
+        let result = select_account(&accounts, &config);
+
+        assert_eq!(result.explanation.total_considered, 3);
+        assert_eq!(result.explanation.candidates.len(), 2);
+        assert_eq!(result.explanation.filtered_out.len(), 1);
+    }
+
+    #[test]
+    fn filtered_reason_includes_threshold_value() {
+        let accounts = vec![make_account("low", 2.0, None)];
+        let config = AccountSelectionConfig {
+            threshold_percent: 10.0,
+        };
+
+        let result = select_account(&accounts, &config);
+
+        assert!(result.selected.is_none());
+        let filtered = &result.explanation.filtered_out[0];
+        assert!(filtered.reason.contains("10.0%"));
+        assert!(filtered.reason.contains("2.0%"));
+    }
+
+    #[test]
+    fn is_above_threshold_boundary() {
+        let acct = make_account("test", 5.0, None);
+        assert!(acct.is_above_threshold(5.0));
+        assert!(acct.is_above_threshold(4.9));
+        assert!(!acct.is_above_threshold(5.1));
+    }
+
+    #[test]
+    fn selection_with_single_high_and_many_low() {
+        let mut accounts: Vec<AccountRecord> = (0..10)
+            .map(|i| make_account(&format!("low-{i}"), 1.0, None))
+            .collect();
+        accounts.push(make_account("winner", 99.0, None));
+        let config = AccountSelectionConfig::default();
+
+        let result = select_account(&accounts, &config);
+
+        assert!(result.selected.is_some());
+        assert_eq!(result.selected.unwrap().account_id, "winner");
+        assert_eq!(result.explanation.filtered_out.len(), 10);
+        assert_eq!(result.explanation.candidates.len(), 1);
+        assert_eq!(result.explanation.selection_reason, "Only eligible account");
+    }
 }

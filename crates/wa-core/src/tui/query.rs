@@ -273,11 +273,13 @@ impl QueryClient for ProductionQueryClient {
     }
 
     fn health(&self) -> Result<HealthStatus, QueryError> {
-        let wezterm_accessible = self.list_panes().is_ok_and(|p| !p.is_empty());
+        // Call list_panes() once and reuse the result to avoid duplicate IPC calls
+        let panes_result = self.list_panes();
+        let wezterm_accessible = panes_result.as_ref().is_ok_and(|p| !p.is_empty());
+        let pane_count = panes_result.map_or(0, |p| p.len());
 
         let db_accessible = self.db_exists();
         let watcher_running = self.is_watcher_running();
-        let pane_count = self.list_panes().map_or(0, |p| p.len());
 
         Ok(HealthStatus {
             watcher_running,

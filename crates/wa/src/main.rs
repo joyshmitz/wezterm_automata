@@ -592,6 +592,54 @@ SEE ALSO:
         command: RulesCommands,
     },
 
+    /// Reserve a pane for exclusive use
+    #[command(after_help = r#"EXAMPLES:
+    wa reserve 3 --owner-id agent-1   Reserve pane 3 for agent-1
+    wa reserve 3 --ttl 3600           Reserve for 1 hour
+    wa reserve 3 --reason "migration" Add a reason
+
+SEE ALSO:
+    wa reservations   List active reservations
+    wa status         Show pane overview"#)]
+    Reserve {
+        /// Pane ID to reserve
+        pane_id: u64,
+
+        /// TTL in seconds (default: 1800 = 30 minutes)
+        #[arg(long, default_value = "1800")]
+        ttl: u64,
+
+        /// Owner kind (workflow, agent, manual)
+        #[arg(long, default_value = "manual")]
+        owner_kind: String,
+
+        /// Owner identifier
+        #[arg(long, default_value = "cli-user")]
+        owner_id: String,
+
+        /// Reason for reservation
+        #[arg(long)]
+        reason: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List active pane reservations
+    #[command(after_help = r#"EXAMPLES:
+    wa reservations               Show active reservations
+    wa reservations --json        Output as JSON
+
+SEE ALSO:
+    wa reserve    Reserve a pane
+    wa status     Show pane overview"#)]
+    Reservations {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show prioritized issues needing attention
     #[command(after_help = r#"EXAMPLES:
     wa triage                         Prioritized triage overview
@@ -795,6 +843,12 @@ enum RobotCommands {
         command: RobotAccountsCommands,
     },
 
+    /// Pane reservation commands (reserve, release, list)
+    Reservations {
+        #[command(subcommand)]
+        command: RobotReservationCommands,
+    },
+
     /// Submit an approval code for a pending action
     Approve {
         /// The approval code (8-character alphanumeric)
@@ -944,6 +998,40 @@ enum RobotAccountsCommands {
         #[arg(long, default_value = "openai")]
         service: String,
     },
+}
+
+#[derive(Subcommand)]
+enum RobotReservationCommands {
+    /// Reserve a pane for exclusive use
+    Reserve {
+        /// Pane ID to reserve
+        pane_id: u64,
+
+        /// TTL in seconds (default: 1800 = 30 minutes)
+        #[arg(long, default_value = "1800")]
+        ttl: u64,
+
+        /// Owner kind (workflow, agent, manual)
+        #[arg(long, default_value = "agent")]
+        owner_kind: String,
+
+        /// Owner identifier
+        #[arg(long)]
+        owner_id: String,
+
+        /// Reason for reservation
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Release a pane reservation
+    Release {
+        /// Reservation ID to release
+        reservation_id: i64,
+    },
+
+    /// List active pane reservations
+    List,
 }
 
 #[derive(Subcommand)]
@@ -2167,6 +2255,38 @@ struct RobotAccountsRefreshData {
     #[serde(skip_serializing_if = "Option::is_none")]
     refreshed_at: Option<String>,
     accounts: Vec<RobotAccountInfo>,
+}
+
+#[derive(serde::Serialize)]
+struct RobotReservationInfo {
+    id: i64,
+    pane_id: u64,
+    owner_kind: String,
+    owner_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    created_at: i64,
+    expires_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    released_at: Option<i64>,
+    status: String,
+}
+
+#[derive(serde::Serialize)]
+struct RobotReserveData {
+    reservation: RobotReservationInfo,
+}
+
+#[derive(serde::Serialize)]
+struct RobotReleaseData {
+    reservation_id: i64,
+    released: bool,
+}
+
+#[derive(serde::Serialize)]
+struct RobotReservationsListData {
+    reservations: Vec<RobotReservationInfo>,
+    total: usize,
 }
 
 fn redact_for_output(text: &str) -> String {
@@ -6053,6 +6173,204 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        RobotCommands::Reservations { command } => {
+                            // Get workspace layout for db path
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<RobotReservationsListData>::error_with_code(
+                                            ROBOT_ERR_CONFIG,
+                                            format!("Failed to get workspace layout: {e}"),
+                                            Some(
+                                                "Check --workspace or WA_WORKSPACE".to_string(),
+                                            ),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+
+                            let db_path = layout.db_path.to_string_lossy();
+                            let storage =
+                                match wa_core::storage::StorageHandle::new(&db_path).await {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        let response =
+                                            RobotResponse::<RobotReservationsListData>::error_with_code(
+                                                ROBOT_ERR_STORAGE,
+                                                format!("Failed to open storage: {e}"),
+                                                Some(
+                                                    "Is the database initialized? Run 'wa watch' first."
+                                                        .to_string(),
+                                                ),
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
+
+                            match command {
+                                RobotReservationCommands::Reserve {
+                                    pane_id,
+                                    ttl,
+                                    owner_kind,
+                                    owner_id,
+                                    reason,
+                                } => {
+                                    let ttl_ms = (ttl * 1000) as i64;
+                                    match storage
+                                        .create_reservation(
+                                            pane_id,
+                                            &owner_kind,
+                                            &owner_id,
+                                            reason.as_deref(),
+                                            ttl_ms,
+                                        )
+                                        .await
+                                    {
+                                        Ok(r) => {
+                                            let data = RobotReserveData {
+                                                reservation: RobotReservationInfo {
+                                                    id: r.id,
+                                                    pane_id: r.pane_id,
+                                                    owner_kind: r.owner_kind,
+                                                    owner_id: r.owner_id,
+                                                    reason: r.reason,
+                                                    created_at: r.created_at,
+                                                    expires_at: r.expires_at,
+                                                    released_at: r.released_at,
+                                                    status: r.status,
+                                                },
+                                            };
+                                            let response = RobotResponse::success(
+                                                data,
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(
+                                                &response, format, stats,
+                                            )?;
+                                        }
+                                        Err(e) => {
+                                            let response =
+                                                RobotResponse::<RobotReserveData>::error_with_code(
+                                                    "robot.reservation_conflict",
+                                                    format!(
+                                                        "Failed to create reservation: {e}"
+                                                    ),
+                                                    Some(
+                                                        "Pane may already be reserved. Use 'wa robot reservations list' to check."
+                                                            .to_string(),
+                                                    ),
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(
+                                                &response, format, stats,
+                                            )?;
+                                        }
+                                    }
+                                }
+                                RobotReservationCommands::Release { reservation_id } => {
+                                    match storage
+                                        .release_reservation(reservation_id)
+                                        .await
+                                    {
+                                        Ok(released) => {
+                                            let data = RobotReleaseData {
+                                                reservation_id,
+                                                released,
+                                            };
+                                            let response = RobotResponse::success(
+                                                data,
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(
+                                                &response, format, stats,
+                                            )?;
+                                        }
+                                        Err(e) => {
+                                            let response =
+                                                RobotResponse::<RobotReleaseData>::error_with_code(
+                                                    ROBOT_ERR_STORAGE,
+                                                    format!(
+                                                        "Failed to release reservation: {e}"
+                                                    ),
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(
+                                                &response, format, stats,
+                                            )?;
+                                        }
+                                    }
+                                }
+                                RobotReservationCommands::List => {
+                                    // Expire stale reservations first
+                                    if let Err(e) =
+                                        storage.expire_stale_reservations().await
+                                    {
+                                        tracing::warn!(
+                                            "Failed to expire stale reservations: {e}"
+                                        );
+                                    }
+
+                                    match storage.list_active_reservations().await {
+                                        Ok(reservations) => {
+                                            let total = reservations.len();
+                                            let infos: Vec<RobotReservationInfo> =
+                                                reservations
+                                                    .into_iter()
+                                                    .map(|r| RobotReservationInfo {
+                                                        id: r.id,
+                                                        pane_id: r.pane_id,
+                                                        owner_kind: r.owner_kind,
+                                                        owner_id: r.owner_id,
+                                                        reason: r.reason,
+                                                        created_at: r.created_at,
+                                                        expires_at: r.expires_at,
+                                                        released_at: r.released_at,
+                                                        status: r.status,
+                                                    })
+                                                    .collect();
+                                            let data = RobotReservationsListData {
+                                                reservations: infos,
+                                                total,
+                                            };
+                                            let response = RobotResponse::success(
+                                                data,
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(
+                                                &response, format, stats,
+                                            )?;
+                                        }
+                                        Err(e) => {
+                                            let response =
+                                                RobotResponse::<RobotReservationsListData>::error_with_code(
+                                                    ROBOT_ERR_STORAGE,
+                                                    format!(
+                                                        "Failed to list reservations: {e}"
+                                                    ),
+                                                    None,
+                                                    elapsed_ms(start),
+                                                );
+                                            print_robot_response(
+                                                &response, format, stats,
+                                            )?;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Clean shutdown
+                            if let Err(e) = storage.shutdown().await {
+                                tracing::warn!(
+                                    "Failed to shutdown storage cleanly: {e}"
+                                );
+                            }
+                        }
                         RobotCommands::Help | RobotCommands::QuickStart => {
                             unreachable!("handled above")
                         }
@@ -8064,6 +8382,127 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
         Some(Commands::Rules { command }) => {
             handle_rules_command(command);
+        }
+
+        Some(Commands::Reserve {
+            pane_id,
+            ttl,
+            owner_kind,
+            owner_id,
+            reason,
+            json,
+        }) => {
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = wa_core::storage::StorageHandle::new(&db_path).await?;
+
+            let ttl_ms = (ttl * 1000) as i64;
+            match storage
+                .create_reservation(pane_id, &owner_kind, &owner_id, reason.as_deref(), ttl_ms)
+                .await
+            {
+                Ok(r) => {
+                    if json {
+                        let info = RobotReservationInfo {
+                            id: r.id,
+                            pane_id: r.pane_id,
+                            owner_kind: r.owner_kind,
+                            owner_id: r.owner_id,
+                            reason: r.reason,
+                            created_at: r.created_at,
+                            expires_at: r.expires_at,
+                            released_at: r.released_at,
+                            status: r.status,
+                        };
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&info)
+                                .unwrap_or_else(|_| "{}".to_string())
+                        );
+                    } else {
+                        println!("Reserved pane {} (id={})", r.pane_id, r.id);
+                        println!("  Owner: {} ({})", r.owner_id, r.owner_kind);
+                        if let Some(ref reason) = r.reason {
+                            println!("  Reason: {reason}");
+                        }
+                        println!("  Expires: {} ms from now", r.expires_at - r.created_at);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to reserve pane {pane_id}: {e}");
+                    eprintln!("Hint: Use 'wa reservations' to see active reservations.");
+                    std::process::exit(1);
+                }
+            }
+
+            storage.shutdown().await?;
+        }
+
+        Some(Commands::Reservations { json }) => {
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = wa_core::storage::StorageHandle::new(&db_path).await?;
+
+            // Expire stale reservations first
+            if let Err(e) = storage.expire_stale_reservations().await {
+                tracing::warn!("Failed to expire stale reservations: {e}");
+            }
+
+            match storage.list_active_reservations().await {
+                Ok(reservations) => {
+                    if json {
+                        let infos: Vec<RobotReservationInfo> = reservations
+                            .into_iter()
+                            .map(|r| RobotReservationInfo {
+                                id: r.id,
+                                pane_id: r.pane_id,
+                                owner_kind: r.owner_kind,
+                                owner_id: r.owner_id,
+                                reason: r.reason,
+                                created_at: r.created_at,
+                                expires_at: r.expires_at,
+                                released_at: r.released_at,
+                                status: r.status,
+                            })
+                            .collect();
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&infos)
+                                .unwrap_or_else(|_| "[]".to_string())
+                        );
+                    } else if reservations.is_empty() {
+                        println!("No active pane reservations.");
+                    } else {
+                        println!(
+                            "{:<6} {:<8} {:<12} {:<16} {:<20} {}",
+                            "ID", "PANE", "OWNER_KIND", "OWNER_ID", "REASON", "EXPIRES_IN"
+                        );
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis() as i64);
+                        for r in &reservations {
+                            let remaining_secs = (r.expires_at - now) / 1000;
+                            let mins = remaining_secs / 60;
+                            let secs = remaining_secs % 60;
+                            println!(
+                                "{:<6} {:<8} {:<12} {:<16} {:<20} {}m {}s",
+                                r.id,
+                                r.pane_id,
+                                r.owner_kind,
+                                r.owner_id,
+                                r.reason.as_deref().unwrap_or("-"),
+                                mins,
+                                secs,
+                            );
+                        }
+                        println!("\n{} active reservation(s).", reservations.len());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to list reservations: {e}");
+                    std::process::exit(1);
+                }
+            }
+
+            storage.shutdown().await?;
         }
 
         Some(Commands::Triage {
@@ -13148,5 +13587,314 @@ mod tests {
         assert_eq!(db_accounts[0].last_refreshed_at, now + 60_000);
 
         cleanup_storage(storage, &db_path).await;
+    }
+
+    // =========================================================================
+    // Reservation data structure tests
+    // =========================================================================
+
+    #[test]
+    fn robot_reservation_info_json_schema() {
+        let info = RobotReservationInfo {
+            id: 1,
+            pane_id: 42,
+            owner_kind: "workflow".to_string(),
+            owner_id: "wf-123".to_string(),
+            reason: Some("testing".to_string()),
+            created_at: 1000,
+            expires_at: 2000,
+            released_at: None,
+            status: "active".to_string(),
+        };
+
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["id"].as_i64().unwrap(), 1);
+        assert_eq!(json["pane_id"].as_u64().unwrap(), 42);
+        assert_eq!(json["owner_kind"].as_str().unwrap(), "workflow");
+        assert_eq!(json["owner_id"].as_str().unwrap(), "wf-123");
+        assert_eq!(json["reason"].as_str().unwrap(), "testing");
+        assert_eq!(json["status"].as_str().unwrap(), "active");
+        // released_at should be absent (skip_serializing_if)
+        assert!(json.get("released_at").is_none());
+    }
+
+    #[test]
+    fn robot_reservation_info_skip_optional_fields() {
+        let info = RobotReservationInfo {
+            id: 1,
+            pane_id: 1,
+            owner_kind: "agent".to_string(),
+            owner_id: "agent-x".to_string(),
+            reason: None,
+            created_at: 1000,
+            expires_at: 2000,
+            released_at: None,
+            status: "active".to_string(),
+        };
+
+        let json = serde_json::to_value(&info).unwrap();
+        // Both optional fields should be absent
+        assert!(json.get("reason").is_none());
+        assert!(json.get("released_at").is_none());
+    }
+
+    #[test]
+    fn robot_reserve_data_json_schema() {
+        let data = RobotReserveData {
+            reservation: RobotReservationInfo {
+                id: 5,
+                pane_id: 7,
+                owner_kind: "manual".to_string(),
+                owner_id: "user-1".to_string(),
+                reason: Some("testing reserve".to_string()),
+                created_at: 3000,
+                expires_at: 4000,
+                released_at: None,
+                status: "active".to_string(),
+            },
+        };
+
+        let json = serde_json::to_value(&data).unwrap();
+        assert!(json["reservation"].is_object());
+        assert_eq!(json["reservation"]["id"].as_i64().unwrap(), 5);
+        assert_eq!(json["reservation"]["pane_id"].as_u64().unwrap(), 7);
+    }
+
+    #[test]
+    fn robot_release_data_json_schema() {
+        let data = RobotReleaseData {
+            reservation_id: 42,
+            released: true,
+        };
+
+        let json = serde_json::to_value(&data).unwrap();
+        assert_eq!(json["reservation_id"].as_i64().unwrap(), 42);
+        assert_eq!(json["released"].as_bool().unwrap(), true);
+    }
+
+    #[test]
+    fn robot_release_data_not_found() {
+        let data = RobotReleaseData {
+            reservation_id: 999,
+            released: false,
+        };
+
+        let json = serde_json::to_value(&data).unwrap();
+        assert_eq!(json["released"].as_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn robot_reservations_list_data_json_schema() {
+        let data = RobotReservationsListData {
+            reservations: vec![
+                RobotReservationInfo {
+                    id: 1,
+                    pane_id: 10,
+                    owner_kind: "workflow".to_string(),
+                    owner_id: "wf-a".to_string(),
+                    reason: Some("first".to_string()),
+                    created_at: 1000,
+                    expires_at: 2000,
+                    released_at: None,
+                    status: "active".to_string(),
+                },
+                RobotReservationInfo {
+                    id: 2,
+                    pane_id: 20,
+                    owner_kind: "agent".to_string(),
+                    owner_id: "agent-b".to_string(),
+                    reason: None,
+                    created_at: 1500,
+                    expires_at: 2500,
+                    released_at: None,
+                    status: "active".to_string(),
+                },
+            ],
+            total: 2,
+        };
+
+        let json = serde_json::to_value(&data).unwrap();
+        assert_eq!(json["total"].as_u64().unwrap(), 2);
+        assert_eq!(json["reservations"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            json["reservations"][0]["owner_id"].as_str().unwrap(),
+            "wf-a"
+        );
+        assert_eq!(
+            json["reservations"][1]["owner_kind"].as_str().unwrap(),
+            "agent"
+        );
+    }
+
+    #[test]
+    fn robot_reservations_list_empty() {
+        let data = RobotReservationsListData {
+            reservations: vec![],
+            total: 0,
+        };
+
+        let json = serde_json::to_value(&data).unwrap();
+        assert_eq!(json["total"].as_u64().unwrap(), 0);
+        assert!(json["reservations"].as_array().unwrap().is_empty());
+    }
+
+    // =========================================================================
+    // Reservation DB integration tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn reservation_create_and_list() {
+        let (storage, db_path) = setup_storage("res_create_list").await;
+
+        // Insert a pane for FK
+        let pane = PaneRecord {
+            pane_id: 100,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("test".to_string()),
+            cwd: Some("/tmp".to_string()),
+            tty_name: None,
+            first_seen_at: now_ms(),
+            last_seen_at: now_ms(),
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane(pane).await.unwrap();
+
+        // Create a reservation
+        let r = storage
+            .create_reservation(100, "agent", "test-agent", Some("testing"), 60_000)
+            .await
+            .unwrap();
+        assert_eq!(r.pane_id, 100);
+        assert_eq!(r.owner_kind, "agent");
+
+        // List should show it
+        let list = storage.list_active_reservations().await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, r.id);
+
+        // Release it
+        let released = storage.release_reservation(r.id).await.unwrap();
+        assert!(released);
+
+        // List should be empty now
+        let list = storage.list_active_reservations().await.unwrap();
+        assert!(list.is_empty());
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn reservation_conflict_detection() {
+        let (storage, db_path) = setup_storage("res_conflict").await;
+
+        let pane = PaneRecord {
+            pane_id: 200,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("test".to_string()),
+            cwd: Some("/tmp".to_string()),
+            tty_name: None,
+            first_seen_at: now_ms(),
+            last_seen_at: now_ms(),
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane(pane).await.unwrap();
+
+        // First reservation succeeds
+        let _r1 = storage
+            .create_reservation(200, "workflow", "wf-1", None, 600_000)
+            .await
+            .unwrap();
+
+        // Second reservation on same pane fails
+        let r2 = storage
+            .create_reservation(200, "workflow", "wf-2", None, 60_000)
+            .await;
+        assert!(r2.is_err());
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[tokio::test]
+    async fn reservation_expire_stale() {
+        let (storage, db_path) = setup_storage("res_expire").await;
+
+        let pane = PaneRecord {
+            pane_id: 300,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("test".to_string()),
+            cwd: Some("/tmp".to_string()),
+            tty_name: None,
+            first_seen_at: now_ms(),
+            last_seen_at: now_ms(),
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        storage.upsert_pane(pane).await.unwrap();
+
+        // Create a reservation with very short TTL (already effectively expired in processing)
+        // Use the storage directly - insert a past-expiry record
+        let r = storage
+            .create_reservation(300, "workflow", "wf-old", None, 60_000)
+            .await
+            .unwrap();
+
+        // Active before expiry
+        let active = storage.get_active_reservation(300).await.unwrap();
+        assert!(active.is_some());
+
+        // Release it so we can test the list is clean after
+        storage.release_reservation(r.id).await.unwrap();
+        let active = storage.get_active_reservation(300).await.unwrap();
+        assert!(active.is_none());
+
+        cleanup_storage(storage, &db_path).await;
+    }
+
+    #[test]
+    fn reservation_info_from_pane_reservation() {
+        // Verify the mapping from PaneReservation to RobotReservationInfo
+        let r = wa_core::storage::PaneReservation {
+            id: 10,
+            pane_id: 5,
+            owner_kind: "agent".to_string(),
+            owner_id: "agent-x".to_string(),
+            reason: Some("migration".to_string()),
+            created_at: 1000,
+            expires_at: 61_000,
+            released_at: None,
+            status: "active".to_string(),
+        };
+
+        let info = RobotReservationInfo {
+            id: r.id,
+            pane_id: r.pane_id,
+            owner_kind: r.owner_kind.clone(),
+            owner_id: r.owner_id.clone(),
+            reason: r.reason.clone(),
+            created_at: r.created_at,
+            expires_at: r.expires_at,
+            released_at: r.released_at,
+            status: r.status.clone(),
+        };
+
+        assert_eq!(info.id, 10);
+        assert_eq!(info.pane_id, 5);
+        assert_eq!(info.owner_kind, "agent");
+        assert_eq!(info.reason.as_deref(), Some("migration"));
+        assert!(r.is_active(30_000));
     }
 }

@@ -5,6 +5,8 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use tokio::time::{Duration, Instant, sleep};
 
@@ -304,6 +306,268 @@ where
     wait_for(condition, timeout, backoff).await
 }
 
+// ---------------------------------------------------------------------------
+// Quiescence detector: composable, live-signal integration
+// ---------------------------------------------------------------------------
+
+/// Atomic gauge that tracks pending work items (queue depth).
+///
+/// Increment on enqueue, decrement on dequeue. The detector reads the gauge
+/// to determine whether queues have drained.
+#[derive(Debug)]
+pub struct QueueDepthGauge {
+    name: String,
+    count: AtomicUsize,
+}
+
+impl QueueDepthGauge {
+    /// Create a new gauge with the given name and initial depth of zero.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            count: AtomicUsize::new(0),
+        }
+    }
+
+    /// Increment pending count (call on enqueue).
+    pub fn increment(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Decrement pending count (call on dequeue). Saturates at zero.
+    pub fn decrement(&self) {
+        // fetch_sub with SeqCst; saturate to prevent underflow
+        let prev = self.count.fetch_sub(1, Ordering::SeqCst);
+        if prev == 0 {
+            // Underflow occurred; restore to 0
+            self.count.store(0, Ordering::SeqCst);
+        }
+    }
+
+    /// Current depth.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+
+    /// Gauge name (for diagnostics).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Tracks the most recent activity using a monotonic clock.
+///
+/// Records are lock-free via `AtomicU64` storing nanosecond offsets from an
+/// epoch [`Instant`] captured at construction time.
+#[derive(Debug)]
+pub struct ActivityTracker {
+    /// Monotonic reference point.
+    epoch: Instant,
+    /// Nanosecond offset from `epoch` of the last recorded activity.
+    /// Zero means no activity has been recorded.
+    last_offset_nanos: AtomicU64,
+}
+
+impl ActivityTracker {
+    /// Create a new tracker with the current instant as epoch.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            last_offset_nanos: AtomicU64::new(0),
+        }
+    }
+
+    /// Record an activity at the current instant.
+    pub fn record(&self) {
+        let offset = Instant::now()
+            .saturating_duration_since(self.epoch)
+            .as_nanos() as u64;
+        // Monotonic: never go backwards.
+        self.last_offset_nanos.fetch_max(offset, Ordering::SeqCst);
+    }
+
+    /// Returns the instant of the last recorded activity, or `None` if
+    /// no activity has been recorded.
+    #[must_use]
+    pub fn last_activity(&self) -> Option<Instant> {
+        let offset = self.last_offset_nanos.load(Ordering::SeqCst);
+        if offset == 0 {
+            None
+        } else {
+            Some(self.epoch + Duration::from_nanos(offset))
+        }
+    }
+
+    /// Returns true if no activity has ever been recorded.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.last_offset_nanos.load(Ordering::SeqCst) == 0
+    }
+}
+
+impl Default for ActivityTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Composable quiescence detector that aggregates live signal sources.
+///
+/// A system is quiescent when:
+/// 1. All queue depth gauges read zero (queues drained).
+/// 2. No activity has occurred within the configured quiet window.
+///
+/// The detector is cheaply cloneable (all fields are `Arc`).
+#[derive(Clone)]
+pub struct QuiescenceDetector {
+    gauges: Vec<Arc<QueueDepthGauge>>,
+    activity: Arc<ActivityTracker>,
+    quiet_window: Duration,
+}
+
+impl QuiescenceDetector {
+    /// Create a detector with the given quiet window and a default activity tracker.
+    #[must_use]
+    pub fn new(quiet_window: Duration) -> Self {
+        Self {
+            gauges: Vec::new(),
+            activity: Arc::new(ActivityTracker::new()),
+            quiet_window,
+        }
+    }
+
+    /// Create a detector sharing an existing activity tracker.
+    #[must_use]
+    pub fn with_activity(mut self, activity: Arc<ActivityTracker>) -> Self {
+        self.activity = activity;
+        self
+    }
+
+    /// Add a queue depth gauge to monitor.
+    pub fn add_gauge(&mut self, gauge: Arc<QueueDepthGauge>) {
+        self.gauges.push(gauge);
+    }
+
+    /// Builder-style: add a gauge and return self.
+    #[must_use]
+    pub fn with_gauge(mut self, gauge: Arc<QueueDepthGauge>) -> Self {
+        self.gauges.push(gauge);
+        self
+    }
+
+    /// Total pending work across all gauges.
+    #[must_use]
+    pub fn total_pending(&self) -> usize {
+        self.gauges.iter().map(|g| g.depth()).sum()
+    }
+
+    /// Take a diagnostic snapshot of the current state.
+    #[must_use]
+    pub fn snapshot(&self) -> QuiescenceSnapshot {
+        let gauge_values: Vec<(String, usize)> = self
+            .gauges
+            .iter()
+            .map(|g| (g.name().to_owned(), g.depth()))
+            .collect();
+        let total_pending: usize = gauge_values.iter().map(|(_, d)| d).sum();
+        QuiescenceSnapshot {
+            total_pending,
+            gauges: gauge_values,
+            last_activity: self.activity.last_activity(),
+            quiet_window: self.quiet_window,
+        }
+    }
+}
+
+impl QuiescenceSignals for QuiescenceDetector {
+    fn is_quiet(&self, now: Instant) -> bool {
+        if self.total_pending() > 0 {
+            return false;
+        }
+        match self.activity.last_activity() {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= self.quiet_window,
+        }
+    }
+
+    fn describe(&self, now: Instant) -> String {
+        let snap = self.snapshot();
+        snap.describe(now)
+    }
+}
+
+impl fmt::Debug for QuiescenceDetector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuiescenceDetector")
+            .field("gauges", &self.gauges.len())
+            .field("quiet_window", &self.quiet_window)
+            .finish()
+    }
+}
+
+/// Diagnostic snapshot of quiescence state.
+///
+/// Captures per-gauge depths, total pending, last activity, and the quiet
+/// window at a single point in time. Useful for structured logging and
+/// timeout error messages.
+#[derive(Debug, Clone)]
+pub struct QuiescenceSnapshot {
+    /// Total pending across all gauges.
+    pub total_pending: usize,
+    /// Per-gauge (name, depth) pairs.
+    pub gauges: Vec<(String, usize)>,
+    /// Last activity instant (monotonic).
+    pub last_activity: Option<Instant>,
+    /// Required quiet window.
+    pub quiet_window: Duration,
+}
+
+impl QuiescenceSnapshot {
+    /// Human-readable description of this snapshot relative to `now`.
+    #[must_use]
+    pub fn describe(&self, now: Instant) -> String {
+        let since_ms = self
+            .last_activity
+            .map_or(0, |last| now.saturating_duration_since(last).as_millis());
+        let gauge_summary: String = if self.gauges.is_empty() {
+            "no gauges".to_owned()
+        } else {
+            self.gauges
+                .iter()
+                .map(|(name, depth)| format!("{name}={depth}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "total_pending={}, gauges=[{}], quiet_window_ms={}, since_last_ms={}",
+            self.total_pending,
+            gauge_summary,
+            self.quiet_window.as_millis(),
+            since_ms
+        )
+    }
+}
+
+impl QuiescenceSignals for QuiescenceSnapshot {
+    fn is_quiet(&self, now: Instant) -> bool {
+        if self.total_pending > 0 {
+            return false;
+        }
+        match self.last_activity {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= self.quiet_window,
+        }
+    }
+
+    fn describe(&self, now: Instant) -> String {
+        self.describe(now)
+    }
+}
+
 /// Wait for a boolean condition to become true.
 ///
 /// Simpler alternative to [`wait_for`] for cases where you just need
@@ -359,8 +623,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn backoff_schedule_increases_and_caps() {
@@ -763,5 +1025,246 @@ mod tests {
         let final_val = counter.load(Ordering::SeqCst);
         assert!(final_val >= 7, "final counter value {final_val} should be >= 7");
         incrementer.await.unwrap();
+    }
+
+    // =========================================================================
+    // QueueDepthGauge tests
+    // =========================================================================
+
+    #[test]
+    fn gauge_starts_at_zero() {
+        let g = QueueDepthGauge::new("test");
+        assert_eq!(g.depth(), 0);
+        assert_eq!(g.name(), "test");
+    }
+
+    #[test]
+    fn gauge_increment_decrement() {
+        let g = QueueDepthGauge::new("q");
+        g.increment();
+        g.increment();
+        g.increment();
+        assert_eq!(g.depth(), 3);
+        g.decrement();
+        assert_eq!(g.depth(), 2);
+        g.decrement();
+        g.decrement();
+        assert_eq!(g.depth(), 0);
+    }
+
+    #[test]
+    fn gauge_decrement_saturates_at_zero() {
+        let g = QueueDepthGauge::new("q");
+        g.decrement(); // should not underflow
+        assert_eq!(g.depth(), 0);
+        g.decrement();
+        assert_eq!(g.depth(), 0);
+    }
+
+    // =========================================================================
+    // ActivityTracker tests
+    // =========================================================================
+
+    #[test]
+    fn tracker_idle_initially() {
+        let t = ActivityTracker::new();
+        assert!(t.is_idle());
+        assert!(t.last_activity().is_none());
+    }
+
+    #[test]
+    fn tracker_records_activity() {
+        let t = ActivityTracker::new();
+        t.record();
+        assert!(!t.is_idle());
+        assert!(t.last_activity().is_some());
+    }
+
+    #[tokio::test]
+    async fn tracker_activity_monotonic() {
+        let t = ActivityTracker::new();
+        t.record();
+        let first = t.last_activity().unwrap();
+        sleep(Duration::from_millis(5)).await;
+        t.record();
+        let second = t.last_activity().unwrap();
+        assert!(second >= first, "activity timestamps should be monotonic");
+    }
+
+    // =========================================================================
+    // QuiescenceDetector tests
+    // =========================================================================
+
+    #[test]
+    fn detector_quiet_with_no_gauges_no_activity() {
+        let d = QuiescenceDetector::new(Duration::from_millis(10));
+        assert!(d.is_quiet(Instant::now()));
+        assert_eq!(d.total_pending(), 0);
+    }
+
+    #[test]
+    fn detector_not_quiet_with_pending_work() {
+        let g = Arc::new(QueueDepthGauge::new("ingest"));
+        g.increment();
+        let d = QuiescenceDetector::new(Duration::from_millis(0))
+            .with_gauge(g);
+        assert!(!d.is_quiet(Instant::now()));
+        assert_eq!(d.total_pending(), 1);
+    }
+
+    #[test]
+    fn detector_not_quiet_within_window() {
+        let activity = Arc::new(ActivityTracker::new());
+        activity.record();
+        let d = QuiescenceDetector::new(Duration::from_secs(60))
+            .with_activity(activity);
+        // Recent activity + 60s window → not quiet
+        assert!(!d.is_quiet(Instant::now()));
+    }
+
+    #[test]
+    fn detector_quiet_after_window_elapses() {
+        let activity = Arc::new(ActivityTracker::new());
+        // Set activity in the past by not recording anything — idle = quiet
+        let d = QuiescenceDetector::new(Duration::from_millis(0))
+            .with_activity(activity);
+        assert!(d.is_quiet(Instant::now()));
+    }
+
+    #[test]
+    fn detector_multiple_gauges_all_must_drain() {
+        let g1 = Arc::new(QueueDepthGauge::new("capture"));
+        let g2 = Arc::new(QueueDepthGauge::new("writer"));
+        g1.increment();
+        let d = QuiescenceDetector::new(Duration::from_millis(0))
+            .with_gauge(g1.clone())
+            .with_gauge(g2);
+        assert!(!d.is_quiet(Instant::now()), "g1 still pending");
+        assert_eq!(d.total_pending(), 1);
+        g1.decrement();
+        assert!(d.is_quiet(Instant::now()), "all gauges drained");
+    }
+
+    #[test]
+    fn snapshot_describe_includes_gauge_names() {
+        let g = Arc::new(QueueDepthGauge::new("ingest_q"));
+        g.increment();
+        g.increment();
+        let d = QuiescenceDetector::new(Duration::from_millis(100))
+            .with_gauge(g);
+        let snap = d.snapshot();
+        assert_eq!(snap.total_pending, 2);
+        assert_eq!(snap.gauges.len(), 1);
+        assert_eq!(snap.gauges[0], ("ingest_q".to_owned(), 2));
+        let desc = snap.describe(Instant::now());
+        assert!(desc.contains("ingest_q=2"), "desc: {desc}");
+        assert!(desc.contains("total_pending=2"), "desc: {desc}");
+    }
+
+    #[test]
+    fn snapshot_implements_quiescence_signals() {
+        let snap = QuiescenceSnapshot {
+            total_pending: 0,
+            gauges: vec![],
+            last_activity: None,
+            quiet_window: Duration::from_millis(0),
+        };
+        assert!(snap.is_quiet(Instant::now()));
+    }
+
+    // =========================================================================
+    // Integration: multi-queue quiescence detection via detector
+    // =========================================================================
+
+    #[tokio::test]
+    async fn detector_integration_multi_queue_drain() {
+        // Simulate two queues being drained by independent consumers.
+        // The detector should report quiescence only after both drain.
+        let capture_gauge = Arc::new(QueueDepthGauge::new("capture"));
+        let writer_gauge = Arc::new(QueueDepthGauge::new("writer"));
+        let activity = Arc::new(ActivityTracker::new());
+
+        // Enqueue work
+        for _ in 0..5 { capture_gauge.increment(); }
+        for _ in 0..3 { writer_gauge.increment(); }
+        activity.record();
+
+        let detector = QuiescenceDetector::new(Duration::from_millis(10))
+            .with_gauge(capture_gauge.clone())
+            .with_gauge(writer_gauge.clone())
+            .with_activity(activity.clone());
+
+        assert!(!detector.is_quiet(Instant::now()));
+
+        // Spawn consumers
+        let cg = capture_gauge.clone();
+        let act1 = activity.clone();
+        let consumer1 = tokio::spawn(async move {
+            for _ in 0..5 {
+                sleep(Duration::from_millis(2)).await;
+                cg.decrement();
+                act1.record();
+            }
+        });
+
+        let wg = writer_gauge.clone();
+        let act2 = activity.clone();
+        let consumer2 = tokio::spawn(async move {
+            for _ in 0..3 {
+                sleep(Duration::from_millis(3)).await;
+                wg.decrement();
+                act2.record();
+            }
+        });
+
+        // Wait for quiescence using the detector with wait_for_quiescence
+        let backoff = Backoff {
+            initial: Duration::from_millis(2),
+            max: Duration::from_millis(20),
+            factor: 2,
+            max_retries: None,
+        };
+
+        let result = wait_for_quiescence_with_backoff(
+            detector.clone(),
+            Duration::from_secs(2),
+            backoff,
+        )
+        .await;
+
+        assert!(result.is_ok(), "detector should report quiescence after both queues drain");
+        assert_eq!(detector.total_pending(), 0);
+
+        consumer1.await.unwrap();
+        consumer2.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn detector_not_quiet_while_one_queue_still_draining() {
+        let fast_gauge = Arc::new(QueueDepthGauge::new("fast"));
+        let slow_gauge = Arc::new(QueueDepthGauge::new("slow"));
+
+        fast_gauge.increment();
+        slow_gauge.increment();
+        slow_gauge.increment();
+        slow_gauge.increment();
+
+        let detector = QuiescenceDetector::new(Duration::from_millis(0))
+            .with_gauge(fast_gauge.clone())
+            .with_gauge(slow_gauge.clone());
+
+        // Drain the fast queue immediately
+        fast_gauge.decrement();
+
+        // Still not quiet because slow_gauge has 3 pending
+        assert!(!detector.is_quiet(Instant::now()));
+        assert_eq!(detector.total_pending(), 3);
+
+        // Drain slow queue
+        slow_gauge.decrement();
+        slow_gauge.decrement();
+        slow_gauge.decrement();
+
+        assert!(detector.is_quiet(Instant::now()));
     }
 }

@@ -5941,6 +5941,201 @@ impl Workflow for HandleAuthRequired {
     }
 }
 
+// ============================================================================
+// Device Auth Workflow Step (wa-nu4.1.3.6)
+// ============================================================================
+//
+// Integrates browser-based OpenAI device auth into the usage-limit failover
+// workflow. This step:
+//   1. Validates the device code format
+//   2. Initializes a BrowserContext
+//   3. Runs the OpenAiDeviceAuthFlow via Playwright
+//   4. Returns a structured result mapping to workflow step outcomes
+
+/// Result of executing the device auth workflow step.
+///
+/// Maps browser automation outcomes to workflow-level concepts.
+#[cfg(feature = "browser")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status")]
+pub enum DeviceAuthStepOutcome {
+    /// Device auth completed successfully; profile is now authenticated.
+    #[serde(rename = "authenticated")]
+    Authenticated {
+        /// Wall-clock time the flow took (ms).
+        elapsed_ms: u64,
+        /// Account used for auth.
+        account: String,
+    },
+
+    /// Interactive bootstrap is required (password/MFA).
+    ///
+    /// The workflow should transition to the safe fallback path
+    /// (wa-nu4.1.3.8) rather than retrying.
+    #[serde(rename = "bootstrap_required")]
+    BootstrapRequired {
+        /// Why interactive login is needed.
+        reason: String,
+        /// Account that needs bootstrap.
+        account: String,
+        /// Path to failure artifacts, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        artifacts_dir: Option<std::path::PathBuf>,
+    },
+
+    /// Auth step failed with an error.
+    #[serde(rename = "failed")]
+    Failed {
+        /// Human-readable error description.
+        error: String,
+        /// Error classification for programmatic handling.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_kind: Option<String>,
+        /// Path to failure artifacts, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        artifacts_dir: Option<std::path::PathBuf>,
+    },
+}
+
+/// Execute the Playwright-based device auth flow as a workflow step.
+///
+/// This function:
+/// 1. Validates the device code format (returns early on invalid codes)
+/// 2. Initializes a BrowserContext from the given data directory
+/// 3. Runs OpenAiDeviceAuthFlow with the persistent browser profile
+/// 4. Maps the result to a [`DeviceAuthStepOutcome`]
+///
+/// # Arguments
+///
+/// * `device_code` - The device code from the Codex pane (e.g., "ABCD-EFGH").
+/// * `account` - Account identifier for profile selection (e.g., "default").
+/// * `data_dir` - Data directory containing browser profiles (typically `.wa/`).
+/// * `artifacts_dir` - Optional directory for failure artifacts (screenshots, etc.).
+/// * `headless` - Whether to run the browser in headless mode.
+///
+/// # Safety
+///
+/// - The device code is validated but **never logged** (secret material).
+/// - Only the code format is checked, not the code content.
+/// - Failure artifacts contain redacted DOM, never session tokens.
+#[cfg(feature = "browser")]
+pub fn execute_device_auth_step(
+    device_code: &str,
+    account: &str,
+    data_dir: &std::path::Path,
+    artifacts_dir: Option<&std::path::Path>,
+    headless: bool,
+) -> DeviceAuthStepOutcome {
+    use crate::browser::{BrowserConfig, BrowserContext};
+    use crate::browser::openai_device::{AuthFlowResult, OpenAiDeviceAuthFlow};
+
+    // Step 1: Validate device code format before touching the browser
+    if !validate_device_code(device_code) {
+        return DeviceAuthStepOutcome::Failed {
+            error: "Invalid device code format".into(),
+            error_kind: Some("invalid_code".into()),
+            artifacts_dir: None,
+        };
+    }
+
+    // Step 2: Initialize browser context
+    let config = BrowserConfig {
+        headless,
+        ..Default::default()
+    };
+    let mut ctx = BrowserContext::new(config, data_dir);
+
+    if let Err(e) = ctx.ensure_ready() {
+        return DeviceAuthStepOutcome::Failed {
+            error: format!("Browser initialization failed: {e}"),
+            error_kind: Some("browser_not_ready".into()),
+            artifacts_dir: None,
+        };
+    }
+
+    // Step 3: Run the device auth flow
+    let mut flow = OpenAiDeviceAuthFlow::with_defaults();
+    if let Some(dir) = artifacts_dir {
+        flow = flow.with_artifacts(dir);
+    }
+
+    let result = flow.execute(&ctx, device_code, account, None);
+
+    // Step 4: Map browser result to workflow outcome
+    match result {
+        AuthFlowResult::Success { elapsed_ms } => {
+            tracing::info!(
+                account = %account,
+                elapsed_ms,
+                "Device auth step: success"
+            );
+            // NOTE: device_code intentionally NOT logged
+            DeviceAuthStepOutcome::Authenticated {
+                elapsed_ms,
+                account: account.to_string(),
+            }
+        }
+        AuthFlowResult::InteractiveBootstrapRequired {
+            reason,
+            artifacts_dir: art_dir,
+        } => {
+            tracing::warn!(
+                account = %account,
+                reason = %reason,
+                "Device auth step: interactive bootstrap required"
+            );
+            DeviceAuthStepOutcome::BootstrapRequired {
+                reason,
+                account: account.to_string(),
+                artifacts_dir: art_dir,
+            }
+        }
+        AuthFlowResult::Failed {
+            error,
+            kind,
+            artifacts_dir: art_dir,
+        } => {
+            tracing::error!(
+                account = %account,
+                error = %error,
+                kind = ?kind,
+                "Device auth step: failed"
+            );
+            DeviceAuthStepOutcome::Failed {
+                error,
+                error_kind: Some(format!("{kind:?}")),
+                artifacts_dir: art_dir,
+            }
+        }
+    }
+}
+
+/// Convert a [`DeviceAuthStepOutcome`] to a [`StepResult`] for workflow integration.
+///
+/// Mapping:
+/// - `Authenticated` → `StepResult::Continue` (proceed to resume step)
+/// - `BootstrapRequired` → `StepResult::Abort` (enter fallback path)
+/// - `Failed` → `StepResult::Abort` with error details
+#[cfg(feature = "browser")]
+pub fn device_auth_outcome_to_step_result(outcome: &DeviceAuthStepOutcome) -> StepResult {
+    match outcome {
+        DeviceAuthStepOutcome::Authenticated { .. } => {
+            let json = serde_json::to_value(outcome).unwrap_or_default();
+            StepResult::Done { result: json }
+        }
+        DeviceAuthStepOutcome::BootstrapRequired {
+            reason, account, ..
+        } => StepResult::Abort {
+            reason: format!(
+                "Interactive bootstrap required for account '{account}': {reason}"
+            ),
+        },
+        DeviceAuthStepOutcome::Failed { error, .. } => StepResult::Abort {
+            reason: format!("Device auth failed: {error}"),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11027,5 +11222,280 @@ Try again at 3:00 PM UTC.
         assert!(record.input_tokens.is_none(), "Wrong field name should not parse as input");
         // Agent type still correctly extracted from top-level
         assert_eq!(record.agent_type, "codex");
+    }
+
+    // ========================================================================
+    // Device Auth Step Tests (wa-nu4.1.3.6)
+    // ========================================================================
+
+    #[cfg(feature = "browser")]
+    mod device_auth_step_tests {
+        use super::*;
+
+        // -- DeviceAuthStepOutcome serde tests --
+
+        #[test]
+        fn outcome_authenticated_serde() {
+            let outcome = DeviceAuthStepOutcome::Authenticated {
+                elapsed_ms: 5432,
+                account: "work".into(),
+            };
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert!(json.contains(r#""status":"authenticated""#));
+            assert!(json.contains(r#""elapsed_ms":5432"#));
+            assert!(json.contains(r#""account":"work""#));
+
+            let parsed: DeviceAuthStepOutcome = serde_json::from_str(&json).unwrap();
+            match parsed {
+                DeviceAuthStepOutcome::Authenticated { elapsed_ms, account } => {
+                    assert_eq!(elapsed_ms, 5432);
+                    assert_eq!(account, "work");
+                }
+                _ => panic!("Expected Authenticated variant"),
+            }
+        }
+
+        #[test]
+        fn outcome_bootstrap_required_serde() {
+            let outcome = DeviceAuthStepOutcome::BootstrapRequired {
+                reason: "MFA required".into(),
+                account: "default".into(),
+                artifacts_dir: Some(std::path::PathBuf::from("/tmp/artifacts")),
+            };
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert!(json.contains(r#""status":"bootstrap_required""#));
+            assert!(json.contains(r#""reason":"MFA required""#));
+            assert!(json.contains("artifacts_dir"));
+
+            let parsed: DeviceAuthStepOutcome = serde_json::from_str(&json).unwrap();
+            match parsed {
+                DeviceAuthStepOutcome::BootstrapRequired { reason, account, artifacts_dir } => {
+                    assert_eq!(reason, "MFA required");
+                    assert_eq!(account, "default");
+                    assert!(artifacts_dir.is_some());
+                }
+                _ => panic!("Expected BootstrapRequired variant"),
+            }
+        }
+
+        #[test]
+        fn outcome_bootstrap_required_omits_none_artifacts() {
+            let outcome = DeviceAuthStepOutcome::BootstrapRequired {
+                reason: "Password needed".into(),
+                account: "default".into(),
+                artifacts_dir: None,
+            };
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert!(!json.contains("artifacts_dir"));
+        }
+
+        #[test]
+        fn outcome_failed_serde() {
+            let outcome = DeviceAuthStepOutcome::Failed {
+                error: "Playwright crashed".into(),
+                error_kind: Some("PlaywrightError".into()),
+                artifacts_dir: None,
+            };
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert!(json.contains(r#""status":"failed""#));
+            assert!(json.contains(r#""error":"Playwright crashed""#));
+            assert!(json.contains(r#""error_kind":"PlaywrightError""#));
+            assert!(!json.contains("artifacts_dir"));
+        }
+
+        #[test]
+        fn outcome_failed_omits_none_kind() {
+            let outcome = DeviceAuthStepOutcome::Failed {
+                error: "unknown".into(),
+                error_kind: None,
+                artifacts_dir: None,
+            };
+            let json = serde_json::to_string(&outcome).unwrap();
+            assert!(!json.contains("error_kind"));
+        }
+
+        // -- execute_device_auth_step: code validation --
+
+        #[test]
+        fn step_rejects_invalid_device_code() {
+            let tmp = std::env::temp_dir().join(format!(
+                "wa_device_auth_test_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&tmp);
+
+            let outcome = execute_device_auth_step("not-valid", "default", &tmp, None, true);
+            match outcome {
+                DeviceAuthStepOutcome::Failed { error, error_kind, .. } => {
+                    assert!(error.contains("Invalid device code"));
+                    assert_eq!(error_kind.as_deref(), Some("invalid_code"));
+                }
+                other => panic!("Expected Failed, got {other:?}"),
+            }
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        #[test]
+        fn step_rejects_empty_device_code() {
+            let tmp = std::env::temp_dir().join(format!(
+                "wa_device_auth_test_empty_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&tmp);
+
+            let outcome = execute_device_auth_step("", "default", &tmp, None, true);
+            match outcome {
+                DeviceAuthStepOutcome::Failed { error_kind, .. } => {
+                    assert_eq!(error_kind.as_deref(), Some("invalid_code"));
+                }
+                other => panic!("Expected Failed, got {other:?}"),
+            }
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        #[test]
+        fn step_rejects_short_parts() {
+            let tmp = std::env::temp_dir().join(format!(
+                "wa_device_auth_test_short_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&tmp);
+
+            let outcome = execute_device_auth_step("AB-CD", "default", &tmp, None, true);
+            match outcome {
+                DeviceAuthStepOutcome::Failed { error_kind, .. } => {
+                    assert_eq!(error_kind.as_deref(), Some("invalid_code"));
+                }
+                other => panic!("Expected Failed, got {other:?}"),
+            }
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        #[test]
+        fn step_accepts_valid_code_format_then_fails_browser() {
+            // A valid code format will pass validation but fail at browser init
+            // (Playwright not installed in test env). This verifies the step
+            // progresses past validation to the browser phase.
+            let tmp = std::env::temp_dir().join(format!(
+                "wa_device_auth_test_valid_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&tmp);
+
+            let outcome =
+                execute_device_auth_step("ABCD-EFGH", "default", &tmp, None, true);
+            match outcome {
+                DeviceAuthStepOutcome::Failed { error, error_kind, .. } => {
+                    // Should fail at browser init, not code validation
+                    assert_ne!(error_kind.as_deref(), Some("invalid_code"));
+                    assert!(
+                        error.contains("Browser") || error.contains("browser")
+                            || error.contains("Playwright") || error.contains("playwright")
+                            || error_kind.as_deref() == Some("browser_not_ready"),
+                        "Expected browser-related error, got: {error}"
+                    );
+                }
+                // If somehow browser init succeeds (unlikely in CI), that's also fine
+                DeviceAuthStepOutcome::Authenticated { .. } => {}
+                DeviceAuthStepOutcome::BootstrapRequired { .. } => {}
+            }
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        #[test]
+        fn step_with_alphanumeric_code() {
+            let tmp = std::env::temp_dir().join(format!(
+                "wa_device_auth_test_alphanum_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::create_dir_all(&tmp);
+
+            // Alphanumeric codes (including digits) should pass validation
+            let outcome =
+                execute_device_auth_step("AB12-CD34", "default", &tmp, None, true);
+            // Should NOT fail with invalid_code
+            match &outcome {
+                DeviceAuthStepOutcome::Failed { error_kind, .. } => {
+                    assert_ne!(error_kind.as_deref(), Some("invalid_code"));
+                }
+                _ => {} // Authenticated or BootstrapRequired are both fine
+            }
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        // -- device_auth_outcome_to_step_result mapping --
+
+        #[test]
+        fn outcome_to_step_result_authenticated() {
+            let outcome = DeviceAuthStepOutcome::Authenticated {
+                elapsed_ms: 1000,
+                account: "default".into(),
+            };
+            let step = device_auth_outcome_to_step_result(&outcome);
+            match step {
+                StepResult::Done { result } => {
+                    assert!(result.get("status").is_some());
+                    assert_eq!(
+                        result.get("status").and_then(|v| v.as_str()),
+                        Some("authenticated")
+                    );
+                }
+                other => panic!("Expected Done, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn outcome_to_step_result_bootstrap_required() {
+            let outcome = DeviceAuthStepOutcome::BootstrapRequired {
+                reason: "MFA".into(),
+                account: "work".into(),
+                artifacts_dir: None,
+            };
+            let step = device_auth_outcome_to_step_result(&outcome);
+            match step {
+                StepResult::Abort { reason } => {
+                    assert!(reason.contains("bootstrap"));
+                    assert!(reason.contains("work"));
+                    assert!(reason.contains("MFA"));
+                }
+                other => panic!("Expected Abort, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn outcome_to_step_result_failed() {
+            let outcome = DeviceAuthStepOutcome::Failed {
+                error: "Selector mismatch".into(),
+                error_kind: Some("SelectorMismatch".into()),
+                artifacts_dir: None,
+            };
+            let step = device_auth_outcome_to_step_result(&outcome);
+            match step {
+                StepResult::Abort { reason } => {
+                    assert!(reason.contains("Selector mismatch"));
+                }
+                other => panic!("Expected Abort, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn outcome_to_step_result_authenticated_contains_elapsed() {
+            let outcome = DeviceAuthStepOutcome::Authenticated {
+                elapsed_ms: 7890,
+                account: "test".into(),
+            };
+            let step = device_auth_outcome_to_step_result(&outcome);
+            if let StepResult::Done { result } = step {
+                assert_eq!(
+                    result.get("elapsed_ms").and_then(|v| v.as_u64()),
+                    Some(7890)
+                );
+            }
+        }
     }
 }

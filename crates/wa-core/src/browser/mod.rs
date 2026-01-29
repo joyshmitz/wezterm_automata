@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
 
+pub mod bootstrap;
 pub mod openai_device;
 
 // =============================================================================
@@ -146,6 +147,191 @@ impl BrowserProfile {
     pub fn exists(&self) -> bool {
         self.path().is_dir()
     }
+
+    /// Path to the profile metadata file.
+    #[must_use]
+    pub fn metadata_path(&self) -> PathBuf {
+        self.path().join(".wa_profile.json")
+    }
+
+    /// Path to the exported Playwright storage state file.
+    ///
+    /// This contains cookies and localStorage, enabling session restoration
+    /// without re-authenticating.
+    #[must_use]
+    pub fn storage_state_path(&self) -> PathBuf {
+        self.path().join("storage_state.json")
+    }
+
+    /// Check if an exported storage state exists for this profile.
+    #[must_use]
+    pub fn has_storage_state(&self) -> bool {
+        self.storage_state_path().is_file()
+    }
+
+    /// Write profile metadata to disk.
+    ///
+    /// The metadata file tracks when the profile was bootstrapped,
+    /// the method used, and when it was last used.
+    pub fn write_metadata(&self, metadata: &ProfileMetadata) -> Result<()> {
+        let path = self.metadata_path();
+        let json = serde_json::to_string_pretty(metadata).map_err(|e| {
+            StorageError::Database(format!("Failed to serialize profile metadata: {e}"))
+        })?;
+        std::fs::write(&path, json.as_bytes()).map_err(|e| {
+            StorageError::Database(format!(
+                "Failed to write profile metadata to {}: {e}",
+                path.display()
+            ))
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(&path, perms);
+        }
+
+        tracing::debug!(
+            path = %path.display(),
+            service = %self.service,
+            "Profile metadata written"
+        );
+        Ok(())
+    }
+
+    /// Read profile metadata from disk.
+    ///
+    /// Returns `None` if the metadata file does not exist.
+    pub fn read_metadata(&self) -> Result<Option<ProfileMetadata>> {
+        let path = self.metadata_path();
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let data = std::fs::read_to_string(&path).map_err(|e| {
+            StorageError::Database(format!(
+                "Failed to read profile metadata from {}: {e}",
+                path.display()
+            ))
+        })?;
+        let meta: ProfileMetadata = serde_json::from_str(&data).map_err(|e| {
+            StorageError::Database(format!("Failed to parse profile metadata: {e}"))
+        })?;
+        Ok(Some(meta))
+    }
+
+    /// Save Playwright storage state (cookies + localStorage) to the profile.
+    ///
+    /// The content should be the JSON output from Playwright's
+    /// `context.storageState()` call.
+    pub fn save_storage_state(&self, state_json: &[u8]) -> Result<()> {
+        let path = self.storage_state_path();
+        std::fs::write(&path, state_json).map_err(|e| {
+            StorageError::Database(format!(
+                "Failed to write storage state to {}: {e}",
+                path.display()
+            ))
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(&path, perms);
+        }
+
+        tracing::debug!(
+            path = %path.display(),
+            bytes = state_json.len(),
+            "Storage state saved"
+        );
+        Ok(())
+    }
+
+    /// Load Playwright storage state from the profile.
+    ///
+    /// Returns `None` if no storage state has been saved.
+    pub fn load_storage_state(&self) -> Result<Option<Vec<u8>>> {
+        let path = self.storage_state_path();
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let data = std::fs::read(&path).map_err(|e| {
+            StorageError::Database(format!(
+                "Failed to read storage state from {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(Some(data))
+    }
+}
+
+// =============================================================================
+// Profile Metadata
+// =============================================================================
+
+/// Metadata about a browser profile's bootstrap and usage history.
+///
+/// Stored as `.wa_profile.json` inside the profile directory.
+/// This file is safe to inspect — it contains no secrets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileMetadata {
+    /// Service this profile is for (e.g., "openai", "anthropic").
+    pub service: String,
+    /// Account identifier.
+    pub account: String,
+    /// ISO 8601 timestamp of when this profile was first bootstrapped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrapped_at: Option<String>,
+    /// Method used for the last bootstrap ("interactive" or "automated").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_method: Option<BootstrapMethod>,
+    /// ISO 8601 timestamp of the last successful use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
+    /// Number of successful automated uses since last bootstrap.
+    #[serde(default)]
+    pub automated_use_count: u64,
+}
+
+impl ProfileMetadata {
+    /// Create new metadata for a fresh profile.
+    #[must_use]
+    pub fn new(service: &str, account: &str) -> Self {
+        Self {
+            service: service.to_string(),
+            account: account.to_string(),
+            bootstrapped_at: None,
+            bootstrap_method: None,
+            last_used_at: None,
+            automated_use_count: 0,
+        }
+    }
+
+    /// Record a successful bootstrap.
+    pub fn record_bootstrap(&mut self, method: BootstrapMethod) {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.bootstrapped_at = Some(now.clone());
+        self.bootstrap_method = Some(method);
+        self.last_used_at = Some(now);
+    }
+
+    /// Record a successful automated use.
+    pub fn record_use(&mut self) {
+        self.last_used_at = Some(chrono::Utc::now().to_rfc3339());
+        self.automated_use_count += 1;
+    }
+}
+
+/// How a browser profile was bootstrapped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BootstrapMethod {
+    /// User completed login interactively in a visible browser window.
+    #[serde(rename = "interactive")]
+    Interactive,
+    /// Login was completed automatically (e.g., already authenticated).
+    #[serde(rename = "automated")]
+    Automated,
 }
 
 /// Resolve the profiles root directory from the data directory.
@@ -550,5 +736,256 @@ mod tests {
     fn profiles_root_custom() {
         let root = profiles_root_from_data_dir(Path::new("/opt/wa-data"));
         assert_eq!(root, PathBuf::from("/opt/wa-data/browser_profiles"));
+    }
+
+    // =========================================================================
+    // ProfileMetadata tests
+    // =========================================================================
+
+    #[test]
+    fn metadata_new() {
+        let meta = ProfileMetadata::new("openai", "my-account");
+        assert_eq!(meta.service, "openai");
+        assert_eq!(meta.account, "my-account");
+        assert!(meta.bootstrapped_at.is_none());
+        assert!(meta.bootstrap_method.is_none());
+        assert!(meta.last_used_at.is_none());
+        assert_eq!(meta.automated_use_count, 0);
+    }
+
+    #[test]
+    fn metadata_record_bootstrap() {
+        let mut meta = ProfileMetadata::new("openai", "test");
+        meta.record_bootstrap(BootstrapMethod::Interactive);
+        assert!(meta.bootstrapped_at.is_some());
+        assert_eq!(meta.bootstrap_method, Some(BootstrapMethod::Interactive));
+        assert!(meta.last_used_at.is_some());
+    }
+
+    #[test]
+    fn metadata_record_use() {
+        let mut meta = ProfileMetadata::new("openai", "test");
+        assert_eq!(meta.automated_use_count, 0);
+        meta.record_use();
+        assert_eq!(meta.automated_use_count, 1);
+        assert!(meta.last_used_at.is_some());
+        meta.record_use();
+        assert_eq!(meta.automated_use_count, 2);
+    }
+
+    #[test]
+    fn metadata_serde_round_trip() {
+        let mut meta = ProfileMetadata::new("anthropic", "work");
+        meta.record_bootstrap(BootstrapMethod::Automated);
+        meta.record_use();
+
+        let json = serde_json::to_string(&meta).unwrap();
+        let deserialized: ProfileMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.service, "anthropic");
+        assert_eq!(deserialized.account, "work");
+        assert_eq!(
+            deserialized.bootstrap_method,
+            Some(BootstrapMethod::Automated)
+        );
+        assert_eq!(deserialized.automated_use_count, 1);
+    }
+
+    #[test]
+    fn metadata_serde_skip_none_fields() {
+        let meta = ProfileMetadata::new("openai", "test");
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(!json.contains("bootstrapped_at"));
+        assert!(!json.contains("bootstrap_method"));
+        assert!(!json.contains("last_used_at"));
+    }
+
+    #[test]
+    fn bootstrap_method_serde() {
+        let interactive = BootstrapMethod::Interactive;
+        let json = serde_json::to_string(&interactive).unwrap();
+        assert_eq!(json, "\"interactive\"");
+
+        let automated = BootstrapMethod::Automated;
+        let json = serde_json::to_string(&automated).unwrap();
+        assert_eq!(json, "\"automated\"");
+
+        let deserialized: BootstrapMethod =
+            serde_json::from_str("\"interactive\"").unwrap();
+        assert_eq!(deserialized, BootstrapMethod::Interactive);
+    }
+
+    // =========================================================================
+    // Profile metadata persistence tests
+    // =========================================================================
+
+    #[test]
+    fn profile_metadata_write_and_read() {
+        let temp = std::env::temp_dir().join(format!(
+            "wa_meta_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+
+        let profile = BrowserProfile::new(&temp, "openai", "test-account");
+        profile.ensure_dir().unwrap();
+
+        let mut meta = ProfileMetadata::new("openai", "test-account");
+        meta.record_bootstrap(BootstrapMethod::Interactive);
+
+        profile.write_metadata(&meta).unwrap();
+        assert!(profile.metadata_path().is_file());
+
+        let loaded = profile.read_metadata().unwrap().unwrap();
+        assert_eq!(loaded.service, "openai");
+        assert_eq!(
+            loaded.bootstrap_method,
+            Some(BootstrapMethod::Interactive)
+        );
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn profile_metadata_read_missing() {
+        let temp = std::env::temp_dir().join(format!(
+            "wa_meta_missing_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+
+        let profile = BrowserProfile::new(&temp, "openai", "nonexistent");
+        let result = profile.read_metadata().unwrap();
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_metadata_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = std::env::temp_dir().join(format!(
+            "wa_meta_perms_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+
+        let profile = BrowserProfile::new(&temp, "openai", "secure");
+        profile.ensure_dir().unwrap();
+
+        let meta = ProfileMetadata::new("openai", "secure");
+        profile.write_metadata(&meta).unwrap();
+
+        let perms = std::fs::metadata(profile.metadata_path())
+            .unwrap()
+            .permissions();
+        assert_eq!(perms.mode() & 0o777, 0o600);
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    // =========================================================================
+    // Storage state persistence tests
+    // =========================================================================
+
+    #[test]
+    fn profile_storage_state_paths() {
+        let profiles_root = PathBuf::from("/data/profiles");
+        let profile = BrowserProfile::new(&profiles_root, "openai", "test");
+        assert_eq!(
+            profile.storage_state_path(),
+            PathBuf::from("/data/profiles/openai/test/storage_state.json")
+        );
+    }
+
+    #[test]
+    fn profile_no_storage_state_initially() {
+        let temp = std::env::temp_dir().join(format!(
+            "wa_state_test_none_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+
+        let profile = BrowserProfile::new(&temp, "openai", "fresh");
+        assert!(!profile.has_storage_state());
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn profile_save_and_load_storage_state() {
+        let temp = std::env::temp_dir().join(format!(
+            "wa_state_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+
+        let profile = BrowserProfile::new(&temp, "openai", "test-account");
+        profile.ensure_dir().unwrap();
+
+        let state = br#"{"cookies":[],"origins":[]}"#;
+        profile.save_storage_state(state).unwrap();
+
+        assert!(profile.has_storage_state());
+
+        let loaded = profile.load_storage_state().unwrap().unwrap();
+        assert_eq!(loaded, state);
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn profile_load_storage_state_missing() {
+        let temp = std::env::temp_dir().join(format!(
+            "wa_state_missing_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+
+        let profile = BrowserProfile::new(&temp, "openai", "no-state");
+        let result = profile.load_storage_state().unwrap();
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_storage_state_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = std::env::temp_dir().join(format!(
+            "wa_state_perms_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+
+        let profile = BrowserProfile::new(&temp, "openai", "secure");
+        profile.ensure_dir().unwrap();
+
+        let state = b"{}";
+        profile.save_storage_state(state).unwrap();
+
+        let perms = std::fs::metadata(profile.storage_state_path())
+            .unwrap()
+            .permissions();
+        assert_eq!(perms.mode() & 0o777, 0o600);
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    // =========================================================================
+    // Metadata path resolution tests
+    // =========================================================================
+
+    #[test]
+    fn metadata_path_resolution() {
+        let profiles_root = PathBuf::from("/data/profiles");
+        let profile = BrowserProfile::new(&profiles_root, "openai", "test");
+        assert_eq!(
+            profile.metadata_path(),
+            PathBuf::from("/data/profiles/openai/test/.wa_profile.json")
+        );
     }
 }

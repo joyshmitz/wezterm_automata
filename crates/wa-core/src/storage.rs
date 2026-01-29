@@ -644,6 +644,46 @@ pub struct SearchResult {
     pub score: f64,
 }
 
+/// Per-pane indexing statistics for observability.
+///
+/// Since FTS5 indexing is trigger-driven (same transaction as INSERT),
+/// segments and FTS rows are always in sync under normal operation.
+/// A mismatch indicates index corruption.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneIndexingStats {
+    /// Pane ID
+    pub pane_id: u64,
+    /// Total segments stored for this pane
+    pub segment_count: u64,
+    /// Total content bytes stored for this pane
+    pub total_bytes: u64,
+    /// Highest sequence number for this pane
+    pub max_seq: Option<u64>,
+    /// Timestamp of the most recent segment (epoch ms)
+    pub last_segment_at: Option<i64>,
+    /// Number of FTS rows for this pane (should equal segment_count)
+    pub fts_row_count: u64,
+    /// Whether FTS index is consistent (fts_row_count == segment_count)
+    pub fts_consistent: bool,
+}
+
+/// Aggregate indexing health across all panes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexingHealthReport {
+    /// Per-pane statistics
+    pub panes: Vec<PaneIndexingStats>,
+    /// Total segments across all panes
+    pub total_segments: u64,
+    /// Total bytes across all panes
+    pub total_bytes: u64,
+    /// Total FTS rows across all panes
+    pub total_fts_rows: u64,
+    /// Number of panes with FTS inconsistency
+    pub inconsistent_panes: u64,
+    /// Overall health: all panes consistent and no errors
+    pub healthy: bool,
+}
+
 /// A gap event indicating discontinuous capture
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Gap {
@@ -2828,6 +2868,34 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
     }
 
+    /// Get per-pane indexing statistics (read-only, uses read connection).
+    pub async fn get_pane_indexing_stats(&self) -> Result<Vec<PaneIndexingStats>> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            get_pane_indexing_stats_sync(&conn)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
+    /// Get a full indexing health report (per-pane stats + FTS integrity).
+    pub async fn get_indexing_health(&self) -> Result<IndexingHealthReport> {
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
+            let stats = get_pane_indexing_stats_sync(&conn)?;
+            let fts_ok = check_fts_integrity_sync(&conn)?;
+            Ok(build_indexing_health_report(stats, fts_ok))
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("Task join error: {e}")))?
+    }
+
     /// Insert an approval token
     pub async fn insert_approval_token(&self, token: ApprovalTokenRecord) -> Result<i64> {
         let (tx, rx) = oneshot::channel();
@@ -4953,6 +5021,134 @@ fn search_fts_with_snippets(
     }
 
     Ok(results)
+}
+
+// =============================================================================
+// Indexing Progress Tracking (wa-upg.5.2)
+// =============================================================================
+
+/// Get per-pane indexing statistics.
+///
+/// Since FTS5 indexing is trigger-driven (same transaction as INSERT), the
+/// segment count *is* the FTS row count under normal operation.  We separately
+/// check FTS integrity to detect corruption.
+fn get_pane_indexing_stats_sync(conn: &Connection) -> Result<Vec<PaneIndexingStats>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.pane_id,
+                    COALESCE(seg.cnt, 0),
+                    COALESCE(seg.bytes, 0),
+                    seg.max_seq,
+                    seg.last_at
+             FROM panes p
+             LEFT JOIN (
+                 SELECT pane_id,
+                        COUNT(*) AS cnt,
+                        SUM(content_len) AS bytes,
+                        MAX(seq) AS max_seq,
+                        MAX(captured_at) AS last_at
+                 FROM output_segments
+                 GROUP BY pane_id
+             ) seg ON seg.pane_id = p.pane_id
+             WHERE p.observed = 1
+             ORDER BY p.pane_id",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prepare indexing stats: {e}")))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let pane_id: u64 = {
+                let v: i64 = row.get(0)?;
+                v as u64
+            };
+            let segment_count: u64 = {
+                let v: i64 = row.get(1)?;
+                v as u64
+            };
+            let total_bytes: u64 = {
+                let v: i64 = row.get(2)?;
+                v as u64
+            };
+            let max_seq: Option<u64> = row.get::<_, Option<i64>>(3)?.map(|v| v as u64);
+            let last_segment_at: Option<i64> = row.get(4)?;
+            // Trigger-driven FTS: segment_count == fts_row_count by construction
+            Ok(PaneIndexingStats {
+                pane_id,
+                segment_count,
+                total_bytes,
+                max_seq,
+                last_segment_at,
+                fts_row_count: segment_count,
+                fts_consistent: true,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Failed to query indexing stats: {e}")))?;
+
+    let mut stats = Vec::new();
+    for row in rows {
+        stats.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+    }
+    Ok(stats)
+}
+
+/// Run the FTS5 integrity-check command.
+///
+/// Returns Ok(true) if the index is consistent, Ok(false) if corruption
+/// is detected.
+fn check_fts_integrity_sync(conn: &Connection) -> Result<bool> {
+    match conn.execute_batch(
+        "INSERT INTO output_segments_fts(output_segments_fts) VALUES('integrity-check')",
+    ) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("database disk image is malformed")
+                || msg.contains("fts5: ")
+            {
+                Ok(false)
+            } else {
+                Err(StorageError::Database(format!("FTS integrity check failed: {e}")).into())
+            }
+        }
+    }
+}
+
+/// Build an aggregate health report from per-pane stats and FTS integrity.
+fn build_indexing_health_report(
+    pane_stats: Vec<PaneIndexingStats>,
+    fts_ok: bool,
+) -> IndexingHealthReport {
+    let total_segments: u64 = pane_stats.iter().map(|p| p.segment_count).sum();
+    let total_bytes: u64 = pane_stats.iter().map(|p| p.total_bytes).sum();
+    let total_fts_rows: u64 = pane_stats.iter().map(|p| p.fts_row_count).sum();
+    let inconsistent_panes = if fts_ok {
+        0
+    } else {
+        // If FTS integrity check fails, mark all panes as potentially inconsistent
+        pane_stats.len() as u64
+    };
+
+    // Update per-pane consistency based on FTS health
+    let panes: Vec<PaneIndexingStats> = if fts_ok {
+        pane_stats
+    } else {
+        pane_stats
+            .into_iter()
+            .map(|mut p| {
+                p.fts_consistent = false;
+                p
+            })
+            .collect()
+    };
+
+    IndexingHealthReport {
+        healthy: fts_ok && inconsistent_panes == 0,
+        total_segments,
+        total_bytes,
+        total_fts_rows,
+        inconsistent_panes,
+        panes,
+    }
 }
 
 /// Query an agent session by ID
@@ -9200,6 +9396,257 @@ mod storage_handle_tests {
 
         drop(conn);
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    // =========================================================================
+    // Indexing Progress Tracking Tests (wa-upg.5.2)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn indexing_stats_empty_database() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        let stats = handle.get_pane_indexing_stats().await.unwrap();
+        assert!(stats.is_empty(), "No panes means no stats");
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn indexing_stats_pane_with_no_segments() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        let stats = handle.get_pane_indexing_stats().await.unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].pane_id, 1);
+        assert_eq!(stats[0].segment_count, 0);
+        assert_eq!(stats[0].total_bytes, 0);
+        assert!(stats[0].max_seq.is_none());
+        assert!(stats[0].last_segment_at.is_none());
+        assert!(stats[0].fts_consistent);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn indexing_stats_tracks_segments() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+        handle.append_segment(1, "hello", None).await.unwrap();
+        handle.append_segment(1, "world!", None).await.unwrap();
+        handle.append_segment(1, "test data", None).await.unwrap();
+
+        let stats = handle.get_pane_indexing_stats().await.unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].pane_id, 1);
+        assert_eq!(stats[0].segment_count, 3);
+        assert_eq!(stats[0].total_bytes, 5 + 6 + 9); // hello + world! + test data
+        assert_eq!(stats[0].max_seq, Some(2)); // 0, 1, 2
+        assert!(stats[0].last_segment_at.is_some());
+        assert!(stats[0].fts_consistent);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn indexing_stats_multiple_panes() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+        handle.upsert_pane(test_pane(2)).await.unwrap();
+
+        handle.append_segment(1, "pane1-data", None).await.unwrap();
+        handle.append_segment(2, "pane2-data-longer", None).await.unwrap();
+        handle.append_segment(2, "pane2-more", None).await.unwrap();
+
+        let stats = handle.get_pane_indexing_stats().await.unwrap();
+        assert_eq!(stats.len(), 2);
+
+        let p1 = stats.iter().find(|s| s.pane_id == 1).unwrap();
+        assert_eq!(p1.segment_count, 1);
+        assert_eq!(p1.total_bytes, 10);
+
+        let p2 = stats.iter().find(|s| s.pane_id == 2).unwrap();
+        assert_eq!(p2.segment_count, 2);
+        assert_eq!(p2.total_bytes, 17 + 10);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn indexing_stats_seq_is_monotonic() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+        for i in 0..10 {
+            handle
+                .append_segment(1, &format!("seg-{i}"), None)
+                .await
+                .unwrap();
+        }
+
+        let stats = handle.get_pane_indexing_stats().await.unwrap();
+        assert_eq!(stats[0].segment_count, 10);
+        assert_eq!(stats[0].max_seq, Some(9));
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn indexing_stats_ignored_panes_excluded() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        // Create observed pane
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+        handle.append_segment(1, "visible", None).await.unwrap();
+
+        // Create ignored pane
+        let mut ignored = test_pane(2);
+        ignored.observed = false;
+        ignored.ignore_reason = Some("test exclude".to_string());
+        handle.upsert_pane(ignored).await.unwrap();
+
+        let stats = handle.get_pane_indexing_stats().await.unwrap();
+        assert_eq!(stats.len(), 1, "Only observed panes appear in stats");
+        assert_eq!(stats[0].pane_id, 1);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn indexing_health_report_healthy() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+        handle.append_segment(1, "hello world", None).await.unwrap();
+
+        let report = handle.get_indexing_health().await.unwrap();
+        assert!(report.healthy);
+        assert_eq!(report.total_segments, 1);
+        assert_eq!(report.total_bytes, 11);
+        assert_eq!(report.inconsistent_panes, 0);
+        assert_eq!(report.panes.len(), 1);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn indexing_health_report_aggregates() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+        handle.upsert_pane(test_pane(2)).await.unwrap();
+        handle.upsert_pane(test_pane(3)).await.unwrap();
+
+        for pane in 1..=3u64 {
+            for i in 0..5 {
+                handle
+                    .append_segment(pane, &format!("p{pane}-s{i}"), None)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let report = handle.get_indexing_health().await.unwrap();
+        assert!(report.healthy);
+        assert_eq!(report.total_segments, 15);
+        assert_eq!(report.panes.len(), 3);
+        for p in &report.panes {
+            assert_eq!(p.segment_count, 5);
+            assert!(p.fts_consistent);
+        }
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn fts_integrity_check_on_healthy_db() {
+        let db_path = temp_db_path();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL").unwrap();
+        initialize_schema(&conn).unwrap();
+
+        // Insert some data via triggers
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (1, 'local', 0, 0, 1)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (1, 0, 'test', 4, 0)",
+            [],
+        ).unwrap();
+
+        let ok = check_fts_integrity_sync(&conn).unwrap();
+        assert!(ok, "Healthy FTS should pass integrity check");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn build_report_marks_healthy_when_fts_ok() {
+        let stats = vec![
+            PaneIndexingStats {
+                pane_id: 1,
+                segment_count: 10,
+                total_bytes: 100,
+                max_seq: Some(9),
+                last_segment_at: Some(1000),
+                fts_row_count: 10,
+                fts_consistent: true,
+            },
+        ];
+        let report = build_indexing_health_report(stats, true);
+        assert!(report.healthy);
+        assert_eq!(report.inconsistent_panes, 0);
+    }
+
+    #[test]
+    fn build_report_marks_unhealthy_when_fts_corrupt() {
+        let stats = vec![
+            PaneIndexingStats {
+                pane_id: 1,
+                segment_count: 10,
+                total_bytes: 100,
+                max_seq: Some(9),
+                last_segment_at: Some(1000),
+                fts_row_count: 10,
+                fts_consistent: true,
+            },
+            PaneIndexingStats {
+                pane_id: 2,
+                segment_count: 5,
+                total_bytes: 50,
+                max_seq: Some(4),
+                last_segment_at: Some(2000),
+                fts_row_count: 5,
+                fts_consistent: true,
+            },
+        ];
+        let report = build_indexing_health_report(stats, false);
+        assert!(!report.healthy);
+        assert_eq!(report.inconsistent_panes, 2); // All panes marked
+        assert!(!report.panes[0].fts_consistent);
+        assert!(!report.panes[1].fts_consistent);
     }
 }
 

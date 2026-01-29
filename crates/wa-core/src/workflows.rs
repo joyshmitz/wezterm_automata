@@ -9360,4 +9360,100 @@ Try again at 3:00 PM UTC.
         assert_eq!(result.selected.as_ref().unwrap().account_id, "acc-123");
         assert_eq!(result.accounts_refreshed, 1);
     }
+
+    // ── Device code parsing tests ───────────────────────────────────────
+
+    #[test]
+    fn parse_device_code_direct_format() {
+        // parse_device_code expects "code" or "enter" directly before the code value
+        let tail = "Your one-time code: ABCD-12345 (visit https://auth.openai.com/device)";
+        let result = parse_device_code(tail).expect("should parse");
+        assert_eq!(result.code, "ABCD-12345");
+        assert!(result.url.is_some());
+        assert!(result.url.unwrap().contains("auth.openai.com"));
+    }
+
+    #[test]
+    fn parse_device_code_v2_format() {
+        let tail =
+            "Please open https://auth.openai.com/codex/device and enter this one-time code: WXYZ-98765";
+        let result = parse_device_code(tail).expect("should parse");
+        assert_eq!(result.code, "WXYZ-98765");
+        assert!(result.url.is_some());
+    }
+
+    #[test]
+    fn parse_device_code_lowercase_prompt() {
+        let tail = "enter code: AAAA-BBBB";
+        let result = parse_device_code(tail).expect("should parse");
+        assert_eq!(result.code, "AAAA-BBBB");
+        assert!(result.url.is_none());
+    }
+
+    #[test]
+    fn parse_device_code_no_code_returns_error() {
+        let tail = "Some random output with no device code";
+        let err = parse_device_code(tail).unwrap_err();
+        assert!(err.to_string().contains("device code"));
+        // Must not contain raw tail content (safe diagnostics)
+        assert!(!err.to_string().contains("random output"));
+        assert!(err.tail_hash != 0);
+        assert_eq!(err.tail_len, tail.len());
+    }
+
+    #[test]
+    fn parse_device_code_empty_input() {
+        let err = parse_device_code("").unwrap_err();
+        assert_eq!(err.tail_len, 0);
+    }
+
+    #[test]
+    fn parse_device_code_url_only_no_code() {
+        let tail = "Visit https://auth.openai.com/device to continue";
+        let err = parse_device_code(tail).unwrap_err();
+        assert!(err.tail_len > 0);
+    }
+
+    #[test]
+    fn parse_device_code_mixed_case() {
+        let tail = "CODE: abcd-efgh";
+        let result = parse_device_code(tail).expect("should parse case-insensitive");
+        assert_eq!(result.code, "ABCD-EFGH");
+    }
+
+    #[test]
+    fn validate_device_code_valid_formats() {
+        assert!(validate_device_code("ABCD-1234"));
+        assert!(validate_device_code("ABCD-12345"));
+        assert!(validate_device_code("WXYZ-EFGH"));
+        assert!(validate_device_code("1234-5678"));
+    }
+
+    #[test]
+    fn validate_device_code_invalid_formats() {
+        assert!(!validate_device_code(""));
+        assert!(!validate_device_code("ABCD"));
+        assert!(!validate_device_code("AB-CD"));
+        assert!(!validate_device_code("ABCD-"));
+        assert!(!validate_device_code("-ABCD"));
+        assert!(!validate_device_code("ABCD-EF-GH"));
+    }
+
+    #[test]
+    fn device_auth_login_command_is_correct() {
+        assert_eq!(DEVICE_AUTH_LOGIN_COMMAND, "cod login --device-auth\n");
+        assert!(DEVICE_AUTH_LOGIN_COMMAND.ends_with('\n'));
+    }
+
+    #[test]
+    fn device_code_parse_error_display_is_safe() {
+        let sensitive_tail = "secret-token: sk-abc123 and code somewhere";
+        let err = parse_device_code(sensitive_tail).unwrap_err();
+        let display = err.to_string();
+        // Display must not leak raw tail content
+        assert!(!display.contains("sk-abc123"));
+        assert!(!display.contains("secret-token"));
+        // But should contain diagnostic info
+        assert!(display.contains("device code"));
+    }
 }

@@ -48,6 +48,7 @@ KEEP_ARTIFACTS=false
 ARTIFACTS_DIR=""
 TIMEOUT="$DEFAULT_TIMEOUT"
 SELF_CHECK_ONLY=false
+SKIP_SELF_CHECK=false
 LIST_ONLY=false
 PARALLEL=1
 WORKSPACE=""
@@ -111,6 +112,7 @@ Options:
     --timeout SECS        Global timeout per scenario (default: $DEFAULT_TIMEOUT)
     --list                List available scenarios and exit
     --self-check          Run harness self-check only
+    --skip-self-check     Skip prerequisites check (for CI setup-only scenarios)
     --parallel N          Run N scenarios in parallel (default: 1)
     --workspace DIR       Override workspace for isolation
     --config FILE         Override wa.toml for testing
@@ -174,6 +176,10 @@ parse_args() {
                 ;;
             --self-check)
                 SELF_CHECK_ONLY=true
+                shift
+                ;;
+            --skip-self-check)
+                SKIP_SELF_CHECK=true
                 shift
                 ;;
             --parallel)
@@ -2815,11 +2821,15 @@ main() {
         fi
     fi
 
-    # Always run self-check first
-    log_info "Running prerequisites check..."
-    if ! run_self_check; then
-        log_fail "Prerequisites check failed. Use --self-check for details."
-        exit 5
+    # Run self-check unless explicitly skipped (e.g., for setup-only CI scenarios)
+    if [[ "$SKIP_SELF_CHECK" == "true" ]]; then
+        log_info "Self-check skipped (--skip-self-check)"
+    else
+        log_info "Running prerequisites check..."
+        if ! run_self_check; then
+            log_fail "Prerequisites check failed. Use --self-check for details."
+            exit 5
+        fi
     fi
     echo ""
 

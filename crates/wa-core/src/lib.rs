@@ -30,6 +30,7 @@
 //! - `wait`: Wait-for utilities (no fixed sleeps)
 //! - `accounts`: Account management and selection policy
 //! - `plan`: Action plan types for unified workflow representation
+//! - `browser`: Browser automation scaffolding (feature-gated: `browser`)
 //!
 //! # Safety
 //!
@@ -74,6 +75,9 @@ pub mod wait;
 pub mod watchdog;
 pub mod wezterm;
 pub mod workflows;
+
+#[cfg(feature = "browser")]
+pub mod browser;
 
 #[cfg(feature = "tui")]
 pub mod tui;

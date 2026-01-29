@@ -283,6 +283,41 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Show audit trail (recent actions, policy decisions)
+    Audit {
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+
+        /// Maximum number of records to return
+        #[arg(long, short = 'l', default_value = "20")]
+        limit: usize,
+
+        /// Filter by pane ID
+        #[arg(long, short = 'p')]
+        pane_id: Option<u64>,
+
+        /// Filter by actor kind (human, robot, mcp, workflow)
+        #[arg(long, short = 'a')]
+        actor: Option<String>,
+
+        /// Filter by action kind (send_text, workflow_run, approve_allow_once, etc.)
+        #[arg(long, short = 'k')]
+        action: Option<String>,
+
+        /// Filter by policy decision (allow, deny, require_approval)
+        #[arg(long, short = 'd')]
+        decision: Option<String>,
+
+        /// Filter by result (success, denied, failed, timeout)
+        #[arg(long, short = 'r')]
+        result: Option<String>,
+
+        /// Only show records since this timestamp (epoch ms)
+        #[arg(long, short = 's')]
+        since: Option<i64>,
+    },
+
     /// Run diagnostics
     Doctor {
         /// Show circuit breaker status
@@ -318,6 +353,12 @@ enum Commands {
     Db {
         #[command(subcommand)]
         command: DbCommands,
+    },
+
+    /// Backup and restore commands
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommands,
     },
 
     /// Launch the interactive TUI (requires --features tui)
@@ -776,6 +817,54 @@ enum DbCommands {
         /// Show the plan without applying migrations
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Check database health (integrity, FTS, WAL, schema)
+    Check {
+        /// Output format (auto, plain, json)
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Repair database issues (FTS rebuild, WAL checkpoint, vacuum)
+    Repair {
+        /// Show what would be repaired without executing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+
+        /// Skip creating a backup before repair
+        #[arg(long)]
+        no_backup: bool,
+
+        /// Output format (auto, plain, json)
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackupCommands {
+    /// Export database and metadata to a portable backup archive
+    Export {
+        /// Output directory path (default: .wa/backups/wa_backup_<timestamp>)
+        #[arg(long, short = 'o')]
+        output: Option<String>,
+
+        /// Include SQL text dump alongside binary database copy
+        #[arg(long)]
+        sql_dump: bool,
+
+        /// Skip post-export verification
+        #[arg(long)]
+        no_verify: bool,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
     },
 }
 
@@ -6145,10 +6234,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let lock_path = &layout.lock_path;
 
             let Some(meta) = check_running(lock_path) else {
-                eprintln!(
-                    "No watcher running in workspace: {}",
-                    layout.root.display()
-                );
+                eprintln!("No watcher running in workspace: {}", layout.root.display());
                 std::process::exit(1);
             };
 
@@ -6212,7 +6298,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     if check_running(lock_path).is_none() {
                         println!("Watcher killed (pid {pid}).");
                     } else {
-                        eprintln!("Warning: lock still held after SIGKILL. The pid may belong to a different process.");
+                        eprintln!(
+                            "Warning: lock still held after SIGKILL. The pid may belong to a different process."
+                        );
                         std::process::exit(1);
                     }
                 } else {
@@ -6372,6 +6460,121 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 eprintln!("Error: IPC event forwarding is only supported on Unix platforms.");
                 eprintln!("Context: pane_id={pane}");
                 std::process::exit(1);
+            }
+        }
+
+        Some(Commands::Audit {
+            format,
+            limit,
+            pane_id,
+            actor,
+            action,
+            decision,
+            result,
+            since,
+        }) => {
+            use wa_core::output::{AuditListRenderer, OutputFormat, RenderContext, detect_format};
+
+            let output_format = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            // Get workspace layout for DB path
+            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                Ok(l) => l,
+                Err(e) => {
+                    if output_format.is_json() {
+                        println!(
+                            r#"{{"ok": false, "error": "Failed to get workspace layout: {}", "version": "{}"}}"#,
+                            e,
+                            wa_core::VERSION
+                        );
+                    } else {
+                        eprintln!("Error: Failed to get workspace layout: {e}");
+                        eprintln!("Check --workspace or WA_WORKSPACE");
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            // Open storage handle
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if output_format.is_json() {
+                        println!(
+                            r#"{{"ok": false, "error": "Failed to open storage: {}", "version": "{}"}}"#,
+                            e,
+                            wa_core::VERSION
+                        );
+                    } else {
+                        eprintln!("Error: Failed to open storage: {e}");
+                        eprintln!("Is the database initialized? Run 'wa watch' first.");
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            // Build audit query
+            let query = wa_core::storage::AuditQuery {
+                limit: Some(limit),
+                pane_id,
+                actor_kind: actor.clone(),
+                action_kind: action.clone(),
+                policy_decision: decision.clone(),
+                result: result.clone(),
+                since,
+                ..Default::default()
+            };
+
+            if cli.verbose {
+                eprintln!("Workspace: {}", layout.root.display());
+                eprintln!("Database:  {}", layout.db_path.display());
+                if let Some(pane_id) = pane_id {
+                    eprintln!("Filter:    pane_id={pane_id}");
+                }
+                if let Some(actor) = &actor {
+                    eprintln!("Filter:    actor={actor}");
+                }
+                if let Some(action) = &action {
+                    eprintln!("Filter:    action={action}");
+                }
+                if let Some(decision) = &decision {
+                    eprintln!("Filter:    decision={decision}");
+                }
+                if let Some(result) = &result {
+                    eprintln!("Filter:    result={result}");
+                }
+                if let Some(since) = since {
+                    eprintln!("Filter:    since={since}");
+                }
+                eprintln!("Limit:     {limit}");
+            }
+
+            // Query audit actions
+            match storage.get_audit_actions(query).await {
+                Ok(actions) => {
+                    let ctx = RenderContext::new(output_format)
+                        .verbose(cli.verbose)
+                        .limit(limit);
+                    let output = AuditListRenderer::render(&actions, &ctx);
+                    print!("{output}");
+                }
+                Err(e) => {
+                    if output_format.is_json() {
+                        println!(
+                            r#"{{"ok": false, "error": "Failed to query audit trail: {}", "version": "{}"}}"#,
+                            e,
+                            wa_core::VERSION
+                        );
+                    } else {
+                        eprintln!("Error: Failed to query audit trail: {e}");
+                    }
+                    std::process::exit(1);
+                }
             }
         }
 
@@ -6798,6 +7001,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             handle_db_command(command, &layout).await?;
         }
 
+        Some(Commands::Backup { command }) => {
+            handle_backup_command(command, &layout, &workspace_root).await?;
+        }
+
         #[cfg(feature = "tui")]
         Some(Commands::Tui { debug, refresh }) => {
             use std::time::Duration;
@@ -7177,6 +7384,230 @@ async fn handle_db_command(
             let applied_plan = migrate_database_to_version(db_path, target_version)?;
             println!("Migration complete.");
             print_migration_plan(&applied_plan);
+        }
+
+        DbCommands::Check { format } => {
+            use wa_core::output::{OutputFormat, detect_format};
+            use wa_core::storage::{DbCheckStatus, check_database_health};
+
+            let output_format = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+            let report = check_database_health(db_path);
+
+            if output_format == OutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+                );
+            } else {
+                println!("Database: {}", report.db_path);
+                if let Some(size) = report.db_size_bytes {
+                    let size_display = if size > 1_048_576 {
+                        format!("{:.1} MB", size as f64 / 1_048_576.0)
+                    } else if size > 1024 {
+                        format!("{:.1} KB", size as f64 / 1024.0)
+                    } else {
+                        format!("{size} bytes")
+                    };
+                    println!("Size: {size_display}");
+                }
+                println!();
+                println!("Running health checks...");
+
+                for check in &report.checks {
+                    let icon = match check.status {
+                        DbCheckStatus::Ok => "  [OK]",
+                        DbCheckStatus::Warning => "  [WARN]",
+                        DbCheckStatus::Error => "  [ERR]",
+                    };
+                    if let Some(detail) = &check.detail {
+                        println!("{icon} {}: {detail}", check.name);
+                    } else {
+                        println!("{icon} {}", check.name);
+                    }
+                }
+
+                let problems = report.problem_count();
+                println!();
+                if problems == 0 {
+                    println!("Summary: Database is healthy");
+                } else {
+                    println!("Problems found: {problems}");
+                    println!("Run: wa db repair --dry-run");
+                }
+            }
+
+            if report.has_errors() {
+                std::process::exit(1);
+            } else if report.has_warnings() {
+                std::process::exit(2);
+            }
+        }
+
+        DbCommands::Repair {
+            dry_run,
+            yes,
+            no_backup,
+            format,
+        } => {
+            use wa_core::output::{OutputFormat, detect_format};
+            use wa_core::storage::repair_database;
+
+            let output_format = match format.to_lowercase().as_str() {
+                "json" => OutputFormat::Json,
+                "plain" => OutputFormat::Plain,
+                _ => detect_format(),
+            };
+
+            if dry_run {
+                if output_format != OutputFormat::Json {
+                    println!("Dry run — no changes will be made.\n");
+                }
+            } else if !yes {
+                println!("This will repair the database at:");
+                println!("  {}", db_path.display());
+                if !no_backup {
+                    println!("\nA backup will be created before repair.");
+                }
+                println!();
+                if !prompt_confirm("Proceed with repair? [y/N]: ")? {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+
+            let report = repair_database(db_path, dry_run, no_backup)?;
+
+            if output_format == OutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+                );
+            } else {
+                if let Some(backup) = &report.backup_path {
+                    println!("Backup created: {backup}");
+                    println!();
+                }
+
+                let label = if dry_run { "Would perform" } else { "Repairing" };
+                println!("{label}:");
+                for (i, repair) in report.repairs.iter().enumerate() {
+                    let status = if repair.success { "done" } else { "FAILED" };
+                    if dry_run {
+                        println!("  {}. {}", i + 1, repair.detail);
+                    } else {
+                        println!("  [{}] {} - {}", status, repair.name, repair.detail);
+                    }
+                }
+
+                println!();
+                if dry_run {
+                    println!("No changes made. Run without --dry-run to apply.");
+                } else if report.all_succeeded() {
+                    println!("Repair complete. Run: wa db check");
+                } else {
+                    eprintln!("Some repairs failed. Check output above.");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_backup_command(
+    command: BackupCommands,
+    layout: &wa_core::config::WorkspaceLayout,
+    workspace_root: &Path,
+) -> anyhow::Result<()> {
+    match command {
+        BackupCommands::Export {
+            output,
+            sql_dump,
+            no_verify,
+            format,
+        } => {
+            let db_path = &layout.db_path;
+
+            if !db_path.exists() {
+                if format == "json" {
+                    let resp = serde_json::json!({
+                        "ok": false,
+                        "error": format!("Database not found: {}", db_path.display()),
+                        "error_code": "E_DB_NOT_FOUND",
+                        "hint": "Run 'wa watch' first to create the database.",
+                    });
+                    println!("{}", serde_json::to_string_pretty(&resp)?);
+                } else {
+                    eprintln!("Error: Database not found at {}", db_path.display());
+                    eprintln!("Hint: Run 'wa watch' first to create the database.");
+                }
+                std::process::exit(1);
+            }
+
+            let opts = wa_core::backup::ExportOptions {
+                output: output.map(std::path::PathBuf::from),
+                include_sql_dump: sql_dump,
+                verify: !no_verify,
+            };
+
+            if format != "json" {
+                println!("Exporting backup...");
+                println!("  Source: {}", db_path.display());
+            }
+
+            match wa_core::backup::export_backup(db_path, workspace_root, &opts) {
+                Ok(result) => {
+                    if format == "json" {
+                        let resp = serde_json::json!({
+                            "ok": true,
+                            "data": {
+                                "output_path": result.output_path,
+                                "manifest": result.manifest,
+                                "total_size_bytes": result.total_size_bytes,
+                            }
+                        });
+                        println!("{}", serde_json::to_string_pretty(&resp)?);
+                    } else {
+                        println!("Backup saved: {}", result.output_path);
+                        println!();
+                        println!("  Schema version: {}", result.manifest.schema_version);
+                        println!("  Database size:  {} bytes", result.manifest.db_size_bytes);
+                        println!("  Total size:     {} bytes", result.total_size_bytes);
+                        println!("  Checksum:       {}", result.manifest.db_checksum);
+                        println!();
+                        println!("  Stats:");
+                        println!("    Panes:      {}", result.manifest.stats.panes);
+                        println!("    Segments:   {}", result.manifest.stats.segments);
+                        println!("    Events:     {}", result.manifest.stats.events);
+                        println!("    Audit:      {}", result.manifest.stats.audit_actions);
+                        println!("    Workflows:  {}", result.manifest.stats.workflow_executions);
+                        if !no_verify {
+                            println!();
+                            println!("  Verified: OK");
+                        }
+                    }
+                }
+                Err(e) => {
+                    if format == "json" {
+                        let resp = serde_json::json!({
+                            "ok": false,
+                            "error": format!("{e}"),
+                            "error_code": "E_BACKUP_FAILED",
+                        });
+                        println!("{}", serde_json::to_string_pretty(&resp)?);
+                    } else {
+                        eprintln!("Backup failed: {e}");
+                    }
+                    std::process::exit(1);
+                }
+            }
         }
     }
 

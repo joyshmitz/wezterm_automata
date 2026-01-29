@@ -40,6 +40,7 @@
 
 pub mod accounts;
 pub mod approval;
+pub mod backup;
 pub mod caut;
 #[cfg(test)]
 pub mod chaos;

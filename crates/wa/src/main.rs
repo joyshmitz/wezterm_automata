@@ -6140,37 +6140,44 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }
 
         Some(Commands::Stop { force, timeout }) => {
-            use wa_core::lock::{check_running, LockMetadata};
+            use wa_core::lock::check_running;
 
             let lock_path = &layout.lock_path;
 
-            let meta: LockMetadata = match check_running(lock_path) {
-                Some(m) => m,
-                None => {
-                    eprintln!(
-                        "No watcher running in workspace: {}",
-                        layout.root.display()
-                    );
-                    std::process::exit(1);
-                }
+            let Some(meta) = check_running(lock_path) else {
+                eprintln!(
+                    "No watcher running in workspace: {}",
+                    layout.root.display()
+                );
+                std::process::exit(1);
             };
 
             let pid = meta.pid;
             println!("Stopping watcher (pid {pid}) in {}", layout.root.display());
 
-            // Safety: only send signals to the process recorded in the lock metadata.
-            // Best-effort ownership check (same uid).
             #[cfg(unix)]
             {
                 use std::time::{Duration, Instant};
 
-                // Send SIGTERM for graceful shutdown.
-                let term_result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-                if term_result != 0 {
-                    let err = std::io::Error::last_os_error();
-                    eprintln!("Failed to send SIGTERM to pid {pid}: {err}");
-                    eprintln!("The process may have already exited or belong to another user.");
-                    std::process::exit(1);
+                // Send SIGTERM via the `kill` command (no unsafe needed).
+                let term_status = std::process::Command::new("kill")
+                    .args(["-s", "TERM", &pid.to_string()])
+                    .status();
+
+                match term_status {
+                    Ok(s) if s.success() => {}
+                    Ok(s) => {
+                        eprintln!(
+                            "Failed to send SIGTERM to pid {pid} (exit code: {}).",
+                            s.code().unwrap_or(-1)
+                        );
+                        eprintln!("The process may have already exited or belong to another user.");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to run kill command: {e}");
+                        std::process::exit(1);
+                    }
                 }
 
                 // Wait for the lock to be released.
@@ -6188,12 +6195,18 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     println!("Watcher stopped gracefully (pid {pid}).");
                 } else if force {
                     println!("Graceful shutdown timed out. Sending SIGKILL to pid {pid}.");
-                    let kill_result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                    if kill_result != 0 {
-                        let err = std::io::Error::last_os_error();
-                        eprintln!("Failed to send SIGKILL to pid {pid}: {err}");
-                        std::process::exit(1);
+                    let kill_status = std::process::Command::new("kill")
+                        .args(["-s", "KILL", &pid.to_string()])
+                        .status();
+
+                    match kill_status {
+                        Ok(s) if s.success() => {}
+                        Ok(_) | Err(_) => {
+                            eprintln!("Failed to send SIGKILL to pid {pid}.");
+                            std::process::exit(1);
+                        }
                     }
+
                     // Wait briefly for SIGKILL to take effect.
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     if check_running(lock_path).is_none() {

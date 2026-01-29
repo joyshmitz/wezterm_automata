@@ -14933,7 +14933,10 @@ mod tests {
             "short version should contain semver dots: {v}"
         );
         // Must contain a commit hash in parens
-        assert!(v.contains('(') && v.contains(')'), "short version should contain commit hash in parens: {v}");
+        assert!(
+            v.contains('(') && v.contains(')'),
+            "short version should contain commit hash in parens: {v}"
+        );
     }
 
     #[test]
@@ -14948,12 +14951,30 @@ mod tests {
     #[test]
     fn version_verbose_includes_all_fields() {
         let v = build_meta::verbose_version();
-        assert!(v.contains("wa "), "verbose version should start with 'wa ': {v}");
-        assert!(v.contains("commit:"), "verbose version should contain commit field: {v}");
-        assert!(v.contains("built:"), "verbose version should contain built field: {v}");
-        assert!(v.contains("rustc:"), "verbose version should contain rustc field: {v}");
-        assert!(v.contains("target:"), "verbose version should contain target field: {v}");
-        assert!(v.contains("features:"), "verbose version should contain features field: {v}");
+        assert!(
+            v.contains("wa "),
+            "verbose version should start with 'wa ': {v}"
+        );
+        assert!(
+            v.contains("commit:"),
+            "verbose version should contain commit field: {v}"
+        );
+        assert!(
+            v.contains("built:"),
+            "verbose version should contain built field: {v}"
+        );
+        assert!(
+            v.contains("rustc:"),
+            "verbose version should contain rustc field: {v}"
+        );
+        assert!(
+            v.contains("target:"),
+            "verbose version should contain target field: {v}"
+        );
+        assert!(
+            v.contains("features:"),
+            "verbose version should contain features field: {v}"
+        );
     }
 
     #[test]
@@ -14970,7 +14991,10 @@ mod tests {
         let v = build_meta::verbose_version();
         let lines: Vec<&str> = v.lines().collect();
         // First line is the version header
-        assert!(lines[0].starts_with("wa "), "first line should be version header");
+        assert!(
+            lines[0].starts_with("wa "),
+            "first line should be version header"
+        );
         // Fields must appear in a stable order
         let field_positions: Vec<_> = ["commit:", "built:", "rustc:", "target:", "features:"]
             .iter()
@@ -14981,10 +15005,7 @@ mod tests {
             .collect();
         // Each field must appear after the previous one
         for window in field_positions.windows(2) {
-            assert!(
-                window[0] < window[1],
-                "fields must appear in stable order"
-            );
+            assert!(window[0] < window[1], "fields must appear in stable order");
         }
     }
 }

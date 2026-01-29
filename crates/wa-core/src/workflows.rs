@@ -12524,8 +12524,7 @@ Try again at 3:00 PM UTC.
 
         #[test]
         fn needs_human_auth_plan_without_session_id() {
-            let plan =
-                build_needs_human_auth_plan(10, "acct", "SSO needed", None, None, 1_000_000);
+            let plan = build_needs_human_auth_plan(10, "acct", "SSO needed", None, None, 1_000_000);
 
             assert!(plan.resume_session_id.is_none());
             assert!(plan.retry_after_ms.is_none());
@@ -12617,14 +12616,7 @@ Try again at 3:00 PM UTC.
 
         #[test]
         fn fallback_plan_to_step_result_is_done() {
-            let plan = build_needs_human_auth_plan(
-                1,
-                "acct",
-                "MFA",
-                None,
-                None,
-                1_000_000,
-            );
+            let plan = build_needs_human_auth_plan(1, "acct", "MFA", None, None, 1_000_000);
             let result = fallback_plan_to_step_result(&plan);
             assert!(result.is_done(), "fallback should produce Done, not Abort");
             assert!(result.is_terminal());
@@ -12634,10 +12626,7 @@ Try again at 3:00 PM UTC.
         fn fallback_plan_to_step_result_has_fallback_flag() {
             let plan = build_failover_disabled_plan(1, None, None, 1_000_000);
             let result = fallback_plan_to_step_result(&plan);
-            assert!(
-                is_fallback_result(&result),
-                "should be tagged as fallback"
-            );
+            assert!(is_fallback_result(&result), "should be tagged as fallback");
         }
 
         #[test]
@@ -12652,10 +12641,7 @@ Try again at 3:00 PM UTC.
         #[test]
         fn is_fallback_result_false_for_abort() {
             let result = StepResult::abort("test");
-            assert!(
-                !is_fallback_result(&result),
-                "Abort should not be fallback"
-            );
+            assert!(!is_fallback_result(&result), "Abort should not be fallback");
         }
 
         #[test]
@@ -12714,14 +12700,8 @@ Try again at 3:00 PM UTC.
 
         #[test]
         fn fallback_step_result_preserves_plan_fields() {
-            let plan = build_needs_human_auth_plan(
-                42,
-                "acct",
-                "MFA",
-                Some("sess-1"),
-                None,
-                1_000_000,
-            );
+            let plan =
+                build_needs_human_auth_plan(42, "acct", "MFA", Some("sess-1"), None, 1_000_000);
             let result = fallback_plan_to_step_result(&plan);
 
             if let StepResult::Done { result } = result {
@@ -12845,8 +12825,7 @@ You've hit your usage limit. Try again at 5:00 PM.";
 
     #[test]
     fn fixture_full_usage_limit_parses_all_fields() {
-        let result =
-            parse_codex_session_summary(FIXTURE_FULL_USAGE_LIMIT).expect("should parse");
+        let result = parse_codex_session_summary(FIXTURE_FULL_USAGE_LIMIT).expect("should parse");
         assert_eq!(result.session_id, "123e4567-e89b-12d3-a456-426614174000");
         assert_eq!(result.token_usage.total, Some(1_234_567));
         assert_eq!(result.token_usage.input, Some(500_000));
@@ -12868,8 +12847,7 @@ You've hit your usage limit. Try again at 5:00 PM.";
 
     #[test]
     fn fixture_no_reset_time_parses_without_reset() {
-        let result =
-            parse_codex_session_summary(FIXTURE_NO_RESET_TIME).expect("should parse");
+        let result = parse_codex_session_summary(FIXTURE_NO_RESET_TIME).expect("should parse");
         assert_eq!(result.session_id, "11111111-2222-3333-4444-555555555555");
         assert_eq!(result.token_usage.total, Some(100));
         assert!(result.reset_time.is_none());
@@ -12877,8 +12855,7 @@ You've hit your usage limit. Try again at 5:00 PM.";
 
     #[test]
     fn fixture_missing_session_id_fails_gracefully() {
-        let err = parse_codex_session_summary(FIXTURE_MISSING_SESSION_ID)
-            .expect_err("should fail");
+        let err = parse_codex_session_summary(FIXTURE_MISSING_SESSION_ID).expect_err("should fail");
         assert!(err.missing.contains(&"session_id"));
         assert!(!err.missing.contains(&"token_usage"));
         assert!(err.tail_len > 0);
@@ -12887,24 +12864,22 @@ You've hit your usage limit. Try again at 5:00 PM.";
 
     #[test]
     fn fixture_missing_token_usage_fails_gracefully() {
-        let err = parse_codex_session_summary(FIXTURE_MISSING_TOKEN_USAGE)
-            .expect_err("should fail");
+        let err =
+            parse_codex_session_summary(FIXTURE_MISSING_TOKEN_USAGE).expect_err("should fail");
         assert!(err.missing.contains(&"token_usage"));
         assert!(!err.missing.contains(&"session_id"));
     }
 
     #[test]
     fn fixture_empty_fails_with_both_missing() {
-        let err =
-            parse_codex_session_summary(FIXTURE_EMPTY).expect_err("should fail");
+        let err = parse_codex_session_summary(FIXTURE_EMPTY).expect_err("should fail");
         assert!(err.missing.contains(&"session_id"));
         assert!(err.missing.contains(&"token_usage"));
     }
 
     #[test]
     fn fixture_garbage_fails_with_both_missing() {
-        let err =
-            parse_codex_session_summary(FIXTURE_GARBAGE).expect_err("should fail");
+        let err = parse_codex_session_summary(FIXTURE_GARBAGE).expect_err("should fail");
         assert!(err.missing.contains(&"session_id"));
         assert!(err.missing.contains(&"token_usage"));
     }

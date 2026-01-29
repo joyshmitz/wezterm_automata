@@ -98,6 +98,40 @@ pub struct CassSearchHit {
     pub extra: HashMap<String, Value>,
 }
 
+/// Parsed cass session details.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CassSession {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub project_path: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub ended_at: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<CassMessage>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// A cass message entry for a session.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CassMessage {
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub timestamp: Option<String>,
+    #[serde(default)]
+    pub token_count: Option<u64>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
 /// Parsed output for `cass view` (session query).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CassViewResult {
@@ -336,6 +370,55 @@ impl CassClient {
         parse_json(&output, self.max_error_bytes)
     }
 
+    /// Search cass for sessions under a given path (and optional agent filter).
+    pub async fn search_sessions(
+        &self,
+        path: &Path,
+        agent: Option<CassAgent>,
+    ) -> Result<Vec<CassSession>, CassError> {
+        let mut args = vec![
+            "search".to_string(),
+            "--path".to_string(),
+            path.to_string_lossy().to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ];
+
+        if let Some(agent) = agent {
+            args.push("--agent".to_string());
+            args.push(agent.as_str().to_string());
+        }
+
+        let output = self.run(&args).await?;
+        let sessions = parse_sessions(&output, self.max_error_bytes)?;
+        if sessions.is_empty() {
+            return Err(CassError::NoResults {
+                query: format!("path={}", path.display()),
+            });
+        }
+        Ok(sessions)
+    }
+
+    /// Query a specific session by session id.
+    pub async fn query_session(&self, session_id: &str) -> Result<CassSession, CassError> {
+        let args = vec![
+            "query".to_string(),
+            "--session-id".to_string(),
+            session_id.to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ];
+
+        let output = self.run(&args).await?;
+        let mut sessions = parse_sessions(&output, self.max_error_bytes)?;
+        if let Some(session) = sessions.pop() {
+            return Ok(session);
+        }
+        Err(CassError::NoResults {
+            query: format!("session_id={session_id}"),
+        })
+    }
+
     /// Query a specific session via `cass view`.
     pub async fn query(
         &self,
@@ -417,6 +500,38 @@ fn parse_json<T: DeserializeOwned>(input: &str, max_preview: usize) -> Result<T,
         message: err.to_string(),
         preview: redact_and_truncate(input, max_preview),
     })
+}
+
+fn parse_sessions(input: &str, max_preview: usize) -> Result<Vec<CassSession>, CassError> {
+    let value: Value = serde_json::from_str(input).map_err(|err| CassError::InvalidJson {
+        message: err.to_string(),
+        preview: redact_and_truncate(input, max_preview),
+    })?;
+
+    if let Some(array) = value.as_array() {
+        return serde_json::from_value(Value::Array(array.clone())).map_err(|err| {
+            CassError::InvalidJson {
+                message: err.to_string(),
+                preview: redact_and_truncate(input, max_preview),
+            }
+        });
+    }
+
+    if let Some(sessions_val) = value.get("sessions") {
+        return serde_json::from_value(sessions_val.clone()).map_err(|err| {
+            CassError::InvalidJson {
+                message: err.to_string(),
+                preview: redact_and_truncate(input, max_preview),
+            }
+        });
+    }
+
+    serde_json::from_value(value)
+        .map(|session: CassSession| vec![session])
+        .map_err(|err| CassError::InvalidJson {
+            message: err.to_string(),
+            preview: redact_and_truncate(input, max_preview),
+        })
 }
 
 fn redact_and_truncate(input: &str, max_len: usize) -> String {
@@ -537,6 +652,62 @@ mod tests {
         assert!(parsed.match_line.is_some());
         let match_line = parsed.match_line.unwrap();
         assert_eq!(match_line.role.as_deref(), Some("assistant"));
+    }
+
+    #[test]
+    fn parse_sessions_array() {
+        let payload = json!([
+            {
+                "session_id": "sess-1",
+                "agent": "codex",
+                "project_path": "/repo",
+                "messages": [
+                    { "role": "user", "content": "hi", "timestamp": "2026-01-29T12:00:00Z" }
+                ]
+            },
+            {
+                "session_id": "sess-2",
+                "agent": "claude_code",
+                "project_path": "/repo2"
+            }
+        ]);
+
+        let parsed = parse_sessions(&payload.to_string(), 4096).expect("should parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].session_id.as_deref(), Some("sess-1"));
+        assert_eq!(parsed[0].messages.len(), 1);
+        assert_eq!(parsed[1].agent.as_deref(), Some("claude_code"));
+    }
+
+    #[test]
+    fn parse_sessions_wrapped() {
+        let payload = json!({
+            "sessions": [
+                {
+                    "session_id": "sess-3",
+                    "agent": "gemini",
+                    "project_path": "/repo3"
+                }
+            ],
+            "extra_field": true
+        });
+
+        let parsed = parse_sessions(&payload.to_string(), 4096).expect("should parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].session_id.as_deref(), Some("sess-3"));
+    }
+
+    #[test]
+    fn parse_sessions_single_object() {
+        let payload = json!({
+            "session_id": "sess-4",
+            "agent": "codex",
+            "project_path": "/repo4"
+        });
+
+        let parsed = parse_sessions(&payload.to_string(), 4096).expect("should parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].session_id.as_deref(), Some("sess-4"));
     }
 
     #[test]

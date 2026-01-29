@@ -59,7 +59,10 @@ fn main() {
         "metrics",
         "distributed",
     ] {
-        println!("cargo:rerun-if-env-changed=CARGO_FEATURE_{}", feat.to_uppercase());
+        println!(
+            "cargo:rerun-if-env-changed=CARGO_FEATURE_{}",
+            feat.to_uppercase()
+        );
         if std::env::var(format!("CARGO_FEATURE_{}", feat.to_uppercase())).is_ok() {
             features.push(*feat);
         }

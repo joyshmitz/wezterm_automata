@@ -360,9 +360,18 @@ pub fn parse_reset_at_ms(reset_at: &str) -> Option<i64> {
                     let (h, min, s) = if let Some(time_str) = parts.get(1) {
                         let time_parts: Vec<&str> = time_str.split(':').collect();
                         (
-                            time_parts.first().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0),
-                            time_parts.get(1).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0),
-                            time_parts.get(2).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0),
+                            time_parts
+                                .first()
+                                .and_then(|v| v.parse::<u32>().ok())
+                                .unwrap_or(0),
+                            time_parts
+                                .get(1)
+                                .and_then(|v| v.parse::<u32>().ok())
+                                .unwrap_or(0),
+                            time_parts
+                                .get(2)
+                                .and_then(|v| v.parse::<u32>().ok())
+                                .unwrap_or(0),
                         )
                     } else {
                         (0, 0, 0)
@@ -370,7 +379,8 @@ pub fn parse_reset_at_ms(reset_at: &str) -> Option<i64> {
 
                     // Days from epoch (simplified — not handling leap seconds)
                     let days = days_from_epoch(y, m, d);
-                    let secs = days * 86_400 + i64::from(h) * 3_600 + i64::from(min) * 60 + i64::from(s);
+                    let secs =
+                        days * 86_400 + i64::from(h) * 3_600 + i64::from(min) * 60 + i64::from(s);
                     return Some(secs * 1_000);
                 }
             }
@@ -847,11 +857,7 @@ mod tests {
     // Multi-account exhaustion tests (wa-4r7)
     // ========================================================================
 
-    fn make_account_with_reset(
-        id: &str,
-        pct: f64,
-        reset_at: Option<&str>,
-    ) -> AccountRecord {
+    fn make_account_with_reset(id: &str, pct: f64, reset_at: Option<&str>) -> AccountRecord {
         AccountRecord {
             id: 0,
             account_id: id.to_string(),
@@ -987,9 +993,7 @@ mod tests {
 
     #[test]
     fn build_exhaustion_info_no_reset_times() {
-        let accounts = vec![
-            make_account_with_reset("x", 0.0, None),
-        ];
+        let accounts = vec![make_account_with_reset("x", 0.0, None)];
         let explanation = SelectionExplanation {
             total_considered: 1,
             filtered_out: vec![],
@@ -1006,9 +1010,7 @@ mod tests {
 
     #[test]
     fn exhaustion_info_serde_round_trip() {
-        let accounts = vec![
-            make_account_with_reset("a", 0.0, Some("1700000000000")),
-        ];
+        let accounts = vec![make_account_with_reset("a", 0.0, Some("1700000000000"))];
         let explanation = SelectionExplanation {
             total_considered: 1,
             filtered_out: vec![],

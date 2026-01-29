@@ -6985,6 +6985,41 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
             }
 
+            // Recent crash bundles
+            {
+                println!();
+                println!("Crash History:");
+                if let Some(bundle) = wa_core::crash::latest_crash_bundle(&layout.crash_dir) {
+                    let detail = if let Some(ref report) = bundle.report {
+                        let msg = if report.message.len() > 80 {
+                            format!("{}...", &report.message[..77])
+                        } else {
+                            report.message.clone()
+                        };
+                        let loc = report
+                            .location
+                            .as_deref()
+                            .unwrap_or("unknown location");
+                        format!("{msg} (at {loc})")
+                    } else if let Some(ref manifest) = bundle.manifest {
+                        format!("crash at {}", manifest.created_at)
+                    } else {
+                        "crash bundle found".to_string()
+                    };
+
+                    has_warnings = true;
+                    let check = DiagnosticCheck::warning(
+                        "Recent crash",
+                        &detail,
+                        format!("Inspect bundle: {}", bundle.path.display()),
+                    );
+                    check.print();
+                } else {
+                    DiagnosticCheck::ok_with_detail("Crash history", "No crash bundles found")
+                        .print();
+                }
+            }
+
             if circuits {
                 use wa_core::circuit_breaker::{
                     CircuitStateKind, circuit_snapshots, ensure_default_circuits,

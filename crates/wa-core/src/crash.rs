@@ -386,6 +386,82 @@ fn format_iso8601(epoch_secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
+// ---------------------------------------------------------------------------
+// Crash bundle listing
+// ---------------------------------------------------------------------------
+
+/// Summary of a discovered crash bundle on disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrashBundleSummary {
+    /// Path to the crash bundle directory
+    pub path: PathBuf,
+    /// Parsed manifest (if readable)
+    pub manifest: Option<CrashManifest>,
+    /// Parsed crash report (if readable)
+    pub report: Option<CrashReport>,
+}
+
+/// List crash bundles in `crash_dir`, sorted newest first.
+///
+/// Scans for directories matching `wa_crash_*`, parses their manifests
+/// and crash reports, and returns up to `limit` results.  Invalid or
+/// unreadable bundles are silently skipped.
+pub fn list_crash_bundles(crash_dir: &Path, limit: usize) -> Vec<CrashBundleSummary> {
+    let entries = match fs::read_dir(crash_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut bundles: Vec<CrashBundleSummary> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_type().map_or(false, |ft| ft.is_dir())
+                && e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("wa_crash_"))
+        })
+        .filter_map(|e| {
+            let path = e.path();
+            let manifest = fs::read_to_string(path.join("manifest.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<CrashManifest>(&s).ok());
+            let report = fs::read_to_string(path.join("crash_report.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<CrashReport>(&s).ok());
+
+            // Skip bundles without at least a manifest or report
+            if manifest.is_none() && report.is_none() {
+                return None;
+            }
+
+            Some(CrashBundleSummary {
+                path,
+                manifest,
+                report,
+            })
+        })
+        .collect();
+
+    // Sort newest first by timestamp (from report or manifest)
+    bundles.sort_by(|a, b| {
+        let ts_a = a.report.as_ref().map_or(0, |r| r.timestamp);
+        let ts_b = b.report.as_ref().map_or(0, |r| r.timestamp);
+        ts_b.cmp(&ts_a)
+    });
+
+    bundles.truncate(limit);
+    bundles
+}
+
+/// Get the most recent crash bundle, if any.
+pub fn latest_crash_bundle(crash_dir: &Path) -> Option<CrashBundleSummary> {
+    list_crash_bundles(crash_dir, 1).into_iter().next()
+}
+
+// ---------------------------------------------------------------------------
+// Helpers (continued)
+// ---------------------------------------------------------------------------
+
 /// Convert days since epoch to (year, month, day).
 fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     // Civil calendar conversion (Euclidean affine)
@@ -418,6 +494,17 @@ mod tests {
             ingest_lag_max_ms: 50,
             db_writable: true,
             db_last_write_at: Some(1_234_567_800),
+        }
+    }
+
+    fn test_report() -> CrashReport {
+        CrashReport {
+            message: "assertion failed".to_string(),
+            location: Some("src/main.rs:42:5".to_string()),
+            backtrace: Some("   0: std::backtrace\n   1: my_func".to_string()),
+            timestamp: 1_700_000_000,
+            pid: 12345,
+            thread_name: Some("main".to_string()),
         }
     }
 
@@ -945,5 +1032,127 @@ mod tests {
         assert!(truncated.len() < long_bt.len());
         assert!(truncated.ends_with("\n... [truncated]"));
         assert!(truncated.len() <= MAX_BACKTRACE_LEN + 20);
+    }
+
+    // -----------------------------------------------------------------------
+    // Crash bundle listing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_crash_bundles_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = list_crash_bundles(tmp.path(), 10);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn list_crash_bundles_nonexistent_dir() {
+        let result = list_crash_bundles(Path::new("/nonexistent/crash/dir"), 10);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn list_crash_bundles_finds_bundles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path();
+
+        let report = test_report();
+        write_crash_bundle(crash_dir, &report, None).unwrap();
+
+        let bundles = list_crash_bundles(crash_dir, 10);
+        assert_eq!(bundles.len(), 1);
+        assert!(bundles[0].manifest.is_some());
+        assert!(bundles[0].report.is_some());
+    }
+
+    #[test]
+    fn list_crash_bundles_sorted_newest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path();
+
+        let mut r1 = test_report();
+        r1.timestamp = 1000;
+        r1.message = "first".to_string();
+        write_crash_bundle(crash_dir, &r1, None).unwrap();
+
+        let mut r2 = test_report();
+        r2.timestamp = 2000;
+        r2.message = "second".to_string();
+        write_crash_bundle(crash_dir, &r2, None).unwrap();
+
+        let bundles = list_crash_bundles(crash_dir, 10);
+        assert_eq!(bundles.len(), 2);
+        assert_eq!(
+            bundles[0].report.as_ref().unwrap().message,
+            "second"
+        );
+        assert_eq!(
+            bundles[1].report.as_ref().unwrap().message,
+            "first"
+        );
+    }
+
+    #[test]
+    fn list_crash_bundles_respects_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path();
+
+        for i in 0..5 {
+            let mut r = test_report();
+            r.timestamp = 1000 + i;
+            write_crash_bundle(crash_dir, &r, None).unwrap();
+        }
+
+        let bundles = list_crash_bundles(crash_dir, 3);
+        assert_eq!(bundles.len(), 3);
+    }
+
+    #[test]
+    fn list_crash_bundles_skips_non_crash_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path();
+
+        // Create a non-crash directory
+        fs::create_dir(crash_dir.join("some_other_dir")).unwrap();
+        // Create a crash bundle
+        let report = test_report();
+        write_crash_bundle(crash_dir, &report, None).unwrap();
+
+        let bundles = list_crash_bundles(crash_dir, 10);
+        assert_eq!(bundles.len(), 1);
+    }
+
+    #[test]
+    fn list_crash_bundles_skips_empty_crash_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path();
+
+        // Create an empty wa_crash_ directory (no manifest or report)
+        fs::create_dir(crash_dir.join("wa_crash_empty")).unwrap();
+        // Create a valid crash bundle
+        let report = test_report();
+        write_crash_bundle(crash_dir, &report, None).unwrap();
+
+        let bundles = list_crash_bundles(crash_dir, 10);
+        assert_eq!(bundles.len(), 1);
+    }
+
+    #[test]
+    fn latest_crash_bundle_returns_newest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path();
+
+        let mut r1 = test_report();
+        r1.timestamp = 1000;
+        r1.message = "older".to_string();
+        write_crash_bundle(crash_dir, &r1, None).unwrap();
+
+        let mut r2 = test_report();
+        r2.timestamp = 2000;
+        r2.message = "newer".to_string();
+        write_crash_bundle(crash_dir, &r2, None).unwrap();
+
+        let latest = latest_crash_bundle(crash_dir).unwrap();
+        assert_eq!(latest.report.as_ref().unwrap().message, "newer");
     }
 }

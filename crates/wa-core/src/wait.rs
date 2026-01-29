@@ -630,4 +630,138 @@ mod tests {
             }
         ));
     }
+
+    // =========================================================================
+    // Integration tests: synthetic producer/consumer quiescence
+    // =========================================================================
+
+    #[tokio::test]
+    async fn quiescence_producer_consumer_eventually_quiet() {
+        // Simulate a producer/consumer where the consumer drains work
+        // and quiescence is achieved once the queue is empty and quiet window elapses.
+        let pending = Arc::new(AtomicUsize::new(5));
+        let pending2 = pending.clone();
+
+        // Spawn a "consumer" task that drains one item every 5ms
+        let consumer = tokio::spawn(async move {
+            loop {
+                let current = pending2.load(Ordering::SeqCst);
+                if current == 0 {
+                    break;
+                }
+                pending2.fetch_sub(1, Ordering::SeqCst);
+                sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        // Wait for quiescence: pending must reach 0
+        let pending_check = pending.clone();
+        let condition = WaitCondition::new("queue drained", move || {
+            let count = pending_check.load(Ordering::SeqCst);
+            async move {
+                if count == 0 {
+                    WaitFor::Ready(())
+                } else {
+                    WaitFor::not_ready(Some(format!("pending={count}")))
+                }
+            }
+        });
+
+        let backoff = Backoff {
+            initial: Duration::from_millis(2),
+            max: Duration::from_millis(20),
+            factor: 2,
+            max_retries: None,
+        };
+
+        let result = wait_for(condition, Duration::from_secs(2), backoff).await;
+        assert!(result.is_ok(), "should achieve quiescence after consumer drains");
+
+        consumer.await.unwrap();
+        assert_eq!(pending.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn quiescence_with_shared_state_and_quiet_window() {
+        // Test QuiescenceState with a shared atomic that simulates
+        // work draining and then a quiet window.
+        use std::sync::Mutex;
+
+        let shared = Arc::new(Mutex::new(QuiescenceState {
+            pending: 3,
+            last_activity: Some(Instant::now()),
+            quiet_window: Duration::from_millis(10),
+        }));
+        let shared2 = shared.clone();
+
+        // Spawn a task that reduces pending and then goes quiet
+        let worker = tokio::spawn(async move {
+            for _ in 0..3 {
+                sleep(Duration::from_millis(3)).await;
+                let mut s = shared2.lock().unwrap();
+                s.pending = s.pending.saturating_sub(1);
+                s.last_activity = Some(Instant::now());
+            }
+        });
+
+        // Poll the shared state for quiescence
+        let shared_check = shared.clone();
+        let condition = WaitCondition::new("shared state quiescent", move || {
+            let state = shared_check.lock().unwrap().clone();
+            let now = Instant::now();
+            async move {
+                if state.is_quiet_at(now) {
+                    WaitFor::Ready(())
+                } else {
+                    WaitFor::not_ready(Some(state.describe_at(now)))
+                }
+            }
+        });
+
+        let backoff = Backoff {
+            initial: Duration::from_millis(2),
+            max: Duration::from_millis(20),
+            factor: 2,
+            max_retries: None,
+        };
+
+        let result = wait_for(condition, Duration::from_secs(2), backoff).await;
+        assert!(result.is_ok(), "should detect quiescence after work drains");
+
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_condition_on_changing_source() {
+        // Simulate a monotonically increasing counter and wait for it to
+        // reach a threshold. Uses wait_for_condition (>= check) rather than
+        // wait_for_value (exact equality) because the counter may overshoot
+        // between polls.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter2 = counter.clone();
+
+        // Spawn an incrementer that ticks every 3ms up to 10
+        let incrementer = tokio::spawn(async move {
+            for _ in 0..10 {
+                sleep(Duration::from_millis(3)).await;
+                counter2.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let counter_read = counter.clone();
+        let result = wait_for_condition(
+            "counter >= 7",
+            move || {
+                let val = counter_read.load(Ordering::SeqCst);
+                async move { val >= 7 }
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert!(result.is_ok(), "counter should reach >= 7 within timeout");
+        let final_val = counter.load(Ordering::SeqCst);
+        assert!(final_val >= 7, "final counter value {final_val} should be >= 7");
+        incrementer.await.unwrap();
+    }
 }

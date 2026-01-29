@@ -254,6 +254,35 @@ enum Commands {
         list: bool,
     },
 
+    /// Stop a running watcher in the current workspace
+    Stop {
+        /// Force kill with SIGKILL if graceful shutdown times out
+        #[arg(long)]
+        force: bool,
+
+        /// Timeout in seconds for graceful shutdown before giving up (or escalating with --force)
+        #[arg(long, default_value = "5")]
+        timeout: u64,
+    },
+
+    /// Submit an approval code for a pending action
+    Approve {
+        /// The approval code (8-character alphanumeric)
+        code: String,
+
+        /// Target pane ID for fingerprint validation (optional)
+        #[arg(long)]
+        pane: Option<u64>,
+
+        /// Expected action fingerprint (optional)
+        #[arg(long)]
+        fingerprint: Option<String>,
+
+        /// Check approval status without consuming
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Run diagnostics
     Doctor {
         /// Show circuit breaker status
@@ -1611,6 +1640,27 @@ async fn evaluate_robot_approve(
     fingerprint: Option<&str>,
     dry_run: bool,
 ) -> Result<RobotApproveData, RobotApproveError> {
+    evaluate_approve(
+        storage,
+        workspace_id,
+        code,
+        pane,
+        fingerprint,
+        dry_run,
+        "robot",
+    )
+    .await
+}
+
+async fn evaluate_approve(
+    storage: &wa_core::storage::StorageHandle,
+    workspace_id: &str,
+    code: &str,
+    pane: Option<u64>,
+    fingerprint: Option<&str>,
+    dry_run: bool,
+    actor_kind: &str,
+) -> Result<RobotApproveData, RobotApproveError> {
     let code_hash = wa_core::approval::hash_allow_once_code(code);
 
     let token = match storage.get_approval_token(&code_hash).await {
@@ -1745,16 +1795,23 @@ async fn evaluate_robot_approve(
     let audit = wa_core::storage::AuditActionRecord {
         id: 0,
         ts: consumed_at,
-        actor_kind: "robot".to_string(),
+        actor_kind: actor_kind.to_string(),
         actor_id: None,
         pane_id: consumed_token.pane_id,
         domain: None,
         action_kind: "approve_allow_once".to_string(),
         policy_decision: "allow".to_string(),
-        decision_reason: Some("Robot submitted approval code".to_string()),
+        decision_reason: Some(format!(
+            "{} submitted approval code",
+            if actor_kind == "human" {
+                "Human"
+            } else {
+                "Robot"
+            }
+        )),
         rule_id: None,
         input_summary: Some(format!(
-            "wa robot approve {} for {} pane {:?}",
+            "wa approve {} for {} pane {:?}",
             code, consumed_token.action_kind, consumed_token.pane_id
         )),
         verification_summary: Some(format!(
@@ -6079,6 +6136,68 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     eprintln!("Use 'wa why --list' to see available templates.");
                 }
                 std::process::exit(1);
+            }
+        }
+
+        Some(Commands::Approve {
+            code,
+            pane,
+            fingerprint,
+            dry_run,
+        }) => {
+            let db_path = layout.db_path.to_string_lossy();
+            let storage = match wa_core::storage::StorageHandle::new(&db_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: Failed to open database: {e}");
+                    eprintln!("Is the watcher running? Try: wa watch --foreground");
+                    std::process::exit(1);
+                }
+            };
+            let workspace_id = layout.root.to_string_lossy().to_string();
+
+            match evaluate_approve(
+                &storage,
+                &workspace_id,
+                &code,
+                pane,
+                fingerprint.as_deref(),
+                dry_run,
+                "human",
+            )
+            .await
+            {
+                Ok(data) => {
+                    if data.dry_run == Some(true) {
+                        println!("Approval code: {}", data.code);
+                        println!("Status: valid (not consumed — dry run)");
+                        if let Some(action) = &data.action_kind {
+                            println!("Action: {action}");
+                        }
+                        if let Some(pane_id) = data.pane_id {
+                            println!("Pane: {pane_id}");
+                        }
+                        if let Some(expires) = data.expires_at {
+                            println!("Expires at: {expires} (epoch ms)");
+                        }
+                    } else {
+                        println!("Approval granted.");
+                        if let Some(action) = &data.action_kind {
+                            println!("Action: {action}");
+                        }
+                        if let Some(pane_id) = data.pane_id {
+                            println!("Pane: {pane_id}");
+                        }
+                        println!("You may now retry the original action.");
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Error: {}", err.message);
+                    if let Some(hint) = &err.hint {
+                        eprintln!("{hint}");
+                    }
+                    std::process::exit(1);
+                }
             }
         }
 

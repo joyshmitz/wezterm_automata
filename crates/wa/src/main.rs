@@ -7689,6 +7689,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             "title": hc.name,
                             "detail": hc.detail,
                             "action": "wa doctor",
+                            "actions": [
+                                {"command": "wa doctor", "label": "Run diagnostics"},
+                                {"command": "wa doctor --json", "label": "Machine-readable diagnostics"},
+                            ],
                         }));
                     }
                 }
@@ -7720,6 +7724,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         "title": "Recent crash",
                         "detail": detail,
                         "action": "wa reproduce --kind crash",
+                        "actions": [
+                            {"command": "wa reproduce --kind crash", "label": "Export incident bundle"},
+                            {"command": "wa doctor", "label": "Check system health"},
+                        ],
+                        "explain": format!(
+                            "ls {}",
+                            bundle.path.display()
+                        ),
                         "bundle_path": bundle.path.display().to_string(),
                     }));
                 }
@@ -7769,6 +7781,33 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             "wa events --pane {} --unhandled",
                                             event.pane_id
                                         ),
+                                        "actions": [
+                                            {
+                                                "command": format!(
+                                                    "wa events --pane {} --unhandled",
+                                                    event.pane_id
+                                                ),
+                                                "label": "List unhandled events"
+                                            },
+                                            {
+                                                "command": format!(
+                                                    "wa why --recent --pane {}",
+                                                    event.pane_id
+                                                ),
+                                                "label": "Explain detection"
+                                            },
+                                            {
+                                                "command": format!(
+                                                    "wa show {}",
+                                                    event.pane_id
+                                                ),
+                                                "label": "Show pane details"
+                                            },
+                                        ],
+                                        "explain": format!(
+                                            "wa why --recent --pane {}",
+                                            event.pane_id
+                                        ),
                                         "event_id": event.id,
                                         "pane_id": event.pane_id,
                                         "detected_at": event.detected_at,
@@ -7798,6 +7837,33 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             "wa workflow status {}",
                                             wf.id
                                         ),
+                                        "actions": [
+                                            {
+                                                "command": format!(
+                                                    "wa workflow status {}",
+                                                    wf.id
+                                                ),
+                                                "label": "Check workflow status"
+                                            },
+                                            {
+                                                "command": format!(
+                                                    "wa why --recent --pane {}",
+                                                    wf.pane_id
+                                                ),
+                                                "label": "Explain decisions"
+                                            },
+                                            {
+                                                "command": format!(
+                                                    "wa show {}",
+                                                    wf.pane_id
+                                                ),
+                                                "label": "Show pane details"
+                                            },
+                                        ],
+                                        "explain": format!(
+                                            "wa why --recent --pane {}",
+                                            wf.pane_id
+                                        ),
                                         "workflow_id": wf.id,
                                         "pane_id": wf.pane_id,
                                         "started_at": wf.started_at,
@@ -7815,6 +7881,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 "Could not open storage: {e}"
                             ),
                             "action": "wa watch",
+                            "actions": [
+                                {"command": "wa watch", "label": "Start the watcher daemon"},
+                                {"command": "wa doctor", "label": "Run diagnostics"},
+                            ],
                         }));
                     }
                 }
@@ -7904,15 +7974,42 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let title = item["title"].as_str().unwrap_or("");
                     println!("  {icon} {title}");
 
-                    if verbose_flag || cli.verbose > 0 {
+                    let is_verbose = verbose_flag || cli.verbose > 0;
+
+                    if is_verbose {
                         if let Some(detail) = item["detail"].as_str() {
                             if !detail.is_empty() {
                                 println!("         {detail}");
                             }
                         }
                     }
+
+                    // Show primary action always
                     if let Some(action) = item["action"].as_str() {
                         println!("         -> {action}");
+                    }
+
+                    // In verbose mode, show additional actions and explain link
+                    if is_verbose {
+                        if let Some(actions) = item["actions"].as_array() {
+                            // Skip first action (already shown as primary)
+                            for extra in actions.iter().skip(1) {
+                                if let (Some(cmd), Some(label)) = (
+                                    extra["command"].as_str(),
+                                    extra["label"].as_str(),
+                                ) {
+                                    println!(
+                                        "            {label}: {cmd}"
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(explain) = item["explain"].as_str()
+                        {
+                            println!(
+                                "         ?? {explain}"
+                            );
+                        }
                     }
                 }
 
@@ -11867,5 +11964,178 @@ mod tests {
         assert_eq!(items[1]["severity"], "error");
         assert_eq!(items[2]["severity"], "warning");
         assert_eq!(items[3]["severity"], "warning");
+    }
+
+    // ---- Triage quick-fix / explainability tests ----
+
+    /// Helper: build a rich triage item with actions and explain fields.
+    fn triage_rich_item(
+        section: &str,
+        severity: &str,
+        title: &str,
+        actions: Vec<(&str, &str)>,
+        explain: Option<&str>,
+    ) -> serde_json::Value {
+        let actions_json: Vec<serde_json::Value> = actions
+            .into_iter()
+            .map(|(cmd, label)| {
+                serde_json::json!({"command": cmd, "label": label})
+            })
+            .collect();
+        let mut item = serde_json::json!({
+            "section": section,
+            "severity": severity,
+            "title": title,
+            "detail": "",
+            "action": actions_json.first()
+                .and_then(|a| a["command"].as_str())
+                .unwrap_or(""),
+            "actions": actions_json,
+        });
+        if let Some(exp) = explain {
+            item["explain"] = serde_json::Value::String(exp.to_string());
+        }
+        item
+    }
+
+    #[test]
+    fn triage_rich_item_has_actions_array() {
+        let item = triage_rich_item(
+            "events",
+            "warning",
+            "unhandled event",
+            vec![
+                ("wa events --pane 3 --unhandled", "List unhandled events"),
+                ("wa why --recent --pane 3", "Explain detection"),
+                ("wa show 3", "Show pane details"),
+            ],
+            Some("wa why --recent --pane 3"),
+        );
+
+        let actions = item["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0]["command"], "wa events --pane 3 --unhandled");
+        assert_eq!(actions[0]["label"], "List unhandled events");
+        assert_eq!(actions[1]["command"], "wa why --recent --pane 3");
+        assert_eq!(actions[2]["command"], "wa show 3");
+    }
+
+    #[test]
+    fn triage_rich_item_primary_action_matches_first_action() {
+        let item = triage_rich_item(
+            "crashes",
+            "warning",
+            "Recent crash",
+            vec![
+                ("wa reproduce --kind crash", "Export incident bundle"),
+                ("wa doctor", "Check system health"),
+            ],
+            None,
+        );
+
+        // Primary action field matches first entry in actions array
+        assert_eq!(item["action"], item["actions"][0]["command"]);
+    }
+
+    #[test]
+    fn triage_rich_item_explain_field() {
+        let with_explain = triage_rich_item(
+            "events",
+            "warning",
+            "event",
+            vec![("wa events", "List")],
+            Some("wa why --recent --pane 5"),
+        );
+        assert_eq!(with_explain["explain"], "wa why --recent --pane 5");
+
+        let without_explain = triage_rich_item(
+            "health",
+            "error",
+            "issue",
+            vec![("wa doctor", "Diagnose")],
+            None,
+        );
+        assert!(without_explain.get("explain").is_none());
+    }
+
+    #[test]
+    fn triage_all_section_types_map_to_suggested_commands() {
+        // Every section type should produce at least one suggested action
+        let section_actions: Vec<(&str, &str)> = vec![
+            ("health", "wa doctor"),
+            ("crashes", "wa reproduce --kind crash"),
+            ("events", "wa events --pane 1 --unhandled"),
+            ("workflows", "wa workflow status wf-1"),
+        ];
+
+        for (section, expected_cmd) in &section_actions {
+            let item = triage_rich_item(
+                section,
+                "warning",
+                "test",
+                vec![(expected_cmd, "Primary")],
+                None,
+            );
+            let actions = item["actions"].as_array().unwrap();
+            assert!(
+                !actions.is_empty(),
+                "Section '{section}' must have at least one action"
+            );
+            assert_eq!(
+                actions[0]["command"].as_str().unwrap(),
+                *expected_cmd,
+                "Section '{section}' primary action mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn triage_event_items_link_to_why_explain() {
+        // Event triage items should include wa why as an explain command
+        let item = triage_rich_item(
+            "events",
+            "error",
+            "[pane 7] pattern_match: error_detect",
+            vec![
+                ("wa events --pane 7 --unhandled", "List unhandled"),
+                ("wa why --recent --pane 7", "Explain detection"),
+                ("wa show 7", "Show pane"),
+            ],
+            Some("wa why --recent --pane 7"),
+        );
+
+        // Explain field references wa why
+        let explain = item["explain"].as_str().unwrap();
+        assert!(
+            explain.starts_with("wa why"),
+            "Event explain should use 'wa why': {explain}"
+        );
+
+        // Actions should include wa why
+        let actions = item["actions"].as_array().unwrap();
+        let has_why = actions
+            .iter()
+            .any(|a| a["command"].as_str().unwrap_or("").contains("wa why"));
+        assert!(has_why, "Event actions must include 'wa why' command");
+    }
+
+    #[test]
+    fn triage_crash_items_link_to_reproduce() {
+        let item = triage_rich_item(
+            "crashes",
+            "warning",
+            "Recent crash",
+            vec![
+                ("wa reproduce --kind crash", "Export incident bundle"),
+                ("wa doctor", "Check system health"),
+            ],
+            Some("ls /tmp/crash_dir"),
+        );
+
+        let primary = item["action"].as_str().unwrap();
+        assert!(
+            primary.contains("reproduce"),
+            "Crash primary action should reference reproduce: {primary}"
+        );
     }
 }

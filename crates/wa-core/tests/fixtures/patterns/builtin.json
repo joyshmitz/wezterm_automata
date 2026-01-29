@@ -273,6 +273,18 @@
     "negative_for": "claude_code.tool_use"
   },
   {
+    "name": "gemini_usage_warning_positive",
+    "text": "Usage limit warning: 10% of your Pro models quota remaining.",
+    "expected_rule_ids": ["gemini.usage.warning"],
+    "expected_extracted": {"remaining": "10"}
+  },
+  {
+    "name": "gemini_usage_warning_negative",
+    "text": "Usage limit warning: 10% of your free tier quota remaining.",
+    "expected_rule_ids": [],
+    "negative_for": "gemini.usage.warning"
+  },
+  {
     "name": "gemini_usage_reached_positive",
     "text": "Usage limit reached for all Pro models. Please wait before continuing.",
     "expected_rule_ids": ["gemini.usage.reached"]
@@ -290,16 +302,40 @@
     "expected_extracted": {"session_id": "abc-def-123", "tool_calls": "12"}
   },
   {
+    "name": "gemini_session_summary_tokens_positive",
+    "text": "Session Summary: Session ID: abc-def-123 Tool Calls: 12 Tokens Used: 9,876",
+    "expected_rule_ids": ["gemini.session.summary"],
+    "expected_extracted": {"session_id": "abc-def-123", "tool_calls": "12", "tokens_used": "9,876"}
+  },
+  {
     "name": "gemini_session_summary_negative",
     "text": "Interaction Summary: Session ID: abc-def-123",
     "expected_rule_ids": [],
     "negative_for": "gemini.session.summary"
   },
   {
+    "name": "gemini_session_resume_hint_positive",
+    "text": "To resume this session, run: gemini resume abcdef12-3456-7890-abcd-ef1234567890",
+    "expected_rule_ids": ["gemini.session.resume_hint"],
+    "expected_extracted": {"session_id": "abcdef12-3456-7890-abcd-ef1234567890"}
+  },
+  {
+    "name": "gemini_session_resume_hint_negative",
+    "text": "To resume, run: resume abcdef12-3456-7890-abcd-ef1234567890",
+    "expected_rule_ids": [],
+    "negative_for": "gemini.session.resume_hint"
+  },
+  {
     "name": "gemini_model_used_positive",
     "text": "Responding with gemini-1.5-pro",
     "expected_rule_ids": ["gemini.model.used"],
     "expected_extracted": {"model": "gemini-1.5-pro"}
+  },
+  {
+    "name": "gemini_model_used_alt_positive",
+    "text": "Using model: gemini-2.0-flash-exp",
+    "expected_rule_ids": ["gemini.model.used"],
+    "expected_extracted": {"model": "gemini-2.0-flash-exp"}
   },
   {
     "name": "gemini_model_used_negative",

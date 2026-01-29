@@ -1093,13 +1093,39 @@ fn builtin_gemini_pack() -> PatternPack {
         "builtin:gemini",
         "0.1.0",
         vec![
+            // Usage warning (approaching limit)
+            RuleDef {
+                id: "gemini.usage.warning".to_string(),
+                agent_type: AgentType::Gemini,
+                event_type: "usage.warning".to_string(),
+                severity: Severity::Warning,
+                anchors: vec![
+                    "Usage limit warning".to_string(),
+                    "approaching your usage limit".to_string(),
+                    "usage limit approaching".to_string(),
+                ],
+                regex: Some(
+                    r"Usage limit (?:warning|approaching)[^\n]*?(?P<remaining>\d+)%\s+of\s+your\s+Pro\s+models?\s+quota\s+remaining"
+                        .to_string(),
+                ),
+                description: "Gemini usage limit approaching".to_string(),
+                remediation: Some("Consider switching models or accounts soon".to_string()),
+                workflow: None,
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
             // Usage limit reached
             RuleDef {
                 id: "gemini.usage.reached".to_string(),
                 agent_type: AgentType::Gemini,
                 event_type: "usage.reached".to_string(),
                 severity: Severity::Critical,
-                anchors: vec!["Usage limit reached for all Pro models".to_string()],
+                anchors: vec![
+                    "Usage limit reached for all Pro models".to_string(),
+                    "Usage limit reached for Pro models".to_string(),
+                    "Usage limit reached for your Pro models".to_string(),
+                ],
                 regex: None,
                 description: "Gemini usage limit reached".to_string(),
                 remediation: Some("Wait for limit reset or switch model".to_string()),
@@ -1114,14 +1140,35 @@ fn builtin_gemini_pack() -> PatternPack {
                 agent_type: AgentType::Gemini,
                 event_type: "session.summary".to_string(),
                 severity: Severity::Info,
-                anchors: vec!["Interaction Summary".to_string()],
+                anchors: vec![
+                    "Interaction Summary".to_string(),
+                    "Session Summary".to_string(),
+                ],
                 regex: Some(
-                    r"Session ID:\s*(?P<session_id>[0-9a-fA-F-]+)[\s\S]*?Tool Calls:\s*(?P<tool_calls>\d+)"
+                    r"Session ID:\s*(?P<session_id>[0-9a-fA-F-]+)[\s\S]*?Tool Calls:\s*(?P<tool_calls>\d+)(?:[\s\S]*?Tokens Used:\s*(?P<tokens_used>[\d,]+))?(?:[\s\S]*?Input Tokens:\s*(?P<input_tokens>[\d,]+))?(?:[\s\S]*?Output Tokens:\s*(?P<output_tokens>[\d,]+))?"
                         .to_string(),
                 ),
                 description: "Gemini session summary with statistics".to_string(),
                 remediation: None,
                 workflow: Some("handle_session_end".to_string()),
+                manual_fix: None,
+                preview_command: None,
+                learn_more_url: None,
+            },
+            // Session resume hint
+            RuleDef {
+                id: "gemini.session.resume_hint".to_string(),
+                agent_type: AgentType::Gemini,
+                event_type: "session.resume_hint".to_string(),
+                severity: Severity::Info,
+                anchors: vec!["gemini resume".to_string(), "gemini --resume".to_string()],
+                regex: Some(
+                    r"gemini\s+(?:resume|--resume)\s+(?P<session_id>[0-9a-fA-F-]{8,})"
+                        .to_string(),
+                ),
+                description: "Gemini session resume hint".to_string(),
+                remediation: None,
+                workflow: None,
                 manual_fix: None,
                 preview_command: None,
                 learn_more_url: None,
@@ -1132,8 +1179,16 @@ fn builtin_gemini_pack() -> PatternPack {
                 agent_type: AgentType::Gemini,
                 event_type: "session.model".to_string(),
                 severity: Severity::Info,
-                anchors: vec!["Responding with gemini-".to_string()],
-                regex: Some(r"Responding with (?P<model>gemini-[^\s]+)".to_string()),
+                anchors: vec![
+                    "Responding with gemini-".to_string(),
+                    "Using model".to_string(),
+                    "Model:".to_string(),
+                    "Switched to model".to_string(),
+                ],
+                regex: Some(
+                    r"(?:Responding with\s+|Using model[:\s]+|Model[:\s]+|Switched to model[:\s]+)(?P<model>gemini-[^\s,]+)"
+                        .to_string(),
+                ),
                 description: "Gemini model being used".to_string(),
                 remediation: None,
                 workflow: None,
@@ -1778,12 +1833,24 @@ mod tests {
         let ids: Vec<&str> = engine.rules().iter().map(|r| r.id.as_str()).collect();
 
         assert!(
+            ids.contains(&"gemini.usage.warning"),
+            "Missing gemini.usage.warning"
+        );
+        assert!(
             ids.contains(&"gemini.usage.reached"),
             "Missing gemini.usage.reached"
         );
         assert!(
             ids.contains(&"gemini.session.summary"),
             "Missing gemini.session.summary"
+        );
+        assert!(
+            ids.contains(&"gemini.session.resume_hint"),
+            "Missing gemini.session.resume_hint"
+        );
+        assert!(
+            ids.contains(&"gemini.model.used"),
+            "Missing gemini.model.used"
         );
     }
 
@@ -2202,6 +2269,23 @@ mod tests {
     }
 
     #[test]
+    fn detect_gemini_usage_warning() {
+        let engine = PatternEngine::new();
+        let text = "Usage limit warning: 10% of your Pro models quota remaining.";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "gemini.usage.warning");
+        assert!(detection.is_some(), "Should match gemini.usage.warning");
+        let d = detection.unwrap();
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(
+            d.extracted.get("remaining").and_then(|v| v.as_str()),
+            Some("10")
+        );
+    }
+
+    #[test]
     fn detect_gemini_usage_reached() {
         let engine = PatternEngine::new();
         let text = "Usage limit reached for all Pro models. Please wait before continuing.";
@@ -2234,6 +2318,25 @@ mod tests {
     }
 
     #[test]
+    fn detect_gemini_session_resume_hint() {
+        let engine = PatternEngine::new();
+        let text = "To resume this session, run: gemini resume abcdef12-3456-7890-abcd-ef1234567890";
+        let detections = engine.detect(text);
+        let detection = detections
+            .iter()
+            .find(|d| d.rule_id == "gemini.session.resume_hint");
+        assert!(
+            detection.is_some(),
+            "Should match gemini.session.resume_hint"
+        );
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("session_id").and_then(|v| v.as_str()),
+            Some("abcdef12-3456-7890-abcd-ef1234567890")
+        );
+    }
+
+    #[test]
     fn detect_gemini_model_used() {
         let engine = PatternEngine::new();
         let text = "Responding with gemini-2.0-flash-exp model";
@@ -2244,6 +2347,20 @@ mod tests {
         assert_eq!(
             d.extracted.get("model").and_then(|v| v.as_str()),
             Some("gemini-2.0-flash-exp")
+        );
+    }
+
+    #[test]
+    fn detect_gemini_model_used_alt() {
+        let engine = PatternEngine::new();
+        let text = "Using model: gemini-1.5-pro";
+        let detections = engine.detect(text);
+        let detection = detections.iter().find(|d| d.rule_id == "gemini.model.used");
+        assert!(detection.is_some(), "Should match gemini.model.used");
+        let d = detection.unwrap();
+        assert_eq!(
+            d.extracted.get("model").and_then(|v| v.as_str()),
+            Some("gemini-1.5-pro")
         );
     }
 

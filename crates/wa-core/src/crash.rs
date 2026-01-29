@@ -809,4 +809,141 @@ mod tests {
         assert_eq!(parsed.observed_panes, health.observed_panes);
         assert_eq!(parsed.capture_queue_depth, health.capture_queue_depth);
     }
+
+    #[test]
+    fn write_crash_bundle_size_budget_skips_oversized_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+
+        // Create a report with a backtrace that exceeds MAX_BUNDLE_SIZE.
+        // The bundle writer should skip writing crash_report.json when the
+        // serialized content exceeds the privacy budget.
+        let huge_bt = "x".repeat(MAX_BUNDLE_SIZE + 1000);
+        let report = CrashReport {
+            message: "big backtrace".to_string(),
+            location: None,
+            backtrace: Some(huge_bt),
+            timestamp: 1_700_000_000,
+            pid: 1,
+            thread_name: None,
+        };
+
+        let bundle_path = write_crash_bundle(&crash_dir, &report, None).unwrap();
+
+        // Manifest should always exist regardless of budget
+        assert!(bundle_path.join("manifest.json").exists());
+
+        // The oversized crash_report.json should be skipped
+        let manifest_json = fs::read_to_string(bundle_path.join("manifest.json")).unwrap();
+        let manifest: CrashManifest = serde_json::from_str(&manifest_json).unwrap();
+
+        // Since the report exceeds budget, it should not be in the file list
+        assert!(
+            !manifest.files.contains(&"crash_report.json".to_string()),
+            "oversized report should be skipped, files: {:?}",
+            manifest.files
+        );
+    }
+
+    #[test]
+    fn write_crash_bundle_within_budget_includes_all_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let crash_dir = tmp.path().join("crash");
+
+        // Small report that fits within budget
+        let report = CrashReport {
+            message: "small panic".to_string(),
+            location: Some("test.rs:1:1".to_string()),
+            backtrace: Some("frame 0".to_string()),
+            timestamp: 1_700_000_000,
+            pid: 1,
+            thread_name: None,
+        };
+
+        let health = test_snapshot();
+        let bundle_path =
+            write_crash_bundle(&crash_dir, &report, Some(&health)).unwrap();
+
+        let manifest_json = fs::read_to_string(bundle_path.join("manifest.json")).unwrap();
+        let manifest: CrashManifest = serde_json::from_str(&manifest_json).unwrap();
+
+        assert_eq!(manifest.files.len(), 2);
+        assert!(manifest.files.contains(&"crash_report.json".to_string()));
+        assert!(manifest.files.contains(&"health_snapshot.json".to_string()));
+        assert!(manifest.has_health_snapshot);
+        assert!(manifest.bundle_size_bytes > 0);
+        assert!(manifest.bundle_size_bytes < MAX_BUNDLE_SIZE as u64);
+    }
+
+    #[test]
+    fn manifest_is_deterministic_for_same_input() {
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        let crash_dir1 = tmp1.path().join("crash");
+        let crash_dir2 = tmp2.path().join("crash");
+
+        let report = CrashReport {
+            message: "deterministic".to_string(),
+            location: Some("test.rs:1:1".to_string()),
+            backtrace: None,
+            timestamp: 1_700_000_000,
+            pid: 42,
+            thread_name: Some("main".to_string()),
+        };
+
+        let health = test_snapshot();
+
+        let path1 =
+            write_crash_bundle(&crash_dir1, &report, Some(&health)).unwrap();
+        let path2 =
+            write_crash_bundle(&crash_dir2, &report, Some(&health)).unwrap();
+
+        // Manifests should have the same structural content
+        let m1: CrashManifest = serde_json::from_str(
+            &fs::read_to_string(path1.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let m2: CrashManifest = serde_json::from_str(
+            &fs::read_to_string(path2.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(m1.wa_version, m2.wa_version);
+        assert_eq!(m1.created_at, m2.created_at);
+        assert_eq!(m1.files, m2.files);
+        assert_eq!(m1.has_health_snapshot, m2.has_health_snapshot);
+        assert_eq!(m1.bundle_size_bytes, m2.bundle_size_bytes);
+
+        // Crash reports should also be identical
+        let r1: CrashReport = serde_json::from_str(
+            &fs::read_to_string(path1.join("crash_report.json")).unwrap(),
+        )
+        .unwrap();
+        let r2: CrashReport = serde_json::from_str(
+            &fs::read_to_string(path2.join("crash_report.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(r1.message, r2.message);
+        assert_eq!(r1.location, r2.location);
+        assert_eq!(r1.timestamp, r2.timestamp);
+        assert_eq!(r1.pid, r2.pid);
+    }
+
+    #[test]
+    fn backtrace_truncation_at_max_len() {
+        // Simulate what the panic hook does with a very long backtrace
+        let long_bt = "a".repeat(MAX_BACKTRACE_LEN + 500);
+        let truncated = if long_bt.len() > MAX_BACKTRACE_LEN {
+            let mut s = long_bt[..MAX_BACKTRACE_LEN].to_string();
+            s.push_str("\n... [truncated]");
+            s
+        } else {
+            long_bt.clone()
+        };
+
+        assert!(truncated.len() < long_bt.len());
+        assert!(truncated.ends_with("\n... [truncated]"));
+        assert!(truncated.len() <= MAX_BACKTRACE_LEN + 20);
+    }
 }

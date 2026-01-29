@@ -353,9 +353,11 @@ impl DegradationManager {
         if self.states.is_empty() {
             return OverallStatus::Healthy;
         }
-        if self.states.values().any(|s| {
-            matches!(s, DegradationLevel::Unavailable { .. })
-        }) {
+        if self
+            .states
+            .values()
+            .any(|s| matches!(s, DegradationLevel::Unavailable { .. }))
+        {
             return OverallStatus::Critical;
         }
         OverallStatus::Degraded
@@ -525,10 +527,9 @@ fn affected_capabilities(s: Subsystem) -> Vec<String> {
             "event generation".into(),
             "workflow triggering".into(),
         ],
-        Subsystem::WorkflowEngine => vec![
-            "automated responses".into(),
-            "workflow execution".into(),
-        ],
+        Subsystem::WorkflowEngine => {
+            vec!["automated responses".into(), "workflow execution".into()]
+        }
         Subsystem::WeztermCli => vec![
             "pane discovery".into(),
             "content capture".into(),

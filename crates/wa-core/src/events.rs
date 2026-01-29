@@ -738,8 +738,7 @@ impl EventDeduplicator {
     /// Get the suppressed count for a key (0 if not tracked or expired).
     #[must_use]
     pub fn suppressed_count(&self, key: &str) -> u64 {
-        self.get(key)
-            .map_or(0, |e| e.count.saturating_sub(1))
+        self.get(key).map_or(0, |e| e.count.saturating_sub(1))
     }
 
     /// Number of tracked keys (including expired ones not yet evicted).
@@ -1459,8 +1458,7 @@ mod tests {
 
     #[test]
     fn dedup_expired_key_resets_as_new() {
-        let mut dedup =
-            EventDeduplicator::with_config(Duration::from_millis(10), 100);
+        let mut dedup = EventDeduplicator::with_config(Duration::from_millis(10), 100);
         dedup.check("key");
         dedup.check("key"); // suppressed_count=1
         std::thread::sleep(Duration::from_millis(20));
@@ -1482,8 +1480,7 @@ mod tests {
 
     #[test]
     fn dedup_capacity_eviction() {
-        let mut dedup =
-            EventDeduplicator::with_config(Duration::from_secs(300), 3);
+        let mut dedup = EventDeduplicator::with_config(Duration::from_secs(300), 3);
         dedup.check("a");
         dedup.check("b");
         dedup.check("c");
@@ -1565,10 +1562,7 @@ mod tests {
 
     #[test]
     fn cooldown_expired_sends_with_suppressed_count() {
-        let mut cd = NotificationCooldown::with_config(
-            Duration::from_millis(10),
-            100,
-        );
+        let mut cd = NotificationCooldown::with_config(Duration::from_millis(10), 100);
         cd.check("k"); // Send(0)
         cd.check("k"); // Suppress(1)
         cd.check("k"); // Suppress(2)
@@ -1584,10 +1578,7 @@ mod tests {
 
     #[test]
     fn cooldown_reset_after_send() {
-        let mut cd = NotificationCooldown::with_config(
-            Duration::from_millis(10),
-            100,
-        );
+        let mut cd = NotificationCooldown::with_config(Duration::from_millis(10), 100);
         cd.check("k");
         cd.check("k"); // Suppress(1)
         std::thread::sleep(Duration::from_millis(20));
@@ -1626,10 +1617,7 @@ mod tests {
 
     #[test]
     fn cooldown_capacity_eviction() {
-        let mut cd = NotificationCooldown::with_config(
-            Duration::from_secs(300),
-            3,
-        );
+        let mut cd = NotificationCooldown::with_config(Duration::from_secs(300), 3);
         cd.check("a");
         cd.check("b");
         cd.check("c");

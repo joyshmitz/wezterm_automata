@@ -197,11 +197,14 @@ impl CassError {
             )
             .command("Check status", "cass status --json")
             .alternative("Run cass diag --json for detailed diagnostics."),
-            Self::OutputTooLarge { .. } => Remediation::new(
-                "cass output was too large. Reduce limit or use --fields minimal.",
-            )
-            .command("Smaller query", "cass search \"query\" --robot --limit 5 --fields minimal")
-            .alternative("Use aggregation to reduce output size."),
+            Self::OutputTooLarge { .. } => {
+                Remediation::new("cass output was too large. Reduce limit or use --fields minimal.")
+                    .command(
+                        "Smaller query",
+                        "cass search \"query\" --robot --limit 5 --fields minimal",
+                    )
+                    .alternative("Use aggregation to reduce output size.")
+            }
             Self::InvalidJson { .. } => Remediation::new(
                 "cass returned malformed JSON. Upgrade cass or verify output format.",
             )
@@ -529,8 +532,7 @@ mod tests {
             "agent": "codex"
         });
 
-        let parsed: CassViewResult =
-            parse_json(&payload.to_string(), 4096).expect("should parse");
+        let parsed: CassViewResult = parse_json(&payload.to_string(), 4096).expect("should parse");
         assert_eq!(parsed.line_number, Some(42));
         assert!(parsed.match_line.is_some());
         let match_line = parsed.match_line.unwrap();
@@ -552,8 +554,7 @@ mod tests {
             ]
         });
 
-        let parsed: CassViewResult =
-            parse_json(&payload.to_string(), 4096).expect("should parse");
+        let parsed: CassViewResult = parse_json(&payload.to_string(), 4096).expect("should parse");
         assert_eq!(parsed.context_before.as_ref().map(|v| v.len()), Some(2));
         assert_eq!(parsed.context_after.as_ref().map(|v| v.len()), Some(1));
     }

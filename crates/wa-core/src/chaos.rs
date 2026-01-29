@@ -307,10 +307,7 @@ impl FaultInjector {
     /// Get a copy of the trigger log.
     #[must_use]
     pub fn get_log(&self) -> Vec<FaultTrigger> {
-        self.log
-            .lock()
-            .map(|log| log.clone())
-            .unwrap_or_default()
+        self.log.lock().map(|log| log.clone()).unwrap_or_default()
     }
 
     /// Drain and return the trigger log.
@@ -596,7 +593,10 @@ pub mod scenarios {
             "db_corruption",
             "Database reads fail, simulating file corruption",
         )
-        .with_fault(FaultPoint::DbRead, FaultMode::always_fail("database disk image is malformed"))
+        .with_fault(
+            FaultPoint::DbRead,
+            FaultMode::always_fail("database disk image is malformed"),
+        )
         .with_assertion(ChaosAssertion::FaultFiredAtLeast(FaultPoint::DbRead, 1))
     }
 
@@ -738,10 +738,7 @@ mod tests {
     fn clear_all() {
         let injector = FaultInjector::new();
         injector.set_fault(FaultPoint::DbWrite, FaultMode::always_fail("error"));
-        injector.set_fault(
-            FaultPoint::WeztermCliCall,
-            FaultMode::always_fail("error"),
-        );
+        injector.set_fault(FaultPoint::WeztermCliCall, FaultMode::always_fail("error"));
 
         let _ = injector.check_point(FaultPoint::DbWrite);
         assert_eq!(injector.get_log().len(), 1);
@@ -797,10 +794,7 @@ mod tests {
         }
 
         let results = injector.check_assertions(&scenario);
-        assert!(
-            results.iter().all(|r| r.passed),
-            "assertions: {results:?}"
-        );
+        assert!(results.iter().all(|r| r.passed), "assertions: {results:?}");
 
         let report = ChaosReport::from_scenario(&injector, &scenario);
         assert!(report.all_passed);
@@ -819,10 +813,7 @@ mod tests {
         }
 
         let results = injector.check_assertions(&scenario);
-        assert!(
-            results.iter().all(|r| r.passed),
-            "assertions: {results:?}"
-        );
+        assert!(results.iter().all(|r| r.passed), "assertions: {results:?}");
     }
 
     #[test]
@@ -837,10 +828,7 @@ mod tests {
         assert!(injector.check_point(FaultPoint::DbWrite).is_ok());
 
         let results = injector.check_assertions(&scenario);
-        assert!(
-            results.iter().all(|r| r.passed),
-            "assertions: {results:?}"
-        );
+        assert!(results.iter().all(|r| r.passed), "assertions: {results:?}");
     }
 
     #[test]
@@ -856,10 +844,7 @@ mod tests {
         }
 
         let results = injector.check_assertions(&scenario);
-        assert!(
-            results.iter().all(|r| r.passed),
-            "assertions: {results:?}"
-        );
+        assert!(results.iter().all(|r| r.passed), "assertions: {results:?}");
 
         let report = ChaosReport::from_scenario(&injector, &scenario);
         assert!(report.all_passed);
@@ -915,10 +900,7 @@ mod tests {
             "retention_cleanup"
         );
         assert_eq!(FaultPoint::ConfigReload.to_string(), "config_reload");
-        assert_eq!(
-            FaultPoint::WebhookDelivery.to_string(),
-            "webhook_delivery"
-        );
+        assert_eq!(FaultPoint::WebhookDelivery.to_string(), "webhook_delivery");
     }
 
     #[test]

@@ -105,9 +105,7 @@ impl BrowserProfile {
     /// Full path to this profile's directory.
     #[must_use]
     pub fn path(&self) -> PathBuf {
-        self.profiles_root
-            .join(&self.service)
-            .join(&self.account)
+        self.profiles_root.join(&self.service).join(&self.account)
     }
 
     /// Ensure the profile directory exists on disk.
@@ -543,9 +541,8 @@ mod tests {
         let profiles_root = profiles_root_from_data_dir(&root);
         let profile = BrowserProfile::new(&profiles_root, "openai", "my-account");
 
-        let expected = PathBuf::from(
-            "/home/user/.local/share/wa/browser_profiles/openai/my-account",
-        );
+        let expected =
+            PathBuf::from("/home/user/.local/share/wa/browser_profiles/openai/my-account");
         assert_eq!(profile.path(), expected);
     }
 
@@ -597,14 +594,20 @@ mod tests {
 
     #[test]
     fn sanitize_path_component_alphanumeric() {
-        assert_eq!(sanitize_path_component("hello-world_123"), "hello-world_123");
+        assert_eq!(
+            sanitize_path_component("hello-world_123"),
+            "hello-world_123"
+        );
     }
 
     #[test]
     fn sanitize_path_component_special_chars() {
         assert_eq!(sanitize_path_component("a/b\\c:d"), "a_b_c_d");
         assert_eq!(sanitize_path_component("user@host"), "user_host");
-        assert_eq!(sanitize_path_component("name with spaces"), "name_with_spaces");
+        assert_eq!(
+            sanitize_path_component("name with spaces"),
+            "name_with_spaces"
+        );
     }
 
     #[test]
@@ -624,10 +627,7 @@ mod tests {
 
     #[test]
     fn profile_ensure_dir_creates_directory() {
-        let temp = std::env::temp_dir().join(format!(
-            "wa_browser_test_{}",
-            std::process::id()
-        ));
+        let temp = std::env::temp_dir().join(format!("wa_browser_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "test-account");
@@ -643,10 +643,8 @@ mod tests {
 
     #[test]
     fn profile_ensure_dir_idempotent() {
-        let temp = std::env::temp_dir().join(format!(
-            "wa_browser_test_idempotent_{}",
-            std::process::id()
-        ));
+        let temp =
+            std::env::temp_dir().join(format!("wa_browser_test_idempotent_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "test");
@@ -661,10 +659,8 @@ mod tests {
     fn profile_dir_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = std::env::temp_dir().join(format!(
-            "wa_browser_test_perms_{}",
-            std::process::id()
-        ));
+        let temp =
+            std::env::temp_dir().join(format!("wa_browser_test_perms_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "secure");
@@ -703,10 +699,7 @@ mod tests {
     fn context_profiles_root() {
         let data_dir = PathBuf::from("/data/wa");
         let ctx = BrowserContext::new(BrowserConfig::default(), &data_dir);
-        assert_eq!(
-            ctx.profiles_root(),
-            Path::new("/data/wa/browser_profiles")
-        );
+        assert_eq!(ctx.profiles_root(), Path::new("/data/wa/browser_profiles"));
     }
 
     #[test]
@@ -809,8 +802,7 @@ mod tests {
         let json = serde_json::to_string(&automated).unwrap();
         assert_eq!(json, "\"automated\"");
 
-        let deserialized: BootstrapMethod =
-            serde_json::from_str("\"interactive\"").unwrap();
+        let deserialized: BootstrapMethod = serde_json::from_str("\"interactive\"").unwrap();
         assert_eq!(deserialized, BootstrapMethod::Interactive);
     }
 
@@ -820,10 +812,7 @@ mod tests {
 
     #[test]
     fn profile_metadata_write_and_read() {
-        let temp = std::env::temp_dir().join(format!(
-            "wa_meta_test_{}",
-            std::process::id()
-        ));
+        let temp = std::env::temp_dir().join(format!("wa_meta_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "test-account");
@@ -837,20 +826,15 @@ mod tests {
 
         let loaded = profile.read_metadata().unwrap().unwrap();
         assert_eq!(loaded.service, "openai");
-        assert_eq!(
-            loaded.bootstrap_method,
-            Some(BootstrapMethod::Interactive)
-        );
+        assert_eq!(loaded.bootstrap_method, Some(BootstrapMethod::Interactive));
 
         let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
     fn profile_metadata_read_missing() {
-        let temp = std::env::temp_dir().join(format!(
-            "wa_meta_missing_test_{}",
-            std::process::id()
-        ));
+        let temp =
+            std::env::temp_dir().join(format!("wa_meta_missing_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "nonexistent");
@@ -865,10 +849,7 @@ mod tests {
     fn profile_metadata_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = std::env::temp_dir().join(format!(
-            "wa_meta_perms_test_{}",
-            std::process::id()
-        ));
+        let temp = std::env::temp_dir().join(format!("wa_meta_perms_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "secure");
@@ -901,10 +882,7 @@ mod tests {
 
     #[test]
     fn profile_no_storage_state_initially() {
-        let temp = std::env::temp_dir().join(format!(
-            "wa_state_test_none_{}",
-            std::process::id()
-        ));
+        let temp = std::env::temp_dir().join(format!("wa_state_test_none_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "fresh");
@@ -915,10 +893,7 @@ mod tests {
 
     #[test]
     fn profile_save_and_load_storage_state() {
-        let temp = std::env::temp_dir().join(format!(
-            "wa_state_test_{}",
-            std::process::id()
-        ));
+        let temp = std::env::temp_dir().join(format!("wa_state_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "test-account");
@@ -937,10 +912,8 @@ mod tests {
 
     #[test]
     fn profile_load_storage_state_missing() {
-        let temp = std::env::temp_dir().join(format!(
-            "wa_state_missing_test_{}",
-            std::process::id()
-        ));
+        let temp =
+            std::env::temp_dir().join(format!("wa_state_missing_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "no-state");
@@ -955,10 +928,7 @@ mod tests {
     fn profile_storage_state_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = std::env::temp_dir().join(format!(
-            "wa_state_perms_test_{}",
-            std::process::id()
-        ));
+        let temp = std::env::temp_dir().join(format!("wa_state_perms_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let profile = BrowserProfile::new(&temp, "openai", "secure");

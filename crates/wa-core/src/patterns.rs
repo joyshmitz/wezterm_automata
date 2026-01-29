@@ -2320,7 +2320,8 @@ mod tests {
     #[test]
     fn detect_gemini_session_resume_hint() {
         let engine = PatternEngine::new();
-        let text = "To resume this session, run: gemini resume abcdef12-3456-7890-abcd-ef1234567890";
+        let text =
+            "To resume this session, run: gemini resume abcdef12-3456-7890-abcd-ef1234567890";
         let detections = engine.detect(text);
         let detection = detections
             .iter()

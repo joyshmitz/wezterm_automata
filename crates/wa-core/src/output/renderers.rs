@@ -1105,8 +1105,7 @@ impl HealthSnapshotRenderer {
     #[must_use]
     pub fn render(snapshot: &HealthSnapshot, ctx: &RenderContext) -> String {
         if ctx.format.is_json() {
-            return serde_json::to_string_pretty(snapshot)
-                .unwrap_or_else(|_| "{}".to_string());
+            return serde_json::to_string_pretty(snapshot).unwrap_or_else(|_| "{}".to_string());
         }
 
         let style = Style::from_format(ctx.format);
@@ -1115,14 +1114,8 @@ impl HealthSnapshotRenderer {
         output.push_str(&style.bold("Health\n"));
 
         // Queue depths
-        let capture_status = Self::queue_status_label(
-            snapshot.capture_queue_depth,
-            &style,
-        );
-        let write_status = Self::queue_status_label(
-            snapshot.write_queue_depth,
-            &style,
-        );
+        let capture_status = Self::queue_status_label(snapshot.capture_queue_depth, &style);
+        let write_status = Self::queue_status_label(snapshot.write_queue_depth, &style);
 
         output.push_str(&format!(
             "  Capture queue: {} pending{}\n",
@@ -1193,7 +1186,11 @@ impl HealthSnapshotRenderer {
             "lag 0ms".to_string()
         };
 
-        let db_label = if snapshot.db_writable { "db ok" } else { "db ERR" };
+        let db_label = if snapshot.db_writable {
+            "db ok"
+        } else {
+            "db ERR"
+        };
 
         output.push_str(&format!(
             "  Health: {} queued, {}, {}\n",
@@ -2359,9 +2356,7 @@ mod tests {
     #[test]
     fn health_snapshot_warnings_displayed() {
         let mut snapshot = sample_health_snapshot();
-        snapshot.warnings = vec![
-            "Capture queue backpressure: 800/1024 (78%)".to_string(),
-        ];
+        snapshot.warnings = vec!["Capture queue backpressure: 800/1024 (78%)".to_string()];
         let ctx = RenderContext::new(OutputFormat::Plain);
         let output = HealthSnapshotRenderer::render(&snapshot, &ctx);
 
@@ -2418,7 +2413,11 @@ mod tests {
 
         // Should have: capture queue, write queue, ingest lag, db health
         assert!(checks.len() >= 4);
-        assert!(checks.iter().all(|c| c.status == HealthDiagnosticStatus::Ok));
+        assert!(
+            checks
+                .iter()
+                .all(|c| c.status == HealthDiagnosticStatus::Ok)
+        );
     }
 
     #[test]

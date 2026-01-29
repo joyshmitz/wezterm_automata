@@ -9,8 +9,7 @@ use serde::Serialize;
 
 use crate::policy::Redactor;
 use crate::storage::{
-    AuditQuery, EventQuery, ExportQuery, Segment, StorageHandle, StoredEvent,
-    WorkflowStepLogRecord,
+    AuditQuery, EventQuery, ExportQuery, Segment, StorageHandle, StoredEvent, WorkflowStepLogRecord,
 };
 
 /// Data kinds available for export.
@@ -222,9 +221,9 @@ pub async fn export_jsonl<W: Write>(
         }
     };
 
-    writer
-        .flush()
-        .map_err(|e| crate::Error::Storage(crate::StorageError::Database(format!("Flush failed: {e}"))))?;
+    writer.flush().map_err(|e| {
+        crate::Error::Storage(crate::StorageError::Database(format!("Flush failed: {e}")))
+    })?;
 
     Ok(count)
 }
@@ -316,18 +315,45 @@ mod tests {
 
     #[test]
     fn export_kind_from_str_loose() {
-        assert_eq!(ExportKind::from_str_loose("segments"), Some(ExportKind::Segments));
-        assert_eq!(ExportKind::from_str_loose("Segment"), Some(ExportKind::Segments));
-        assert_eq!(ExportKind::from_str_loose("output"), Some(ExportKind::Segments));
+        assert_eq!(
+            ExportKind::from_str_loose("segments"),
+            Some(ExportKind::Segments)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("Segment"),
+            Some(ExportKind::Segments)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("output"),
+            Some(ExportKind::Segments)
+        );
         assert_eq!(ExportKind::from_str_loose("gaps"), Some(ExportKind::Gaps));
         assert_eq!(ExportKind::from_str_loose("Gap"), Some(ExportKind::Gaps));
-        assert_eq!(ExportKind::from_str_loose("events"), Some(ExportKind::Events));
-        assert_eq!(ExportKind::from_str_loose("detections"), Some(ExportKind::Events));
-        assert_eq!(ExportKind::from_str_loose("workflows"), Some(ExportKind::Workflows));
-        assert_eq!(ExportKind::from_str_loose("sessions"), Some(ExportKind::Sessions));
+        assert_eq!(
+            ExportKind::from_str_loose("events"),
+            Some(ExportKind::Events)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("detections"),
+            Some(ExportKind::Events)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("workflows"),
+            Some(ExportKind::Workflows)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("sessions"),
+            Some(ExportKind::Sessions)
+        );
         assert_eq!(ExportKind::from_str_loose("audit"), Some(ExportKind::Audit));
-        assert_eq!(ExportKind::from_str_loose("audit-actions"), Some(ExportKind::Audit));
-        assert_eq!(ExportKind::from_str_loose("reservations"), Some(ExportKind::Reservations));
+        assert_eq!(
+            ExportKind::from_str_loose("audit-actions"),
+            Some(ExportKind::Audit)
+        );
+        assert_eq!(
+            ExportKind::from_str_loose("reservations"),
+            Some(ExportKind::Reservations)
+        );
         assert_eq!(ExportKind::from_str_loose("unknown"), None);
     }
 
@@ -390,7 +416,9 @@ mod tests {
             event_type: "auth.error".to_string(),
             severity: "warning".to_string(),
             confidence: 0.9,
-            extracted: Some(serde_json::json!({"key": "sk-abc123def456ghi789jkl012mno345pqr678stu901v"})),
+            extracted: Some(
+                serde_json::json!({"key": "sk-abc123def456ghi789jkl012mno345pqr678stu901v"}),
+            ),
             matched_text: Some("Error: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string()),
             segment_id: None,
             detected_at: 1000,
@@ -428,10 +456,7 @@ mod tests {
     #[tokio::test]
     async fn export_segments_to_buffer() {
         // Create temp DB
-        let tmp = std::env::temp_dir().join(format!(
-            "wa_test_export_{}.db",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("wa_test_export_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
 
         let storage = StorageHandle::new(&db_path).await.unwrap();
@@ -491,10 +516,8 @@ mod tests {
 
     #[tokio::test]
     async fn export_with_redaction() {
-        let tmp = std::env::temp_dir().join(format!(
-            "wa_test_export_redact_{}.db",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("wa_test_export_redact_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
 
         let storage = StorageHandle::new(&db_path).await.unwrap();
@@ -516,7 +539,11 @@ mod tests {
         };
         storage.upsert_pane(pane).await.unwrap();
         storage
-            .append_segment(1, "secret: sk-abc123def456ghi789jkl012mno345pqr678stu901v", None)
+            .append_segment(
+                1,
+                "secret: sk-abc123def456ghi789jkl012mno345pqr678stu901v",
+                None,
+            )
             .await
             .unwrap();
 
@@ -549,10 +576,8 @@ mod tests {
 
     #[tokio::test]
     async fn export_with_pane_filter() {
-        let tmp = std::env::temp_dir().join(format!(
-            "wa_test_export_filter_{}.db",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("wa_test_export_filter_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
 
         let storage = StorageHandle::new(&db_path).await.unwrap();
@@ -607,10 +632,8 @@ mod tests {
 
     #[tokio::test]
     async fn export_pretty_format() {
-        let tmp = std::env::temp_dir().join(format!(
-            "wa_test_export_pretty_{}.db",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("wa_test_export_pretty_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
 
         let storage = StorageHandle::new(&db_path).await.unwrap();
@@ -655,10 +678,8 @@ mod tests {
 
     #[tokio::test]
     async fn export_audit_with_actor_filter() {
-        let tmp = std::env::temp_dir().join(format!(
-            "wa_test_export_audit_{}.db",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("wa_test_export_audit_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
 
         let storage = StorageHandle::new(&db_path).await.unwrap();
@@ -815,9 +836,13 @@ mod tests {
             domain: None,
             action_kind: "test".to_string(),
             policy_decision: "allow".to_string(),
-            decision_reason: Some("API key: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string()),
+            decision_reason: Some(
+                "API key: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string(),
+            ),
             rule_id: None,
-            input_summary: Some("input with sk-abc123def456ghi789jkl012mno345pqr678stu901v secret".to_string()),
+            input_summary: Some(
+                "input with sk-abc123def456ghi789jkl012mno345pqr678stu901v secret".to_string(),
+            ),
             verification_summary: None,
             decision_context: None,
             result: "ok".to_string(),

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use wa_core::error::*;
 use wa_core::error_codes::{get_error_code, list_error_codes};
-use wa_core::event_templates::{render_event, EVENT_TEMPLATE_REGISTRY};
+use wa_core::event_templates::{EVENT_TEMPLATE_REGISTRY, render_event};
 use wa_core::explanations::{
     format_explanation, get_explanation, list_template_ids, render_explanation,
 };
@@ -159,7 +159,10 @@ fn every_error_variant_has_remediation() {
         Error::Workflow(WorkflowError::PaneLocked),
         // Config variants
         Error::Config(ConfigError::FileNotFound("wa.toml".to_string())),
-        Error::Config(ConfigError::ReadFailed("wa.toml".to_string(), "io".to_string())),
+        Error::Config(ConfigError::ReadFailed(
+            "wa.toml".to_string(),
+            "io".to_string(),
+        )),
         Error::Config(ConfigError::ParseError("parse".to_string())),
         Error::Config(ConfigError::ParseFailed("parse".to_string())),
         Error::Config(ConfigError::SerializeFailed("serialize".to_string())),
@@ -194,11 +197,7 @@ fn every_error_variant_has_remediation() {
 
         // Each command must have non-empty label and command
         for cmd in &remediation.commands {
-            assert!(
-                !cmd.label.is_empty(),
-                "Empty command label for {:?}",
-                error
-            );
+            assert!(!cmd.label.is_empty(), "Empty command label for {:?}", error);
             assert!(
                 !cmd.command.is_empty(),
                 "Empty command text for {:?}",
@@ -438,7 +437,10 @@ fn suggest_closest_finds_typo() {
 
     // Too different should return None
     let result = suggest_closest("completely_different_thing", &candidates);
-    assert!(result.is_none(), "Should not suggest for very different input");
+    assert!(
+        result.is_none(),
+        "Should not suggest for very different input"
+    );
 }
 
 #[test]
@@ -537,11 +539,7 @@ fn error_renderer_maps_all_error_variants_to_catalog() {
 
     for error in &errors {
         let code = ErrorRenderer::error_code(error);
-        assert!(
-            !code.is_empty(),
-            "Empty error code for {:?}",
-            error
-        );
+        assert!(!code.is_empty(), "Empty error code for {:?}", error);
         assert!(
             get_error_code(code).is_some(),
             "Error code {code} for {:?} not found in catalog",
@@ -577,11 +575,42 @@ fn all_explanation_templates_have_valid_ids() {
 #[test]
 fn all_explanation_suggestions_start_with_verb() {
     let verbs = [
-        "Run", "Check", "Wait", "Try", "Use", "Switch", "Close", "Open",
-        "Verify", "Review", "Contact", "Remove", "Add", "Set", "Reduce",
-        "Increase", "Consider", "Ensure", "Investigate", "If", "Adjust",
-        "Look", "See", "Ask", "Allow", "Follow", "Re-", "Update", "Disable",
-        "Enable", "Restart", "Stop", "Start", "Pass", "Exit", "Let",
+        "Run",
+        "Check",
+        "Wait",
+        "Try",
+        "Use",
+        "Switch",
+        "Close",
+        "Open",
+        "Verify",
+        "Review",
+        "Contact",
+        "Remove",
+        "Add",
+        "Set",
+        "Reduce",
+        "Increase",
+        "Consider",
+        "Ensure",
+        "Investigate",
+        "If",
+        "Adjust",
+        "Look",
+        "See",
+        "Ask",
+        "Allow",
+        "Follow",
+        "Re-",
+        "Update",
+        "Disable",
+        "Enable",
+        "Restart",
+        "Stop",
+        "Start",
+        "Pass",
+        "Exit",
+        "Let",
         "Configure",
     ];
 
@@ -589,9 +618,10 @@ fn all_explanation_suggestions_start_with_verb() {
         let template = get_explanation(id).expect("template exists");
         for suggestion in template.suggestions {
             let first_word = suggestion.split_whitespace().next().unwrap_or("");
-            let starts_with_verb = verbs
-                .iter()
-                .any(|v| first_word.starts_with(v) || first_word.to_lowercase().starts_with(&v.to_lowercase()));
+            let starts_with_verb = verbs.iter().any(|v| {
+                first_word.starts_with(v)
+                    || first_word.to_lowercase().starts_with(&v.to_lowercase())
+            });
             assert!(
                 starts_with_verb,
                 "Suggestion for template '{id}' should start with verb, got: '{suggestion}'"
@@ -627,11 +657,7 @@ fn all_explanation_see_also_references_valid_targets() {
 #[test]
 fn event_template_registry_covers_builtin_types() {
     let registry = &*EVENT_TEMPLATE_REGISTRY;
-    let core_events = [
-        "usage.reached",
-        "session.start",
-        "error.network",
-    ];
+    let core_events = ["usage.reached", "session.start", "error.network"];
 
     for event_type in &core_events {
         assert!(
@@ -676,10 +702,7 @@ fn error_renderer_plain_output_structure() {
         output.contains("Error code"),
         "Must include 'Error code' footer"
     );
-    assert!(
-        output.contains("wa why WA-"),
-        "Must include 'wa why' hint"
-    );
+    assert!(output.contains("wa why WA-"), "Must include 'wa why' hint");
 }
 
 #[test]
@@ -704,14 +727,8 @@ fn error_code_format_plain_produces_stable_sections() {
     let def = get_error_code("WA-1001").expect("WA-1001 exists");
     let formatted = def.format_plain();
 
-    assert!(
-        formatted.contains("WA-1001"),
-        "Should contain error code"
-    );
-    assert!(
-        formatted.contains(def.title),
-        "Should contain title"
-    );
+    assert!(formatted.contains("WA-1001"), "Should contain error code");
+    assert!(formatted.contains(def.title), "Should contain title");
     assert!(
         formatted.contains("Common causes:") || def.causes.is_empty(),
         "Should contain causes section if causes exist"

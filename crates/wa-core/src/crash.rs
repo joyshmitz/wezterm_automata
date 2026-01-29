@@ -176,9 +176,9 @@ pub fn install_panic_hook(config: &CrashConfig) {
         };
 
         // Extract location
-        let location = info.location().map(|loc| {
-            format!("{}:{}:{}", loc.file(), loc.line(), loc.column())
-        });
+        let location = info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()));
 
         // Always print to stderr (the original hook behavior)
         if let Some(ref loc) = location {
@@ -262,8 +262,7 @@ pub fn write_crash_bundle(
             pid: report.pid,
             thread_name: report.thread_name.clone(),
         };
-        let json =
-            serde_json::to_string_pretty(&redacted_report).map_err(std::io::Error::other)?;
+        let json = serde_json::to_string_pretty(&redacted_report).map_err(std::io::Error::other)?;
         let bytes = json.as_bytes();
         total_size += bytes.len() as u64;
         if total_size <= MAX_BUNDLE_SIZE as u64 {
@@ -523,8 +522,7 @@ pub fn export_incident_bundle(
         if let Some(crash) = latest_crash_bundle(crash_dir) {
             // Copy crash report
             if let Some(ref report) = crash.report {
-                let json = serde_json::to_string_pretty(report)
-                    .map_err(std::io::Error::other)?;
+                let json = serde_json::to_string_pretty(report).map_err(std::io::Error::other)?;
                 let redacted = redactor.redact(&json);
                 let bytes = redacted.as_bytes();
                 total_size += bytes.len() as u64;
@@ -534,8 +532,7 @@ pub fn export_incident_bundle(
 
             // Copy crash manifest
             if let Some(ref manifest) = crash.manifest {
-                let json = serde_json::to_string_pretty(manifest)
-                    .map_err(std::io::Error::other)?;
+                let json = serde_json::to_string_pretty(manifest).map_err(std::io::Error::other)?;
                 let bytes = json.as_bytes();
                 total_size += bytes.len() as u64;
                 write_file_sync(&bundle_dir.join("crash_manifest.json"), bytes)?;
@@ -549,10 +546,7 @@ pub fn export_incident_bundle(
                     let redacted = redactor.redact(&contents);
                     let bytes = redacted.as_bytes();
                     total_size += bytes.len() as u64;
-                    write_file_sync(
-                        &bundle_dir.join("health_snapshot.json"),
-                        bytes,
-                    )?;
+                    write_file_sync(&bundle_dir.join("health_snapshot.json"), bytes)?;
                     files.push("health_snapshot.json".to_string());
                 }
             }
@@ -585,8 +579,7 @@ pub fn export_incident_bundle(
         exported_at: format_iso8601(ts),
     };
 
-    let manifest_json = serde_json::to_string_pretty(&result)
-        .map_err(std::io::Error::other)?;
+    let manifest_json = serde_json::to_string_pretty(&result).map_err(std::io::Error::other)?;
     write_file_sync(
         &bundle_dir.join("incident_manifest.json"),
         manifest_json.as_bytes(),
@@ -777,8 +770,7 @@ mod tests {
         };
 
         let health = test_snapshot();
-        let bundle_path =
-            write_crash_bundle(&crash_dir, &report, Some(&health)).unwrap();
+        let bundle_path = write_crash_bundle(&crash_dir, &report, Some(&health)).unwrap();
 
         assert!(bundle_path.exists());
         assert!(bundle_path.join("manifest.json").exists());
@@ -842,7 +834,8 @@ mod tests {
         let crash_dir = tmp.path().join("crash");
 
         let report = CrashReport {
-            message: "failed with key sk-ant-api03-secret123456789012345678901234567890ABCDEF".to_string(),
+            message: "failed with key sk-ant-api03-secret123456789012345678901234567890ABCDEF"
+                .to_string(),
             location: None,
             backtrace: Some("token=my_secret_token_1234567890 in frame".to_string()),
             timestamp: 1_700_000_000,
@@ -1022,11 +1015,9 @@ mod tests {
             thread_name: None,
         };
 
-        let bundle_path =
-            write_crash_bundle(&crash_dir, &report, Some(&health)).unwrap();
+        let bundle_path = write_crash_bundle(&crash_dir, &report, Some(&health)).unwrap();
 
-        let health_json =
-            fs::read_to_string(bundle_path.join("health_snapshot.json")).unwrap();
+        let health_json = fs::read_to_string(bundle_path.join("health_snapshot.json")).unwrap();
         let parsed: HealthSnapshot = serde_json::from_str(&health_json).unwrap();
 
         assert_eq!(parsed.timestamp, health.timestamp);
@@ -1085,8 +1076,7 @@ mod tests {
         };
 
         let health = test_snapshot();
-        let bundle_path =
-            write_crash_bundle(&crash_dir, &report, Some(&health)).unwrap();
+        let bundle_path = write_crash_bundle(&crash_dir, &report, Some(&health)).unwrap();
 
         let manifest_json = fs::read_to_string(bundle_path.join("manifest.json")).unwrap();
         let manifest: CrashManifest = serde_json::from_str(&manifest_json).unwrap();
@@ -1117,20 +1107,16 @@ mod tests {
 
         let health = test_snapshot();
 
-        let path1 =
-            write_crash_bundle(&crash_dir1, &report, Some(&health)).unwrap();
-        let path2 =
-            write_crash_bundle(&crash_dir2, &report, Some(&health)).unwrap();
+        let path1 = write_crash_bundle(&crash_dir1, &report, Some(&health)).unwrap();
+        let path2 = write_crash_bundle(&crash_dir2, &report, Some(&health)).unwrap();
 
         // Manifests should have the same structural content
-        let m1: CrashManifest = serde_json::from_str(
-            &fs::read_to_string(path1.join("manifest.json")).unwrap(),
-        )
-        .unwrap();
-        let m2: CrashManifest = serde_json::from_str(
-            &fs::read_to_string(path2.join("manifest.json")).unwrap(),
-        )
-        .unwrap();
+        let m1: CrashManifest =
+            serde_json::from_str(&fs::read_to_string(path1.join("manifest.json")).unwrap())
+                .unwrap();
+        let m2: CrashManifest =
+            serde_json::from_str(&fs::read_to_string(path2.join("manifest.json")).unwrap())
+                .unwrap();
 
         assert_eq!(m1.wa_version, m2.wa_version);
         assert_eq!(m1.created_at, m2.created_at);
@@ -1139,14 +1125,12 @@ mod tests {
         assert_eq!(m1.bundle_size_bytes, m2.bundle_size_bytes);
 
         // Crash reports should also be identical
-        let r1: CrashReport = serde_json::from_str(
-            &fs::read_to_string(path1.join("crash_report.json")).unwrap(),
-        )
-        .unwrap();
-        let r2: CrashReport = serde_json::from_str(
-            &fs::read_to_string(path2.join("crash_report.json")).unwrap(),
-        )
-        .unwrap();
+        let r1: CrashReport =
+            serde_json::from_str(&fs::read_to_string(path1.join("crash_report.json")).unwrap())
+                .unwrap();
+        let r2: CrashReport =
+            serde_json::from_str(&fs::read_to_string(path2.join("crash_report.json")).unwrap())
+                .unwrap();
 
         assert_eq!(r1.message, r2.message);
         assert_eq!(r1.location, r2.location);
@@ -1219,14 +1203,8 @@ mod tests {
 
         let bundles = list_crash_bundles(crash_dir, 10);
         assert_eq!(bundles.len(), 2);
-        assert_eq!(
-            bundles[0].report.as_ref().unwrap().message,
-            "second"
-        );
-        assert_eq!(
-            bundles[1].report.as_ref().unwrap().message,
-            "first"
-        );
+        assert_eq!(bundles[0].report.as_ref().unwrap().message, "second");
+        assert_eq!(bundles[1].report.as_ref().unwrap().message, "first");
     }
 
     #[test]
@@ -1344,13 +1322,15 @@ mod tests {
             export_incident_bundle(&crash_dir, None, &out_dir, IncidentKind::Manual).unwrap();
 
         assert_eq!(result.kind, IncidentKind::Manual);
-        assert!(result
-            .path
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("wa_incident_manual_"));
+        assert!(
+            result
+                .path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("wa_incident_manual_")
+        );
     }
 
     #[test]
@@ -1371,8 +1351,7 @@ mod tests {
         .unwrap();
 
         assert!(result.files.contains(&"config_summary.toml".to_string()));
-        let config_content =
-            fs::read_to_string(result.path.join("config_summary.toml")).unwrap();
+        let config_content = fs::read_to_string(result.path.join("config_summary.toml")).unwrap();
         assert!(config_content.contains("buffer_size"));
     }
 

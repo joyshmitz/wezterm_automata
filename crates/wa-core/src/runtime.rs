@@ -1322,9 +1322,18 @@ mod tests {
         #[allow(clippy::cast_precision_loss)]
         let ratio_above = depth_above as f64 / capacity as f64;
 
-        assert!(ratio_below < BACKPRESSURE_WARN_RATIO, "74% should not trigger warning");
-        assert!(ratio_at >= BACKPRESSURE_WARN_RATIO, "75% should trigger warning");
-        assert!(ratio_above >= BACKPRESSURE_WARN_RATIO, "80% should trigger warning");
+        assert!(
+            ratio_below < BACKPRESSURE_WARN_RATIO,
+            "74% should not trigger warning"
+        );
+        assert!(
+            ratio_at >= BACKPRESSURE_WARN_RATIO,
+            "75% should trigger warning"
+        );
+        assert!(
+            ratio_above >= BACKPRESSURE_WARN_RATIO,
+            "80% should trigger warning"
+        );
     }
 
     #[test]

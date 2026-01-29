@@ -866,12 +866,18 @@ mod tests {
             supervisor.capturing_panes.insert(1);
             supervisor.handle_poll_result(1, PollOutcome::Backpressure);
         }
-        assert_eq!(supervisor.tailers.get(&1).unwrap().consecutive_backpressure, 3);
+        assert_eq!(
+            supervisor.tailers.get(&1).unwrap().consecutive_backpressure,
+            3
+        );
 
         // Changed resets it
         supervisor.capturing_panes.insert(1);
         supervisor.handle_poll_result(1, PollOutcome::Changed);
-        assert_eq!(supervisor.tailers.get(&1).unwrap().consecutive_backpressure, 0);
+        assert_eq!(
+            supervisor.tailers.get(&1).unwrap().consecutive_backpressure,
+            0
+        );
     }
 
     #[test]
@@ -898,7 +904,10 @@ mod tests {
         // NoChange also resets
         supervisor.capturing_panes.insert(1);
         supervisor.handle_poll_result(1, PollOutcome::NoChange);
-        assert_eq!(supervisor.tailers.get(&1).unwrap().consecutive_backpressure, 0);
+        assert_eq!(
+            supervisor.tailers.get(&1).unwrap().consecutive_backpressure,
+            0
+        );
     }
 
     #[test]
@@ -918,7 +927,11 @@ mod tests {
 
         // Force overflow state
         supervisor.tailers.get_mut(&1).unwrap().overflow_gap_pending = true;
-        supervisor.tailers.get_mut(&1).unwrap().consecutive_backpressure = OVERFLOW_BACKPRESSURE_THRESHOLD;
+        supervisor
+            .tailers
+            .get_mut(&1)
+            .unwrap()
+            .consecutive_backpressure = OVERFLOW_BACKPRESSURE_THRESHOLD;
 
         // Emit overflow gap
         supervisor.capturing_panes.insert(1);
@@ -952,8 +965,7 @@ mod tests {
             cursor_guard.insert(1, PaneCursor::new(1));
         }
 
-        let mut supervisor =
-            TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
 
         let mut panes = HashMap::new();
         panes.insert(1, make_pane(1));
@@ -981,7 +993,9 @@ mod tests {
         }
 
         // Verify the gap event was sent
-        let event = rx.try_recv().expect("should have received overflow gap event");
+        let event = rx
+            .try_recv()
+            .expect("should have received overflow gap event");
         assert_eq!(event.segment.pane_id, 1);
         assert_eq!(event.segment.content, "");
         assert!(matches!(

@@ -1179,8 +1179,8 @@ pub struct PaneReservationConfig {
 impl Default for PaneReservationConfig {
     fn default() -> Self {
         Self {
-            default_ttl_ms: 30 * 60 * 1000,   // 30 minutes
-            max_ttl_ms: 4 * 60 * 60 * 1000,    // 4 hours
+            default_ttl_ms: 30 * 60 * 1000, // 30 minutes
+            max_ttl_ms: 4 * 60 * 60 * 1000, // 4 hours
         }
     }
 }
@@ -2635,7 +2635,9 @@ enum WriteCommand {
         respond: oneshot::Sender<Result<usize>>,
     },
     /// Checkpoint WAL (incremental, non-blocking)
-    Checkpoint { respond: oneshot::Sender<Result<CheckpointResult>> },
+    Checkpoint {
+        respond: oneshot::Sender<Result<CheckpointResult>>,
+    },
     /// Shutdown the writer thread (flush pending writes)
     Shutdown { respond: oneshot::Sender<()> },
 }
@@ -3796,8 +3798,9 @@ impl StorageHandle {
     pub async fn export_segments(&self, query: ExportQuery) -> Result<Vec<Segment>> {
         let db_path = Arc::clone(&self.db_path);
         tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open read connection: {e}")))?;
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
             query_export_segments(&conn, &query)
         })
         .await
@@ -3808,8 +3811,9 @@ impl StorageHandle {
     pub async fn export_gaps(&self, query: ExportQuery) -> Result<Vec<Gap>> {
         let db_path = Arc::clone(&self.db_path);
         tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open read connection: {e}")))?;
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
             query_export_gaps(&conn, &query)
         })
         .await
@@ -3820,8 +3824,9 @@ impl StorageHandle {
     pub async fn export_workflows(&self, query: ExportQuery) -> Result<Vec<WorkflowRecord>> {
         let db_path = Arc::clone(&self.db_path);
         tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open read connection: {e}")))?;
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
             query_export_workflows(&conn, &query)
         })
         .await
@@ -3832,8 +3837,9 @@ impl StorageHandle {
     pub async fn export_sessions(&self, query: ExportQuery) -> Result<Vec<AgentSessionRecord>> {
         let db_path = Arc::clone(&self.db_path);
         tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open read connection: {e}")))?;
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
             query_export_sessions(&conn, &query)
         })
         .await
@@ -3844,8 +3850,9 @@ impl StorageHandle {
     pub async fn export_reservations(&self, query: ExportQuery) -> Result<Vec<PaneReservation>> {
         let db_path = Arc::clone(&self.db_path);
         tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open read connection: {e}")))?;
+            let conn = Connection::open(db_path.as_str()).map_err(|e| {
+                StorageError::Database(format!("Failed to open read connection: {e}"))
+            })?;
             query_export_reservations(&conn, &query)
         })
         .await
@@ -4098,8 +4105,7 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
             status,
             respond,
         } => {
-            let result =
-                mark_event_handled_sync(conn, event_id, workflow_id.as_deref(), &status);
+            let result = mark_event_handled_sync(conn, event_id, workflow_id.as_deref(), &status);
             let _ = respond.send(result);
         }
         WriteCommand::UpsertPane { pane, respond } => {
@@ -4228,8 +4234,7 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
             last_used_at,
             respond,
         } => {
-            let result =
-                update_account_last_used_sync(conn, &service, &account_id, last_used_at);
+            let result = update_account_last_used_sync(conn, &service, &account_id, last_used_at);
             let _ = respond.send(result);
         }
         WriteCommand::DeleteAccount {
@@ -4248,8 +4253,14 @@ fn dispatch_write_command(conn: &mut Connection, cmd: WriteCommand, should_break
             ttl_ms,
             respond,
         } => {
-            let result =
-                create_reservation_sync(conn, pane_id, &owner_kind, &owner_id, reason.as_deref(), ttl_ms);
+            let result = create_reservation_sync(
+                conn,
+                pane_id,
+                &owner_kind,
+                &owner_id,
+                reason.as_deref(),
+                ttl_ms,
+            );
             let _ = respond.send(result);
         }
         WriteCommand::ReleaseReservation {
@@ -5049,10 +5060,7 @@ fn release_reservation_sync(conn: &Connection, reservation_id: i64) -> Result<bo
 /// Get the active reservation for a pane (if any).
 ///
 /// Only returns a reservation that is both status='active' and not expired.
-fn get_active_reservation_sync(
-    conn: &Connection,
-    pane_id: u64,
-) -> Result<Option<PaneReservation>> {
+fn get_active_reservation_sync(conn: &Connection, pane_id: u64) -> Result<Option<PaneReservation>> {
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
     let now = now_ms();
 
@@ -5118,7 +5126,9 @@ fn list_active_reservations_sync(conn: &Connection) -> Result<Vec<PaneReservatio
     let mut reservations = Vec::new();
     for row in rows {
         reservations.push(
-            row.map_err(|e| StorageError::Database(format!("Failed to read reservation row: {e}")))?,
+            row.map_err(|e| {
+                StorageError::Database(format!("Failed to read reservation row: {e}"))
+            })?,
         );
     }
     Ok(reservations)
@@ -5605,9 +5615,7 @@ fn check_fts_integrity_sync(conn: &Connection) -> Result<bool> {
         Ok(()) => Ok(true),
         Err(e) => {
             let msg = e.to_string();
-            if msg.contains("database disk image is malformed")
-                || msg.contains("fts5: ")
-            {
+            if msg.contains("database disk image is malformed") || msg.contains("fts5: ") {
                 Ok(false)
             } else {
                 Err(StorageError::Database(format!("FTS integrity check failed: {e}")).into())
@@ -6647,7 +6655,9 @@ fn build_export_where(
 /// Unchecked u64→i64 cast for query params (SQLite stores as i64).
 fn u64_to_i64_unchecked(val: u64) -> i64 {
     #[allow(clippy::cast_possible_wrap)]
-    { val as i64 }
+    {
+        val as i64
+    }
 }
 
 fn query_export_segments(conn: &Connection, query: &ExportQuery) -> Result<Vec<Segment>> {
@@ -6663,7 +6673,8 @@ fn query_export_segments(conn: &Connection, query: &ExportQuery) -> Result<Vec<S
 
     let mut all_params = params;
     all_params.push(Box::new(limit as i64));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        all_params.iter().map(|p| p.as_ref()).collect();
 
     let mut stmt = conn
         .prepare(&sql)
@@ -6676,18 +6687,24 @@ fn query_export_segments(conn: &Connection, query: &ExportQuery) -> Result<Vec<S
                 pane_id: {
                     let val: i64 = row.get(1)?;
                     #[allow(clippy::cast_sign_loss)]
-                    { val as u64 }
+                    {
+                        val as u64
+                    }
                 },
                 seq: {
                     let val: i64 = row.get(2)?;
                     #[allow(clippy::cast_sign_loss)]
-                    { val as u64 }
+                    {
+                        val as u64
+                    }
                 },
                 content: row.get(3)?,
                 content_len: {
                     let val: i64 = row.get(4)?;
                     #[allow(clippy::cast_sign_loss)]
-                    { val as usize }
+                    {
+                        val as usize
+                    }
                 },
                 content_hash: row.get(5)?,
                 captured_at: row.get(6)?,
@@ -6715,7 +6732,8 @@ fn query_export_gaps(conn: &Connection, query: &ExportQuery) -> Result<Vec<Gap>>
 
     let mut all_params = params;
     all_params.push(Box::new(limit as i64));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        all_params.iter().map(|p| p.as_ref()).collect();
 
     let mut stmt = conn
         .prepare(&sql)
@@ -6728,17 +6746,23 @@ fn query_export_gaps(conn: &Connection, query: &ExportQuery) -> Result<Vec<Gap>>
                 pane_id: {
                     let val: i64 = row.get(1)?;
                     #[allow(clippy::cast_sign_loss)]
-                    { val as u64 }
+                    {
+                        val as u64
+                    }
                 },
                 seq_before: {
                     let val: i64 = row.get(2)?;
                     #[allow(clippy::cast_sign_loss)]
-                    { val as u64 }
+                    {
+                        val as u64
+                    }
                 },
                 seq_after: {
                     let val: i64 = row.get(3)?;
                     #[allow(clippy::cast_sign_loss)]
-                    { val as u64 }
+                    {
+                        val as u64
+                    }
                 },
                 reason: row.get(4)?,
                 detected_at: row.get(5)?,
@@ -6767,7 +6791,8 @@ fn query_export_workflows(conn: &Connection, query: &ExportQuery) -> Result<Vec<
 
     let mut all_params = params;
     all_params.push(Box::new(limit as i64));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        all_params.iter().map(|p| p.as_ref()).collect();
 
     let mut stmt = conn
         .prepare(&sql)
@@ -6776,14 +6801,11 @@ fn query_export_workflows(conn: &Connection, query: &ExportQuery) -> Result<Vec<
     let rows = stmt
         .query_map(param_refs.as_slice(), |row| {
             let wait_condition: Option<String> = row.get(6)?;
-            let wait_condition = wait_condition
-                .and_then(|s| serde_json::from_str(&s).ok());
+            let wait_condition = wait_condition.and_then(|s| serde_json::from_str(&s).ok());
             let context: Option<String> = row.get(7)?;
-            let context = context
-                .and_then(|s| serde_json::from_str(&s).ok());
+            let context = context.and_then(|s| serde_json::from_str(&s).ok());
             let result: Option<String> = row.get(8)?;
-            let result = result
-                .and_then(|s| serde_json::from_str(&s).ok());
+            let result = result.and_then(|s| serde_json::from_str(&s).ok());
 
             Ok(WorkflowRecord {
                 id: row.get(0)?,
@@ -6791,7 +6813,9 @@ fn query_export_workflows(conn: &Connection, query: &ExportQuery) -> Result<Vec<
                 pane_id: {
                     let val: i64 = row.get(2)?;
                     #[allow(clippy::cast_sign_loss)]
-                    { val as u64 }
+                    {
+                        val as u64
+                    }
                 },
                 trigger_event_id: row.get(3)?,
                 current_step: {
@@ -6817,7 +6841,10 @@ fn query_export_workflows(conn: &Connection, query: &ExportQuery) -> Result<Vec<
     Ok(results)
 }
 
-fn query_export_sessions(conn: &Connection, query: &ExportQuery) -> Result<Vec<AgentSessionRecord>> {
+fn query_export_sessions(
+    conn: &Connection,
+    query: &ExportQuery,
+) -> Result<Vec<AgentSessionRecord>> {
     let (where_clause, params) = build_export_where(query, "started_at");
     let limit = query.limit.unwrap_or(10_000);
     let sql = format!(
@@ -6833,7 +6860,8 @@ fn query_export_sessions(conn: &Connection, query: &ExportQuery) -> Result<Vec<A
 
     let mut all_params = params;
     all_params.push(Box::new(limit as i64));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        all_params.iter().map(|p| p.as_ref()).collect();
 
     let mut stmt = conn
         .prepare(&sql)
@@ -6846,7 +6874,9 @@ fn query_export_sessions(conn: &Connection, query: &ExportQuery) -> Result<Vec<A
                 pane_id: {
                     let val: i64 = row.get(1)?;
                     #[allow(clippy::cast_sign_loss)]
-                    { val as u64 }
+                    {
+                        val as u64
+                    }
                 },
                 agent_type: row.get(2)?,
                 session_id: row.get(3)?,
@@ -6872,7 +6902,10 @@ fn query_export_sessions(conn: &Connection, query: &ExportQuery) -> Result<Vec<A
     Ok(results)
 }
 
-fn query_export_reservations(conn: &Connection, query: &ExportQuery) -> Result<Vec<PaneReservation>> {
+fn query_export_reservations(
+    conn: &Connection,
+    query: &ExportQuery,
+) -> Result<Vec<PaneReservation>> {
     let (where_clause, params) = build_export_where(query, "created_at");
     let limit = query.limit.unwrap_or(10_000);
     let sql = format!(
@@ -6886,7 +6919,8 @@ fn query_export_reservations(conn: &Connection, query: &ExportQuery) -> Result<V
 
     let mut all_params = params;
     all_params.push(Box::new(limit as i64));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        all_params.iter().map(|p| p.as_ref()).collect();
 
     let mut stmt = conn
         .prepare(&sql)
@@ -6899,7 +6933,9 @@ fn query_export_reservations(conn: &Connection, query: &ExportQuery) -> Result<V
                 pane_id: {
                     let val: i64 = row.get(1)?;
                     #[allow(clippy::cast_sign_loss)]
-                    { val as u64 }
+                    {
+                        val as u64
+                    }
                 },
                 owner_kind: row.get(2)?,
                 owner_id: row.get(3)?,
@@ -9372,11 +9408,13 @@ mod db_check_repair_tests {
             .find(|c| c.name == "Schema version")
             .unwrap();
         assert_eq!(schema_check.status, DbCheckStatus::Warning);
-        assert!(schema_check
-            .detail
-            .as_ref()
-            .unwrap()
-            .contains("needs migration"));
+        assert!(
+            schema_check
+                .detail
+                .as_ref()
+                .unwrap()
+                .contains("needs migration")
+        );
 
         cleanup_db(&path);
     }
@@ -9402,11 +9440,13 @@ mod db_check_repair_tests {
             .find(|c| c.name == "Schema version")
             .unwrap();
         assert_eq!(schema_check.status, DbCheckStatus::Error);
-        assert!(schema_check
-            .detail
-            .as_ref()
-            .unwrap()
-            .contains("newer than supported"));
+        assert!(
+            schema_check
+                .detail
+                .as_ref()
+                .unwrap()
+                .contains("newer than supported")
+        );
 
         cleanup_db(&path);
     }
@@ -9510,7 +9550,11 @@ mod db_check_repair_tests {
 
         assert!(report.all_succeeded());
         // Each item should indicate no repair was needed
-        let fts_item = report.repairs.iter().find(|r| r.name == "FTS index").unwrap();
+        let fts_item = report
+            .repairs
+            .iter()
+            .find(|r| r.name == "FTS index")
+            .unwrap();
         assert!(fts_item.detail.contains("healthy"));
 
         cleanup_db(&path);
@@ -10108,10 +10152,7 @@ mod storage_handle_tests {
         let handle = StorageHandle::new(&db_path).await.unwrap();
 
         handle.upsert_pane(test_pane(1)).await.unwrap();
-        handle
-            .append_segment(1, "vacuum test", None)
-            .await
-            .unwrap();
+        handle.append_segment(1, "vacuum test", None).await.unwrap();
 
         // Vacuum should still work alongside checkpoint
         handle.vacuum().await.unwrap();
@@ -10279,7 +10320,10 @@ mod storage_handle_tests {
         handle.upsert_pane(test_pane(2)).await.unwrap();
 
         handle.append_segment(1, "pane1-data", None).await.unwrap();
-        handle.append_segment(2, "pane2-data-longer", None).await.unwrap();
+        handle
+            .append_segment(2, "pane2-data-longer", None)
+            .await
+            .unwrap();
         handle.append_segment(2, "pane2-more", None).await.unwrap();
 
         let stats = handle.get_pane_indexing_stats().await.unwrap();
@@ -10417,17 +10461,15 @@ mod storage_handle_tests {
 
     #[test]
     fn build_report_marks_healthy_when_fts_ok() {
-        let stats = vec![
-            PaneIndexingStats {
-                pane_id: 1,
-                segment_count: 10,
-                total_bytes: 100,
-                max_seq: Some(9),
-                last_segment_at: Some(1000),
-                fts_row_count: 10,
-                fts_consistent: true,
-            },
-        ];
+        let stats = vec![PaneIndexingStats {
+            pane_id: 1,
+            segment_count: 10,
+            total_bytes: 100,
+            max_seq: Some(9),
+            last_segment_at: Some(1000),
+            fts_row_count: 10,
+            fts_consistent: true,
+        }];
         let report = build_indexing_health_report(stats, true);
         assert!(report.healthy);
         assert_eq!(report.inconsistent_panes, 0);
@@ -10515,7 +10557,10 @@ mod queue_depth_tests {
         // Queue depth should always be <= capacity
         let depth = handle.write_queue_depth();
         let cap = handle.write_queue_capacity();
-        assert!(depth <= cap, "depth ({depth}) should be <= capacity ({cap})");
+        assert!(
+            depth <= cap,
+            "depth ({depth}) should be <= capacity ({cap})"
+        );
 
         handle.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);
@@ -10552,9 +10597,8 @@ mod queue_depth_tests {
         let mut join_handles = Vec::new();
         for i in 0..6 {
             let h = handle.clone();
-            let jh = tokio::spawn(async move {
-                h.append_segment(1, &format!("data-{i}"), None).await
-            });
+            let jh =
+                tokio::spawn(async move { h.append_segment(1, &format!("data-{i}"), None).await });
             join_handles.push(jh);
         }
 
@@ -10571,7 +10615,10 @@ mod queue_depth_tests {
         // (give writer a moment to drain)
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         let final_depth = handle.write_queue_depth();
-        assert_eq!(final_depth, 0, "Queue should be drained after all writes complete");
+        assert_eq!(
+            final_depth, 0,
+            "Queue should be drained after all writes complete"
+        );
 
         handle.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);
@@ -10609,9 +10656,8 @@ mod queue_depth_tests {
         let mut join_handles = Vec::new();
         for i in 0..20 {
             let h = handle.clone();
-            let jh = tokio::spawn(async move {
-                h.append_segment(1, &format!("flood-{i}"), None).await
-            });
+            let jh =
+                tokio::spawn(async move { h.append_segment(1, &format!("flood-{i}"), None).await });
             join_handles.push(jh);
         }
 
@@ -10787,14 +10833,11 @@ mod backpressure_integration_tests {
         }
 
         // Use a timeout to detect deadlocks
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(10),
-            async {
-                for jh in handles {
-                    jh.await.unwrap();
-                }
-            },
-        )
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            for jh in handles {
+                jh.await.unwrap();
+            }
+        })
         .await;
 
         assert!(
@@ -10838,14 +10881,14 @@ mod backpressure_integration_tests {
             .unwrap();
 
         // Write a segment first (gap requires existing seq)
-        let seg_before = handle
-            .append_segment(1, "before-gap", None)
-            .await
-            .unwrap();
+        let seg_before = handle.append_segment(1, "before-gap", None).await.unwrap();
 
         // Record a gap (simulating backpressure-induced discontinuity)
         let gap = handle.record_gap(1, "backpressure_overflow").await.unwrap();
-        assert!(gap.is_some(), "GAP should be recorded after existing segment");
+        assert!(
+            gap.is_some(),
+            "GAP should be recorded after existing segment"
+        );
         let gap = gap.unwrap();
         assert_eq!(gap.pane_id, 1);
         assert_eq!(gap.reason, "backpressure_overflow");
@@ -10914,10 +10957,7 @@ mod backpressure_integration_tests {
         let result = sub.recv().await;
         match result {
             Err(crate::events::RecvError::Lagged { missed_count }) => {
-                assert!(
-                    missed_count > 0,
-                    "Should report missed events due to lag"
-                );
+                assert!(missed_count > 0, "Should report missed events due to lag");
             }
             Ok(_) => {
                 // Some events may still be in buffer, that's also valid
@@ -11567,8 +11607,8 @@ mod reservation_tests {
     #[test]
     fn create_reservation_basic() {
         let conn = setup_db();
-        let r = create_reservation_sync(&conn, 1, "workflow", "wf-1", Some("testing"), 60_000)
-            .unwrap();
+        let r =
+            create_reservation_sync(&conn, 1, "workflow", "wf-1", Some("testing"), 60_000).unwrap();
 
         assert_eq!(r.pane_id, 1);
         assert_eq!(r.owner_kind, "workflow");
@@ -11666,8 +11706,8 @@ mod reservation_tests {
     #[test]
     fn get_active_reservation_returns_some() {
         let conn = setup_db();
-        let created = create_reservation_sync(&conn, 1, "workflow", "wf-1", Some("reason"), 600_000)
-            .unwrap();
+        let created =
+            create_reservation_sync(&conn, 1, "workflow", "wf-1", Some("reason"), 600_000).unwrap();
 
         let fetched = get_active_reservation_sync(&conn, 1).unwrap();
         assert!(fetched.is_some());
@@ -11798,8 +11838,8 @@ mod reservation_tests {
         let conn = setup_db();
 
         // Create first reservation
-        let r1 = create_reservation_sync(&conn, 1, "workflow", "wf-1", Some("first"), 600_000)
-            .unwrap();
+        let r1 =
+            create_reservation_sync(&conn, 1, "workflow", "wf-1", Some("first"), 600_000).unwrap();
         assert!(get_active_reservation_sync(&conn, 1).unwrap().is_some());
 
         // Release it
@@ -11807,8 +11847,8 @@ mod reservation_tests {
         assert!(get_active_reservation_sync(&conn, 1).unwrap().is_none());
 
         // Create second reservation on same pane
-        let r2 = create_reservation_sync(&conn, 1, "agent", "agent-b", Some("second"), 300_000)
-            .unwrap();
+        let r2 =
+            create_reservation_sync(&conn, 1, "agent", "agent-b", Some("second"), 300_000).unwrap();
         let active = get_active_reservation_sync(&conn, 1).unwrap().unwrap();
         assert_eq!(active.id, r2.id);
         assert_eq!(active.owner_kind, "agent");

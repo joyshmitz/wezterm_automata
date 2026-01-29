@@ -2840,10 +2840,16 @@ mod tests {
         changed.title = Some("vim".to_string());
         let diff = reg.discovery_tick(vec![changed]);
 
-        assert!(diff.new_generations.contains(&1), "should be new generation");
+        assert!(
+            diff.new_generations.contains(&1),
+            "should be new generation"
+        );
         assert!(diff.new_panes.is_empty(), "should not be new pane");
         let uuid_after = reg.get_entry(1).unwrap().pane_uuid.clone();
-        assert_eq!(uuid_before, uuid_after, "UUID must be stable across title change");
+        assert_eq!(
+            uuid_before, uuid_after,
+            "UUID must be stable across title change"
+        );
     }
 
     #[test]
@@ -2861,7 +2867,10 @@ mod tests {
 
         assert!(diff.new_generations.contains(&1));
         let uuid_after = reg.get_entry(1).unwrap().pane_uuid.clone();
-        assert_eq!(uuid_before, uuid_after, "UUID must be stable across cwd change");
+        assert_eq!(
+            uuid_before, uuid_after,
+            "UUID must be stable across cwd change"
+        );
     }
 
     #[test]
@@ -2879,10 +2888,19 @@ mod tests {
         let diff = reg.discovery_tick(vec![moved]);
 
         // Should be changed_panes (metadata), not new_generations (same fingerprint)
-        assert!(diff.changed_panes.contains(&1), "should detect metadata change");
-        assert!(diff.new_generations.is_empty(), "same fingerprint = no new generation");
+        assert!(
+            diff.changed_panes.contains(&1),
+            "should detect metadata change"
+        );
+        assert!(
+            diff.new_generations.is_empty(),
+            "same fingerprint = no new generation"
+        );
         let uuid_after = reg.get_entry(1).unwrap().pane_uuid.clone();
-        assert_eq!(uuid_before, uuid_after, "UUID must be stable across tab/window move");
+        assert_eq!(
+            uuid_before, uuid_after,
+            "UUID must be stable across tab/window move"
+        );
     }
 
     #[test]
@@ -2941,7 +2959,11 @@ mod tests {
         for pane_id in [1, 2, 3] {
             let entry = reg.get_entry(pane_id).unwrap();
             let looked_up = reg.get_pane_id_by_uuid(&entry.pane_uuid);
-            assert_eq!(looked_up, Some(pane_id), "reverse index should map UUID back to pane_id");
+            assert_eq!(
+                looked_up,
+                Some(pane_id),
+                "reverse index should map UUID back to pane_id"
+            );
         }
 
         // UUIDs should be distinct
@@ -2981,7 +3003,9 @@ mod tests {
         reg.discovery_tick(vec![pane]);
 
         let uuid = reg.get_entry(42).unwrap().pane_uuid.clone();
-        let info = reg.get_pane_by_uuid(&uuid).expect("should find pane by UUID");
+        let info = reg
+            .get_pane_by_uuid(&uuid)
+            .expect("should find pane by UUID");
         assert_eq!(info.pane_id, 42);
         assert_eq!(info.title.as_deref(), Some("bash"));
     }
@@ -3069,9 +3093,21 @@ mod tests {
         let p3 = make_pane_info(3, 100, 11);
         reg.discovery_tick(vec![p1, p2, p3]);
 
-        assert_eq!(reg.get_entry(1).unwrap().pane_uuid, uuid1, "UUID1 stable after title change");
-        assert_eq!(reg.get_entry(2).unwrap().pane_uuid, uuid2, "UUID2 stable after tab move");
-        assert_eq!(reg.get_entry(3).unwrap().pane_uuid, uuid3, "UUID3 stable when unchanged");
+        assert_eq!(
+            reg.get_entry(1).unwrap().pane_uuid,
+            uuid1,
+            "UUID1 stable after title change"
+        );
+        assert_eq!(
+            reg.get_entry(2).unwrap().pane_uuid,
+            uuid2,
+            "UUID2 stable after tab move"
+        );
+        assert_eq!(
+            reg.get_entry(3).unwrap().pane_uuid,
+            uuid3,
+            "UUID3 stable when unchanged"
+        );
 
         // T2: Pane 2 closes, pane 4 appears
         let mut p1_v2 = make_pane_info(1, 100, 10);
@@ -3082,9 +3118,20 @@ mod tests {
 
         assert!(diff.closed_panes.contains(&2), "pane 2 should close");
         assert!(diff.new_panes.contains(&4), "pane 4 should be new");
-        assert_eq!(reg.get_entry(1).unwrap().pane_uuid, uuid1, "UUID1 still stable");
-        assert_eq!(reg.get_entry(3).unwrap().pane_uuid, uuid3, "UUID3 still stable");
-        assert!(reg.get_pane_id_by_uuid(&uuid2).is_none(), "UUID2 removed after close");
+        assert_eq!(
+            reg.get_entry(1).unwrap().pane_uuid,
+            uuid1,
+            "UUID1 still stable"
+        );
+        assert_eq!(
+            reg.get_entry(3).unwrap().pane_uuid,
+            uuid3,
+            "UUID3 still stable"
+        );
+        assert!(
+            reg.get_pane_id_by_uuid(&uuid2).is_none(),
+            "UUID2 removed after close"
+        );
         assert!(reg.get_entry(4).is_some(), "pane 4 should exist");
         let uuid4 = reg.get_entry(4).unwrap().pane_uuid.clone();
         assert_ne!(uuid4, uuid1, "new pane gets distinct UUID");

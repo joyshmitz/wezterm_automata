@@ -77,10 +77,7 @@ impl Default for BootstrapConfig {
                 "https://platform.openai.com".to_string(),
                 "https://chatgpt.com".to_string(),
             ],
-            success_text_markers: vec![
-                "Successfully logged in".to_string(),
-                "Welcome".to_string(),
-            ],
+            success_text_markers: vec!["Successfully logged in".to_string(), "Welcome".to_string()],
         }
     }
 }
@@ -215,11 +212,8 @@ impl InteractiveBootstrap {
                 }
 
                 // Update metadata
-                let mut metadata = profile
-                    .read_metadata()
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| {
+                let mut metadata =
+                    profile.read_metadata().ok().flatten().unwrap_or_else(|| {
                         ProfileMetadata::new(&profile.service, &profile.account)
                     });
                 metadata.record_bootstrap(BootstrapMethod::Interactive);
@@ -583,10 +577,8 @@ mod tests {
     fn execute_rejects_not_ready_context() {
         let bootstrap = InteractiveBootstrap::with_defaults();
         let data_dir = std::env::temp_dir().join("wa_bootstrap_test_nr");
-        let ctx = super::super::BrowserContext::new(
-            super::super::BrowserConfig::default(),
-            &data_dir,
-        );
+        let ctx =
+            super::super::BrowserContext::new(super::super::BrowserConfig::default(), &data_dir);
         let profile = ctx.profile("openai", "test-account");
 
         let result = bootstrap.execute(&ctx, &profile, None);
@@ -606,10 +598,8 @@ mod tests {
     fn script_contains_login_url() {
         let bootstrap = InteractiveBootstrap::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
-        let script = bootstrap.build_bootstrap_script(
-            &profile_dir,
-            "https://auth.openai.com/authorize",
-        );
+        let script =
+            bootstrap.build_bootstrap_script(&profile_dir, "https://auth.openai.com/authorize");
         assert!(script.contains("auth.openai.com/authorize"));
         assert!(script.contains("/tmp/profile"));
         assert!(script.contains("headless: false")); // Must be visible
@@ -619,8 +609,7 @@ mod tests {
     fn script_contains_success_markers() {
         let bootstrap = InteractiveBootstrap::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
-        let script =
-            bootstrap.build_bootstrap_script(&profile_dir, "https://example.com/login");
+        let script = bootstrap.build_bootstrap_script(&profile_dir, "https://example.com/login");
         assert!(script.contains("platform.openai.com"));
         assert!(script.contains("Successfully logged in"));
     }
@@ -629,8 +618,7 @@ mod tests {
     fn script_exports_storage_state() {
         let bootstrap = InteractiveBootstrap::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
-        let script =
-            bootstrap.build_bootstrap_script(&profile_dir, "https://example.com/login");
+        let script = bootstrap.build_bootstrap_script(&profile_dir, "https://example.com/login");
         assert!(script.contains("storageState"));
     }
 
@@ -669,8 +657,7 @@ mod tests {
     #[test]
     fn parse_error() {
         let bootstrap = InteractiveBootstrap::with_defaults();
-        let result = bootstrap
-            .parse_bootstrap_result(r#"{"status":"error","message":"crash"}"#);
+        let result = bootstrap.parse_bootstrap_result(r#"{"status":"error","message":"crash"}"#);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("crash"));
     }

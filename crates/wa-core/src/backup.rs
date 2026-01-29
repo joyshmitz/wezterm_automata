@@ -388,9 +388,7 @@ fn backup_database(src_path: &Path, dest_path: &Path) -> Result<()> {
 
     // Copy all pages in one step (no progress callback needed for now)
     backup.step(-1).map_err(|e| {
-        Error::Storage(crate::StorageError::Database(format!(
-            "Backup failed: {e}"
-        )))
+        Error::Storage(crate::StorageError::Database(format!("Backup failed: {e}")))
     })?;
 
     Ok(())
@@ -449,20 +447,18 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
             let mut rows = row_stmt.query([]).unwrap();
             while let Ok(Some(row)) = rows.next() {
                 let values: Vec<String> = (0..col_count)
-                    .map(|i| {
-                        match row.get_ref(i) {
-                            Ok(rusqlite::types::ValueRef::Null) => "NULL".to_string(),
-                            Ok(rusqlite::types::ValueRef::Integer(v)) => v.to_string(),
-                            Ok(rusqlite::types::ValueRef::Real(f)) => f.to_string(),
-                            Ok(rusqlite::types::ValueRef::Text(t)) => {
-                                let s = String::from_utf8_lossy(t);
-                                format!("'{}'", s.replace('\'', "''"))
-                            }
-                            Ok(rusqlite::types::ValueRef::Blob(b)) => {
-                                format!("X'{}'", hex::encode(b))
-                            }
-                            Err(_) => "NULL".to_string(),
+                    .map(|i| match row.get_ref(i) {
+                        Ok(rusqlite::types::ValueRef::Null) => "NULL".to_string(),
+                        Ok(rusqlite::types::ValueRef::Integer(v)) => v.to_string(),
+                        Ok(rusqlite::types::ValueRef::Real(f)) => f.to_string(),
+                        Ok(rusqlite::types::ValueRef::Text(t)) => {
+                            let s = String::from_utf8_lossy(t);
+                            format!("'{}'", s.replace('\'', "''"))
                         }
+                        Ok(rusqlite::types::ValueRef::Blob(b)) => {
+                            format!("X'{}'", hex::encode(b))
+                        }
+                        Err(_) => "NULL".to_string(),
                     })
                     .collect();
 
@@ -480,7 +476,9 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
 
     // Dump indexes
     let mut idx_stmt = conn
-        .prepare("SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name")
+        .prepare(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name",
+        )
         .map_err(|e| {
             Error::Storage(crate::StorageError::Database(format!(
                 "Failed to list indexes: {e}"
@@ -518,11 +516,9 @@ fn gather_stats(db_path: &Path) -> Result<BackupStats> {
     })?;
 
     let count = |table: &str| -> u64 {
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM \"{table}\""),
-            [],
-            |row| row.get::<_, i64>(0),
-        )
+        conn.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
+            row.get::<_, i64>(0)
+        })
         .unwrap_or(0) as u64
     };
 
@@ -577,9 +573,7 @@ fn format_timestamp_compact(epoch_secs: u64) -> String {
     // Compute date from days since epoch (1970-01-01)
     let (year, month, day) = days_to_ymd(days);
 
-    format!(
-        "{year:04}{month:02}{day:02}_{hours:02}{minutes:02}{seconds:02}"
-    )
+    format!("{year:04}{month:02}{day:02}_{hours:02}{minutes:02}{seconds:02}")
 }
 
 /// Format epoch seconds as ISO-8601 string.
@@ -593,9 +587,7 @@ fn format_iso8601(epoch_secs: u64) -> String {
 
     let (year, month, day) = days_to_ymd(days);
 
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
 /// Convert days since epoch to (year, month, day).
@@ -830,7 +822,10 @@ mod tests {
         let result = import_backup(&backup_dir, &target_db, tmp.path(), &import_opts).unwrap();
 
         assert!(result.dry_run);
-        assert!(!target_db.exists(), "Dry-run should not create target database");
+        assert!(
+            !target_db.exists(),
+            "Dry-run should not create target database"
+        );
     }
 
     #[test]

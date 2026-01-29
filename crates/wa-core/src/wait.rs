@@ -683,10 +683,16 @@ mod tests {
             elapsed: Duration::from_millis(3200),
         };
         let msg = err.to_string();
-        assert!(msg.contains("database ready"), "should mention expected condition");
+        assert!(
+            msg.contains("database ready"),
+            "should mention expected condition"
+        );
         assert!(msg.contains("3200"), "should mention elapsed ms");
         assert!(msg.contains("retries=5"), "should mention retry count");
-        assert!(msg.contains("connecting"), "should mention last observed state");
+        assert!(
+            msg.contains("connecting"),
+            "should mention last observed state"
+        );
     }
 
     #[test]
@@ -698,7 +704,10 @@ mod tests {
             elapsed: Duration::from_millis(100),
         };
         let msg = err.to_string();
-        assert!(msg.contains("<none>"), "should show <none> for missing observation");
+        assert!(
+            msg.contains("<none>"),
+            "should show <none> for missing observation"
+        );
     }
 
     #[tokio::test]
@@ -751,9 +760,7 @@ mod tests {
 
         let condition = WaitCondition::new("never ready", move || {
             let n = counter2.fetch_add(1, Ordering::SeqCst);
-            async move {
-                WaitFor::<()>::not_ready(Some(format!("attempt={n}")))
-            }
+            async move { WaitFor::<()>::not_ready(Some(format!("attempt={n}"))) }
         });
 
         let backoff = Backoff {
@@ -789,12 +796,8 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_condition_times_out() {
-        let result = wait_for_condition(
-            "impossible",
-            || async { false },
-            Duration::from_millis(10),
-        )
-        .await;
+        let result =
+            wait_for_condition("impossible", || async { false }, Duration::from_millis(10)).await;
         let err = result.expect_err("should timeout");
         assert!(err.expected.contains("impossible"));
         assert!(err.retries >= 1);
@@ -825,7 +828,10 @@ mod tests {
         assert!(err.expected.contains("quiescence"));
         assert!(err.last_observed.is_some());
         let obs = err.last_observed.unwrap();
-        assert!(obs.contains("pending=5"), "should report pending count: {obs}");
+        assert!(
+            obs.contains("pending=5"),
+            "should report pending count: {obs}"
+        );
     }
 
     #[test]
@@ -937,7 +943,10 @@ mod tests {
         };
 
         let result = wait_for(condition, Duration::from_secs(2), backoff).await;
-        assert!(result.is_ok(), "should achieve quiescence after consumer drains");
+        assert!(
+            result.is_ok(),
+            "should achieve quiescence after consumer drains"
+        );
 
         consumer.await.unwrap();
         assert_eq!(pending.load(Ordering::SeqCst), 0);
@@ -1023,7 +1032,10 @@ mod tests {
 
         assert!(result.is_ok(), "counter should reach >= 7 within timeout");
         let final_val = counter.load(Ordering::SeqCst);
-        assert!(final_val >= 7, "final counter value {final_val} should be >= 7");
+        assert!(
+            final_val >= 7,
+            "final counter value {final_val} should be >= 7"
+        );
         incrementer.await.unwrap();
     }
 
@@ -1106,8 +1118,7 @@ mod tests {
     fn detector_not_quiet_with_pending_work() {
         let g = Arc::new(QueueDepthGauge::new("ingest"));
         g.increment();
-        let d = QuiescenceDetector::new(Duration::from_millis(0))
-            .with_gauge(g);
+        let d = QuiescenceDetector::new(Duration::from_millis(0)).with_gauge(g);
         assert!(!d.is_quiet(Instant::now()));
         assert_eq!(d.total_pending(), 1);
     }
@@ -1116,8 +1127,7 @@ mod tests {
     fn detector_not_quiet_within_window() {
         let activity = Arc::new(ActivityTracker::new());
         activity.record();
-        let d = QuiescenceDetector::new(Duration::from_secs(60))
-            .with_activity(activity);
+        let d = QuiescenceDetector::new(Duration::from_secs(60)).with_activity(activity);
         // Recent activity + 60s window → not quiet
         assert!(!d.is_quiet(Instant::now()));
     }
@@ -1126,8 +1136,7 @@ mod tests {
     fn detector_quiet_after_window_elapses() {
         let activity = Arc::new(ActivityTracker::new());
         // Set activity in the past by not recording anything — idle = quiet
-        let d = QuiescenceDetector::new(Duration::from_millis(0))
-            .with_activity(activity);
+        let d = QuiescenceDetector::new(Duration::from_millis(0)).with_activity(activity);
         assert!(d.is_quiet(Instant::now()));
     }
 
@@ -1150,8 +1159,7 @@ mod tests {
         let g = Arc::new(QueueDepthGauge::new("ingest_q"));
         g.increment();
         g.increment();
-        let d = QuiescenceDetector::new(Duration::from_millis(100))
-            .with_gauge(g);
+        let d = QuiescenceDetector::new(Duration::from_millis(100)).with_gauge(g);
         let snap = d.snapshot();
         assert_eq!(snap.total_pending, 2);
         assert_eq!(snap.gauges.len(), 1);
@@ -1185,8 +1193,12 @@ mod tests {
         let activity = Arc::new(ActivityTracker::new());
 
         // Enqueue work
-        for _ in 0..5 { capture_gauge.increment(); }
-        for _ in 0..3 { writer_gauge.increment(); }
+        for _ in 0..5 {
+            capture_gauge.increment();
+        }
+        for _ in 0..3 {
+            writer_gauge.increment();
+        }
         activity.record();
 
         let detector = QuiescenceDetector::new(Duration::from_millis(10))
@@ -1225,14 +1237,14 @@ mod tests {
             max_retries: None,
         };
 
-        let result = wait_for_quiescence_with_backoff(
-            detector.clone(),
-            Duration::from_secs(2),
-            backoff,
-        )
-        .await;
+        let result =
+            wait_for_quiescence_with_backoff(detector.clone(), Duration::from_secs(2), backoff)
+                .await;
 
-        assert!(result.is_ok(), "detector should report quiescence after both queues drain");
+        assert!(
+            result.is_ok(),
+            "detector should report quiescence after both queues drain"
+        );
         assert_eq!(detector.total_pending(), 0);
 
         consumer1.await.unwrap();

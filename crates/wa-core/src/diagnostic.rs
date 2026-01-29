@@ -18,9 +18,7 @@ use serde::Serialize;
 
 use crate::config::{Config, WorkspaceLayout};
 use crate::policy::Redactor;
-use crate::storage::{
-    AuditQuery, EventQuery, ExportQuery, StorageHandle, SCHEMA_VERSION,
-};
+use crate::storage::{AuditQuery, EventQuery, ExportQuery, SCHEMA_VERSION, StorageHandle};
 
 // =============================================================================
 // Public types
@@ -170,11 +168,9 @@ fn gather_db_health(db_path: &Path) -> crate::Result<DbHealthStats> {
     };
 
     let count = |table: &str| -> i64 {
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM \"{table}\""),
-            [],
-            |row| row.get(0),
-        )
+        conn.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
+            row.get(0)
+        })
         .unwrap_or(-1)
     };
 
@@ -266,10 +262,7 @@ struct RedactedStep {
     completed_at: i64,
 }
 
-fn redact_step(
-    step: crate::storage::WorkflowStepLogRecord,
-    redactor: &Redactor,
-) -> RedactedStep {
+fn redact_step(step: crate::storage::WorkflowStepLogRecord, redactor: &Redactor) -> RedactedStep {
     RedactedStep {
         step_index: step.step_index,
         step_name: step.step_name,
@@ -331,10 +324,7 @@ struct RedactedAudit {
     decision_reason: Option<String>,
 }
 
-fn redact_audit(
-    action: crate::storage::AuditActionRecord,
-    redactor: &Redactor,
-) -> RedactedAudit {
+fn redact_audit(action: crate::storage::AuditActionRecord, redactor: &Redactor) -> RedactedAudit {
     RedactedAudit {
         id: action.id,
         ts: action.ts,
@@ -607,13 +597,12 @@ fn write_json_file<T: Serialize>(dir: &Path, name: &str, value: &T) -> crate::Re
 }
 
 fn dir_size(path: &Path) -> u64 {
-    fs::read_dir(path)
-        .map_or(0, |entries| {
-            entries
-                .filter_map(Result::ok)
-                .map(|e| e.metadata().map_or(0, |m| m.len()))
-                .sum()
-        })
+    fs::read_dir(path).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .map(|e| e.metadata().map_or(0, |m| m.len()))
+            .sum()
+    })
 }
 
 // =============================================================================
@@ -644,10 +633,8 @@ mod tests {
 
     #[test]
     fn db_health_gathers_stats() {
-        let tmp = std::env::temp_dir().join(format!(
-            "wa_test_diag_health_{}.db",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("wa_test_diag_health_{}.db", std::process::id()));
 
         // Create a minimal DB
         {
@@ -695,9 +682,7 @@ mod tests {
             severity: "warning".to_string(),
             confidence: 0.9,
             extracted: None,
-            matched_text: Some(
-                "Error: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string(),
-            ),
+            matched_text: Some("Error: sk-abc123def456ghi789jkl012mno345pqr678stu901v".to_string()),
             segment_id: None,
             detected_at: 1000,
             handled_at: None,
@@ -742,9 +727,8 @@ mod tests {
 
     #[test]
     fn write_json_file_creates_valid_json() {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "wa_test_diag_write_{}", std::process::id()
-        ));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("wa_test_diag_write_{}", std::process::id()));
         fs::create_dir_all(&tmp_dir).unwrap();
 
         let data = serde_json::json!({"key": "value", "count": 42});
@@ -760,10 +744,8 @@ mod tests {
 
     #[tokio::test]
     async fn generate_bundle_creates_all_files() {
-        let tmp = std::env::temp_dir().join(format!(
-            "wa_test_diag_bundle_{}.db",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("wa_test_diag_bundle_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
 
         let storage = StorageHandle::new(&db_path).await.unwrap();
@@ -785,7 +767,10 @@ mod tests {
             last_decision_at: None,
         };
         storage.upsert_pane(pane).await.unwrap();
-        storage.append_segment(1, "test output", None).await.unwrap();
+        storage
+            .append_segment(1, "test output", None)
+            .await
+            .unwrap();
 
         let config = Config::default();
         let layout = WorkspaceLayout::new(
@@ -793,9 +778,8 @@ mod tests {
             &config.storage,
         );
 
-        let output_dir = std::env::temp_dir().join(format!(
-            "wa_test_diag_output_{}", std::process::id()
-        ));
+        let output_dir =
+            std::env::temp_dir().join(format!("wa_test_diag_output_{}", std::process::id()));
         let opts = DiagnosticOptions {
             output: Some(output_dir.clone()),
             ..Default::default()
@@ -848,10 +832,8 @@ mod tests {
 
     #[tokio::test]
     async fn bundle_does_not_contain_secrets() {
-        let tmp = std::env::temp_dir().join(format!(
-            "wa_test_diag_secrets_{}.db",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("wa_test_diag_secrets_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
 
         let storage = StorageHandle::new(&db_path).await.unwrap();
@@ -902,7 +884,8 @@ mod tests {
         );
 
         let output_dir = std::env::temp_dir().join(format!(
-            "wa_test_diag_secrets_output_{}", std::process::id()
+            "wa_test_diag_secrets_output_{}",
+            std::process::id()
         ));
         let opts = DiagnosticOptions {
             output: Some(output_dir.clone()),
@@ -937,10 +920,7 @@ mod tests {
 
     #[tokio::test]
     async fn bundle_manifest_has_stable_metadata() {
-        let tmp = std::env::temp_dir().join(format!(
-            "wa_test_diag_meta_{}.db",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("wa_test_diag_meta_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
         let storage = StorageHandle::new(&db_path).await.unwrap();
 
@@ -950,9 +930,8 @@ mod tests {
             &config.storage,
         );
 
-        let output_dir = std::env::temp_dir().join(format!(
-            "wa_test_diag_meta_output_{}", std::process::id()
-        ));
+        let output_dir =
+            std::env::temp_dir().join(format!("wa_test_diag_meta_output_{}", std::process::id()));
         let opts = DiagnosticOptions {
             output: Some(output_dir.clone()),
             ..Default::default()
@@ -986,8 +965,7 @@ mod tests {
         assert!(env["arch"].is_string());
 
         // Verify config_summary.json has stable fields
-        let config_content =
-            fs::read_to_string(output_dir.join("config_summary.json")).unwrap();
+        let config_content = fs::read_to_string(output_dir.join("config_summary.json")).unwrap();
         let config_json: serde_json::Value = serde_json::from_str(&config_content).unwrap();
         assert!(config_json["general_log_level"].is_string());
         assert!(config_json["ingest_poll_interval_ms"].is_number());
@@ -1001,10 +979,7 @@ mod tests {
 
     #[tokio::test]
     async fn bundle_includes_reservation_snapshot() {
-        let tmp = std::env::temp_dir().join(format!(
-            "wa_test_diag_res_{}.db",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("wa_test_diag_res_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
         let storage = StorageHandle::new(&db_path).await.unwrap();
 
@@ -1045,9 +1020,8 @@ mod tests {
             &config.storage,
         );
 
-        let output_dir = std::env::temp_dir().join(format!(
-            "wa_test_diag_res_output_{}", std::process::id()
-        ));
+        let output_dir =
+            std::env::temp_dir().join(format!("wa_test_diag_res_output_{}", std::process::id()));
         let opts = DiagnosticOptions {
             output: Some(output_dir.clone()),
             ..Default::default()
@@ -1058,11 +1032,13 @@ mod tests {
             .unwrap();
 
         // Verify active_reservations.json contains the reservation
-        let res_content =
-            fs::read_to_string(output_dir.join("active_reservations.json")).unwrap();
+        let res_content = fs::read_to_string(output_dir.join("active_reservations.json")).unwrap();
         let reservations: serde_json::Value = serde_json::from_str(&res_content).unwrap();
         let arr = reservations.as_array().unwrap();
-        assert!(!arr.is_empty(), "Active reservations should contain at least one entry");
+        assert!(
+            !arr.is_empty(),
+            "Active reservations should contain at least one entry"
+        );
 
         // Verify reservation fields are present
         let first = &arr[0];
@@ -1073,8 +1049,7 @@ mod tests {
         assert!(first["expires_at"].is_number());
 
         // Verify reservation_history.json also has the reservation
-        let hist_content =
-            fs::read_to_string(output_dir.join("reservation_history.json")).unwrap();
+        let hist_content = fs::read_to_string(output_dir.join("reservation_history.json")).unwrap();
         let history: serde_json::Value = serde_json::from_str(&hist_content).unwrap();
         let hist_arr = history.as_array().unwrap();
         assert!(!hist_arr.is_empty());
@@ -1087,10 +1062,8 @@ mod tests {
 
     #[tokio::test]
     async fn bundle_output_dir_reuse_generates_fresh_bundle() {
-        let tmp = std::env::temp_dir().join(format!(
-            "wa_test_diag_reuse_{}.db",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("wa_test_diag_reuse_{}.db", std::process::id()));
         let db_path = tmp.to_string_lossy().to_string();
         let storage = StorageHandle::new(&db_path).await.unwrap();
 
@@ -1100,9 +1073,8 @@ mod tests {
             &config.storage,
         );
 
-        let output_dir = std::env::temp_dir().join(format!(
-            "wa_test_diag_reuse_output_{}", std::process::id()
-        ));
+        let output_dir =
+            std::env::temp_dir().join(format!("wa_test_diag_reuse_output_{}", std::process::id()));
 
         // Generate first bundle
         let opts = DiagnosticOptions {

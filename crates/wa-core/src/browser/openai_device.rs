@@ -232,8 +232,9 @@ impl Default for DevicePageSelectors {
             email_input: "input[name='email'], input[type='email']".to_string(),
             email_submit: "button[type='submit']".to_string(),
             password_prompt: "input[type='password']".to_string(),
-            success_marker: "text=Successfully logged in, text=Device connected, text=You're all set"
-                .to_string(),
+            success_marker:
+                "text=Successfully logged in, text=Device connected, text=You're all set"
+                    .to_string(),
         }
     }
 }
@@ -272,10 +273,7 @@ impl ArtifactCapture {
     /// Create the artifacts directory for a specific flow invocation.
     ///
     /// Returns the path to the per-invocation directory.
-    pub fn ensure_invocation_dir(
-        &self,
-        flow_name: &str,
-    ) -> Result<PathBuf, std::io::Error> {
+    pub fn ensure_invocation_dir(&self, flow_name: &str) -> Result<PathBuf, std::io::Error> {
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let pid = std::process::id();
         let dir = self
@@ -459,8 +457,11 @@ impl OpenAiDeviceAuthFlow {
                         self.config.device_url,
                         profile_dir.display(),
                     );
-                    let _ =
-                        ArtifactCapture::write_artifact(dir, ArtifactKind::FailureReport, report.as_bytes());
+                    let _ = ArtifactCapture::write_artifact(
+                        dir,
+                        ArtifactKind::FailureReport,
+                        report.as_bytes(),
+                    );
                 }
                 AuthFlowResult::Failed {
                     error: e.error,
@@ -473,8 +474,9 @@ impl OpenAiDeviceAuthFlow {
 
     /// Prepare the artifacts directory for this invocation, if configured.
     fn prepare_artifacts_dir(&self) -> Option<PathBuf> {
-        self.artifacts.as_ref().and_then(|a| {
-            match a.ensure_invocation_dir("openai_device") {
+        self.artifacts
+            .as_ref()
+            .and_then(|a| match a.ensure_invocation_dir("openai_device") {
                 Ok(dir) => Some(dir),
                 Err(e) => {
                     tracing::warn!(
@@ -483,8 +485,7 @@ impl OpenAiDeviceAuthFlow {
                     );
                     None
                 }
-            }
-        })
+            })
     }
 
     /// Run the Playwright subprocess that performs the actual browser automation.
@@ -794,16 +795,10 @@ const {{ chromium }} = require('playwright');
         }
 
         // Fallback: use stderr
-        let stderr_summary = stderr
-            .lines()
-            .take(5)
-            .collect::<Vec<_>>()
-            .join("; ");
+        let stderr_summary = stderr.lines().take(5).collect::<Vec<_>>().join("; ");
 
         PlaywrightFlowError {
-            error: format!(
-                "Playwright process exited with {status}: {stderr_summary}"
-            ),
+            error: format!("Playwright process exited with {status}: {stderr_summary}"),
             kind: AuthFlowFailureKind::PlaywrightError,
         }
     }
@@ -1070,8 +1065,7 @@ mod tests {
 
     #[test]
     fn flow_with_artifacts() {
-        let flow = OpenAiDeviceAuthFlow::with_defaults()
-            .with_artifacts("/tmp/artifacts");
+        let flow = OpenAiDeviceAuthFlow::with_defaults().with_artifacts("/tmp/artifacts");
         assert!(flow.artifacts.is_some());
     }
 
@@ -1095,10 +1089,8 @@ mod tests {
     fn execute_rejects_invalid_code() {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
         let data_dir = std::env::temp_dir().join("wa_test_auth_flow");
-        let mut ctx = super::super::BrowserContext::new(
-            super::super::BrowserConfig::default(),
-            &data_dir,
-        );
+        let mut ctx =
+            super::super::BrowserContext::new(super::super::BrowserConfig::default(), &data_dir);
         // Force status to Ready for testing
         ctx.status = BrowserStatus::Ready;
 
@@ -1115,10 +1107,8 @@ mod tests {
     fn execute_rejects_not_ready_context() {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
         let data_dir = std::env::temp_dir().join("wa_test_auth_flow_nr");
-        let ctx = super::super::BrowserContext::new(
-            super::super::BrowserConfig::default(),
-            &data_dir,
-        );
+        let ctx =
+            super::super::BrowserContext::new(super::super::BrowserConfig::default(), &data_dir);
         // ctx is NotInitialized by default
 
         let result = flow.execute(&ctx, "ABCD-EFGH", "test-account", None);
@@ -1205,10 +1195,7 @@ mod tests {
 
     #[test]
     fn artifact_capture_creates_dir() {
-        let temp = std::env::temp_dir().join(format!(
-            "wa_artifact_test_{}",
-            std::process::id()
-        ));
+        let temp = std::env::temp_dir().join(format!("wa_artifact_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
 
         let capture = ArtifactCapture::new(&temp);
@@ -1221,17 +1208,14 @@ mod tests {
 
     #[test]
     fn artifact_write_and_read() {
-        let temp = std::env::temp_dir().join(format!(
-            "wa_artifact_write_test_{}",
-            std::process::id()
-        ));
+        let temp =
+            std::env::temp_dir().join(format!("wa_artifact_write_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let content = b"Test failure report";
         let path =
-            ArtifactCapture::write_artifact(&temp, ArtifactKind::FailureReport, content)
-                .unwrap();
+            ArtifactCapture::write_artifact(&temp, ArtifactKind::FailureReport, content).unwrap();
         assert_eq!(path.file_name().unwrap(), "failure_report.txt");
         assert_eq!(std::fs::read(&path).unwrap(), content);
 
@@ -1249,8 +1233,7 @@ mod tests {
 
         let content = b"\x89PNG fake screenshot data";
         let path =
-            ArtifactCapture::write_artifact(&temp, ArtifactKind::Screenshot, content)
-                .unwrap();
+            ArtifactCapture::write_artifact(&temp, ArtifactKind::Screenshot, content).unwrap();
         assert_eq!(path.file_name().unwrap(), "screenshot.png");
 
         let _ = std::fs::remove_dir_all(&temp);
@@ -1258,17 +1241,14 @@ mod tests {
 
     #[test]
     fn artifact_write_redacted_dom() {
-        let temp = std::env::temp_dir().join(format!(
-            "wa_artifact_dom_test_{}",
-            std::process::id()
-        ));
+        let temp =
+            std::env::temp_dir().join(format!("wa_artifact_dom_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
 
         let content = b"<html><body>[REDACTED]</body></html>";
         let path =
-            ArtifactCapture::write_artifact(&temp, ArtifactKind::RedactedDom, content)
-                .unwrap();
+            ArtifactCapture::write_artifact(&temp, ArtifactKind::RedactedDom, content).unwrap();
         assert_eq!(path.file_name().unwrap(), "redacted_dom.html");
 
         let _ = std::fs::remove_dir_all(&temp);
@@ -1328,8 +1308,7 @@ mod tests {
     fn script_contains_device_url() {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
-        let script =
-            flow.build_playwright_script(&profile_dir, "ABCD-EFGH", None, None);
+        let script = flow.build_playwright_script(&profile_dir, "ABCD-EFGH", None, None);
         assert!(script.contains("auth.openai.com/codex/device"));
         assert!(script.contains("ABCD-EFGH"));
         assert!(script.contains("/tmp/profile"));
@@ -1339,12 +1318,8 @@ mod tests {
     fn script_with_email() {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
-        let script = flow.build_playwright_script(
-            &profile_dir,
-            "ABCD-EFGH",
-            Some("user@example.com"),
-            None,
-        );
+        let script =
+            flow.build_playwright_script(&profile_dir, "ABCD-EFGH", Some("user@example.com"), None);
         assert!(script.contains("user@example.com"));
     }
 
@@ -1353,12 +1328,8 @@ mod tests {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
         let artifacts_dir = PathBuf::from("/tmp/artifacts");
-        let script = flow.build_playwright_script(
-            &profile_dir,
-            "ABCD-EFGH",
-            None,
-            Some(&artifacts_dir),
-        );
+        let script =
+            flow.build_playwright_script(&profile_dir, "ABCD-EFGH", None, Some(&artifacts_dir));
         assert!(script.contains("/tmp/artifacts"));
     }
 
@@ -1367,12 +1338,7 @@ mod tests {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
         // This shouldn't normally happen but tests defensive coding
-        let script = flow.build_playwright_script(
-            &profile_dir,
-            "AB'D-EF'H",
-            None,
-            None,
-        );
+        let script = flow.build_playwright_script(&profile_dir, "AB'D-EF'H", None, None);
         // Single quotes should be escaped
         assert!(script.contains("\\'"));
     }
@@ -1381,8 +1347,7 @@ mod tests {
     fn script_null_email_when_none() {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
-        let script =
-            flow.build_playwright_script(&profile_dir, "ABCD-EFGH", None, None);
+        let script = flow.build_playwright_script(&profile_dir, "ABCD-EFGH", None, None);
         assert!(script.contains("const email = null"));
     }
 
@@ -1390,8 +1355,7 @@ mod tests {
     fn script_null_artifacts_when_none() {
         let flow = OpenAiDeviceAuthFlow::with_defaults();
         let profile_dir = PathBuf::from("/tmp/profile");
-        let script =
-            flow.build_playwright_script(&profile_dir, "ABCD-EFGH", None, None);
+        let script = flow.build_playwright_script(&profile_dir, "ABCD-EFGH", None, None);
         assert!(script.contains("const artifactsDir = null"));
     }
 }

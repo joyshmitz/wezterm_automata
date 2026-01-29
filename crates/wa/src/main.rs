@@ -3715,7 +3715,8 @@ async fn run_watcher(
         // Register built-in workflows
         workflow_runner.register_workflow(Arc::new(HandleCompaction::default()));
         workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleUsageLimits::new()));
-        tracing::info!("Registered workflows: handle_compaction, handle_usage_limits");
+        workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleSessionEnd::new()));
+        tracing::info!("Registered workflows: handle_compaction, handle_usage_limits, handle_session_end");
 
         // Spawn workflow runner event loop
         let event_bus_clone = Arc::clone(&event_bus);

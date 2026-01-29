@@ -5422,6 +5422,229 @@ impl Workflow for HandleUsageLimits {
     }
 }
 
+// ============================================================================
+// HandleSessionEnd — persist structured session summaries (wa-nu4.2.2.3)
+// ============================================================================
+
+/// Persist structured session summaries when agents emit session.summary or session.end events.
+///
+/// Supported agents: Codex, Claude Code, Gemini.
+/// Extracts available fields (session_id, tokens, cost, end_reason) from the
+/// detection trigger and upserts an [`AgentSessionRecord`].
+pub struct HandleSessionEnd;
+
+impl HandleSessionEnd {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Build an [`AgentSessionRecord`] from a detection trigger's extracted fields.
+    fn record_from_detection(
+        pane_id: u64,
+        detection: &serde_json::Value,
+    ) -> crate::storage::AgentSessionRecord {
+        let agent_type_str = detection
+            .get("agent_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        let extracted = detection.get("extracted");
+
+        let mut record = crate::storage::AgentSessionRecord::new_start(pane_id, agent_type_str);
+        let now = now_ms();
+        record.ended_at = Some(now);
+
+        // Determine end_reason from event_type
+        let event_type = detection
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        record.end_reason = Some(match event_type {
+            "session.end" => "completed".to_string(),
+            "session.summary" => "completed".to_string(),
+            other => other.to_string(),
+        });
+
+        // Extract session_id (Codex resume hint, Gemini session summary)
+        if let Some(ext) = extracted {
+            record.session_id = ext
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            // Token fields (Codex session.summary)
+            record.total_tokens = ext
+                .get("total")
+                .and_then(|v| v.as_str())
+                .and_then(|s| parse_number(s));
+            record.input_tokens = ext
+                .get("input")
+                .and_then(|v| v.as_str())
+                .and_then(|s| parse_number(s));
+            record.output_tokens = ext
+                .get("output")
+                .and_then(|v| v.as_str())
+                .and_then(|s| parse_number(s));
+            record.cached_tokens = ext
+                .get("cached")
+                .and_then(|v| v.as_str())
+                .and_then(|s| parse_number(s));
+            record.reasoning_tokens = ext
+                .get("reasoning")
+                .and_then(|v| v.as_str())
+                .and_then(|s| parse_number(s));
+
+            // Cost field (Claude Code session.cost_summary)
+            record.estimated_cost_usd = ext
+                .get("cost")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok());
+
+            // Model name (if present in extracted)
+            record.model_name = ext
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+
+        record
+    }
+}
+
+impl Default for HandleSessionEnd {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Workflow for HandleSessionEnd {
+    fn name(&self) -> &'static str {
+        "handle_session_end"
+    }
+
+    fn description(&self) -> &'static str {
+        "Persist structured session summary when an agent session ends"
+    }
+
+    fn handles(&self, detection: &crate::patterns::Detection) -> bool {
+        matches!(
+            detection.event_type.as_str(),
+            "session.summary" | "session.end"
+        )
+    }
+
+    fn trigger_event_types(&self) -> &'static [&'static str] {
+        &["session.summary", "session.end"]
+    }
+
+    fn supported_agent_types(&self) -> &'static [&'static str] {
+        &["codex", "claude_code", "gemini"]
+    }
+
+    fn requires_pane(&self) -> bool {
+        true
+    }
+
+    fn requires_approval(&self) -> bool {
+        false
+    }
+
+    fn is_destructive(&self) -> bool {
+        false
+    }
+
+    fn steps(&self) -> Vec<WorkflowStep> {
+        vec![
+            WorkflowStep::new("extract_summary", "Extract structured session data from detection"),
+            WorkflowStep::new("persist_record", "Persist session record to database"),
+        ]
+    }
+
+    fn execute_step(
+        &self,
+        ctx: &mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'_, StepResult> {
+        let pane_id = ctx.pane_id();
+        let storage = ctx.storage().clone();
+        let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
+
+        Box::pin(async move {
+            match step_idx {
+                // Step 0: Extract and validate detection data
+                0 => {
+                    if trigger.is_null() {
+                        return StepResult::abort("No trigger detection available");
+                    }
+
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let event_type = trigger
+                        .get("event_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+
+                    tracing::info!(
+                        pane_id,
+                        agent_type,
+                        event_type,
+                        "handle_session_end: extracted session data from detection"
+                    );
+
+                    StepResult::cont()
+                }
+
+                // Step 1: Build and persist the session record
+                1 => {
+                    let record = Self::record_from_detection(pane_id, &trigger);
+
+                    let agent_type = record.agent_type.clone();
+                    let session_id = record.session_id.clone();
+                    let has_tokens = record.total_tokens.is_some();
+                    let has_cost = record.estimated_cost_usd.is_some();
+
+                    match storage.upsert_agent_session(record).await {
+                        Ok(db_id) => {
+                            tracing::info!(
+                                pane_id,
+                                db_id,
+                                agent_type = %agent_type,
+                                session_id = ?session_id,
+                                has_tokens,
+                                has_cost,
+                                "handle_session_end: persisted session record"
+                            );
+
+                            StepResult::done(serde_json::json!({
+                                "status": "persisted",
+                                "db_id": db_id,
+                                "pane_id": pane_id,
+                                "agent_type": agent_type,
+                                "session_id": session_id,
+                                "has_tokens": has_tokens,
+                                "has_cost": has_cost,
+                            }))
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                pane_id,
+                                error = %e,
+                                "handle_session_end: failed to persist session record"
+                            );
+                            StepResult::abort(format!("Failed to persist session: {e}"))
+                        }
+                    }
+                }
+
+                _ => StepResult::abort("Unexpected step"),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9455,5 +9678,260 @@ Try again at 3:00 PM UTC.
         assert!(!display.contains("secret-token"));
         // But should contain diagnostic info
         assert!(display.contains("device code"));
+    }
+
+    // ========================================================================
+    // HandleSessionEnd Tests (wa-nu4.2.2.3)
+    // ========================================================================
+
+    #[test]
+    fn handle_session_end_metadata() {
+        let wf = HandleSessionEnd::new();
+        assert_eq!(wf.name(), "handle_session_end");
+        assert!(!wf.description().is_empty());
+        assert_eq!(wf.steps().len(), 2);
+        assert_eq!(wf.steps()[0].name, "extract_summary");
+        assert_eq!(wf.steps()[1].name, "persist_record");
+    }
+
+    #[test]
+    fn handle_session_end_handles_session_summary() {
+        let wf = HandleSessionEnd::new();
+        let detection = Detection {
+            rule_id: "codex.session.token_usage".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "session.summary".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: Default::default(),
+            matched_text: "Token usage: total=100".to_string(),
+            span: (0, 20),
+        };
+        assert!(wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_session_end_handles_session_end() {
+        let wf = HandleSessionEnd::new();
+        let detection = Detection {
+            rule_id: "claude_code.session.end".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "session.end".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: Default::default(),
+            matched_text: "Session ended".to_string(),
+            span: (0, 13),
+        };
+        assert!(wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_session_end_ignores_other_events() {
+        let wf = HandleSessionEnd::new();
+        let detection = Detection {
+            rule_id: "codex.usage.warning".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "usage.warning".to_string(),
+            severity: Severity::Warning,
+            confidence: 1.0,
+            extracted: Default::default(),
+            matched_text: "usage warning".to_string(),
+            span: (0, 13),
+        };
+        assert!(!wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_session_end_record_from_codex_detection() {
+        let trigger = serde_json::json!({
+            "agent_type": "codex",
+            "event_type": "session.summary",
+            "extracted": {
+                "total": "1500",
+                "input": "1000",
+                "output": "500",
+                "cached": "200",
+                "reasoning": "50",
+            }
+        });
+        let record = HandleSessionEnd::record_from_detection(42, &trigger);
+        assert_eq!(record.pane_id, 42);
+        assert_eq!(record.agent_type, "codex");
+        assert_eq!(record.total_tokens, Some(1500));
+        assert_eq!(record.input_tokens, Some(1000));
+        assert_eq!(record.output_tokens, Some(500));
+        assert_eq!(record.cached_tokens, Some(200));
+        assert_eq!(record.reasoning_tokens, Some(50));
+        assert_eq!(record.end_reason.as_deref(), Some("completed"));
+        assert!(record.ended_at.is_some());
+    }
+
+    #[test]
+    fn handle_session_end_record_from_claude_code_detection() {
+        let trigger = serde_json::json!({
+            "agent_type": "claude_code",
+            "event_type": "session.summary",
+            "extracted": {
+                "cost": "2.50",
+            }
+        });
+        let record = HandleSessionEnd::record_from_detection(99, &trigger);
+        assert_eq!(record.pane_id, 99);
+        assert_eq!(record.agent_type, "claude_code");
+        assert_eq!(record.estimated_cost_usd, Some(2.50));
+        assert!(record.total_tokens.is_none());
+        assert_eq!(record.end_reason.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn handle_session_end_record_from_gemini_detection() {
+        let trigger = serde_json::json!({
+            "agent_type": "gemini",
+            "event_type": "session.summary",
+            "extracted": {
+                "session_id": "abcdef12-3456-7890-abcd-ef1234567890",
+                "tool_calls": "7",
+            }
+        });
+        let record = HandleSessionEnd::record_from_detection(10, &trigger);
+        assert_eq!(record.pane_id, 10);
+        assert_eq!(record.agent_type, "gemini");
+        assert_eq!(
+            record.session_id.as_deref(),
+            Some("abcdef12-3456-7890-abcd-ef1234567890")
+        );
+        assert_eq!(record.end_reason.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn handle_session_end_record_from_session_end_event() {
+        let trigger = serde_json::json!({
+            "agent_type": "claude_code",
+            "event_type": "session.end",
+            "extracted": {}
+        });
+        let record = HandleSessionEnd::record_from_detection(5, &trigger);
+        assert_eq!(record.agent_type, "claude_code");
+        assert_eq!(record.end_reason.as_deref(), Some("completed"));
+        assert!(record.ended_at.is_some());
+        // No token or cost data expected from a bare session.end
+        assert!(record.total_tokens.is_none());
+        assert!(record.estimated_cost_usd.is_none());
+    }
+
+    #[test]
+    fn handle_session_end_record_missing_extracted() {
+        let trigger = serde_json::json!({
+            "agent_type": "unknown",
+            "event_type": "session.end",
+        });
+        let record = HandleSessionEnd::record_from_detection(1, &trigger);
+        assert_eq!(record.agent_type, "unknown");
+        assert!(record.session_id.is_none());
+        assert!(record.total_tokens.is_none());
+        assert!(record.estimated_cost_usd.is_none());
+    }
+
+    #[test]
+    fn handle_session_end_record_comma_numbers() {
+        let trigger = serde_json::json!({
+            "agent_type": "codex",
+            "event_type": "session.summary",
+            "extracted": {
+                "total": "1,500,000",
+                "input": "1,000,000",
+                "output": "500,000",
+            }
+        });
+        let record = HandleSessionEnd::record_from_detection(42, &trigger);
+        assert_eq!(record.total_tokens, Some(1_500_000));
+        assert_eq!(record.input_tokens, Some(1_000_000));
+        assert_eq!(record.output_tokens, Some(500_000));
+    }
+
+    #[test]
+    fn handle_session_end_trigger_event_types() {
+        let wf = HandleSessionEnd::new();
+        let types = wf.trigger_event_types();
+        assert!(types.contains(&"session.summary"));
+        assert!(types.contains(&"session.end"));
+    }
+
+    #[test]
+    fn handle_session_end_supported_agents() {
+        let wf = HandleSessionEnd::new();
+        let agents = wf.supported_agent_types();
+        assert!(agents.contains(&"codex"));
+        assert!(agents.contains(&"claude_code"));
+        assert!(agents.contains(&"gemini"));
+    }
+
+    #[test]
+    fn handle_session_end_not_destructive() {
+        let wf = HandleSessionEnd::new();
+        assert!(!wf.is_destructive());
+        assert!(!wf.requires_approval());
+        assert!(wf.requires_pane());
+    }
+
+    #[tokio::test]
+    async fn handle_session_end_persist_roundtrip() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::SeqCst);
+        let db_path = std::env::temp_dir().join(format!(
+            "wa_test_session_end_{}_{n}.db",
+            std::process::id()
+        ));
+        let db = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .expect("temp DB");
+
+        // Insert a pane record first (FK constraint)
+        let pane = crate::storage::PaneRecord {
+            pane_id: 77,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: None,
+            cwd: None,
+            tty_name: None,
+            first_seen_at: now_ms(),
+            last_seen_at: now_ms(),
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        db.upsert_pane(pane).await.expect("insert pane");
+
+        let trigger = serde_json::json!({
+            "agent_type": "codex",
+            "event_type": "session.summary",
+            "extracted": {
+                "total": "5000",
+                "input": "3000",
+                "output": "2000",
+                "session_id": "abc-def-123",
+            }
+        });
+        let record = HandleSessionEnd::record_from_detection(77, &trigger);
+        let db_id = db.upsert_agent_session(record).await.expect("upsert");
+        assert!(db_id > 0);
+
+        // Query back by DB id
+        let session = db
+            .get_agent_session(db_id)
+            .await
+            .expect("query")
+            .expect("session should exist");
+        assert_eq!(session.agent_type, "codex");
+        assert_eq!(session.session_id.as_deref(), Some("abc-def-123"));
+        assert_eq!(session.total_tokens, Some(5000));
+        assert_eq!(session.input_tokens, Some(3000));
+        assert_eq!(session.output_tokens, Some(2000));
+        assert!(session.ended_at.is_some());
+        assert_eq!(session.end_reason.as_deref(), Some("completed"));
     }
 }

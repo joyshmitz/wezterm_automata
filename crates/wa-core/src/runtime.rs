@@ -35,6 +35,7 @@ use crate::ingest::{PaneCursor, PaneRegistry, persist_captured_segment};
 use crate::patterns::{Detection, DetectionContext, PatternEngine};
 use crate::storage::{StorageHandle, StoredEvent};
 use crate::tailer::{CaptureEvent, TailerConfig, TailerSupervisor};
+use crate::watchdog::HeartbeatRegistry;
 use crate::wezterm::{PaneInfo, WeztermClient};
 
 /// Configuration for the observation runtime.
@@ -196,6 +197,8 @@ pub struct ObservationRuntime {
     config_rx: watch::Receiver<HotReloadableConfig>,
     /// Optional event bus for publishing detection events to workflow runners
     event_bus: Option<Arc<EventBus>>,
+    /// Heartbeat registry for watchdog monitoring
+    heartbeats: Arc<HeartbeatRegistry>,
 }
 
 impl ObservationRuntime {
@@ -242,6 +245,7 @@ impl ObservationRuntime {
             config_tx,
             config_rx,
             event_bus: None,
+            heartbeats: Arc::new(HeartbeatRegistry::new()),
         }
     }
 
@@ -292,6 +296,7 @@ impl ObservationRuntime {
             start_time: Instant::now(),
             config_tx: self.config_tx.clone(),
             event_bus: self.event_bus.clone(),
+            heartbeats: Arc::clone(&self.heartbeats),
         })
     }
 
@@ -300,6 +305,7 @@ impl ObservationRuntime {
         let storage = Arc::clone(&self.storage);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let mut config_rx = self.config_rx.clone();
+        let heartbeats = Arc::clone(&self.heartbeats);
 
         let initial_retention_days = self.config.retention_days;
         let initial_checkpoint_secs = self.config.checkpoint_interval_secs;
@@ -316,6 +322,8 @@ impl ObservationRuntime {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
+                        heartbeats.record_maintenance();
+
                         if shutdown_flag.load(Ordering::SeqCst) {
                             break;
                         }
@@ -388,6 +396,7 @@ impl ObservationRuntime {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let initial_interval = self.config.discovery_interval;
         let mut config_rx = self.config_rx.clone();
+        let heartbeats = Arc::clone(&self.heartbeats);
 
         tokio::spawn(async move {
             // Create a fresh WezTerm client for this task with shorter timeout
@@ -430,6 +439,7 @@ impl ObservationRuntime {
 
                 match wezterm.list_panes().await {
                     Ok(panes) => {
+                        heartbeats.record_discovery();
                         let mut reg = registry.write().await;
                         let diff = reg.discovery_tick(panes);
 
@@ -522,6 +532,7 @@ impl ObservationRuntime {
                         }
                     }
                     Err(e) => {
+                        heartbeats.record_discovery();
                         warn!(error = %e, "Failed to list panes");
                     }
                 }
@@ -542,6 +553,7 @@ impl ObservationRuntime {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let discovery_interval = self.config.discovery_interval;
         let mut config_rx = self.config_rx.clone();
+        let heartbeats = Arc::clone(&self.heartbeats);
 
         // Create tailer config from runtime config
         // Capture overlap_size for use in the async block (not hot-reloadable)
@@ -581,6 +593,8 @@ impl ObservationRuntime {
 
                 tokio::select! {
                     _ = sync_tick.tick() => {
+                        heartbeats.record_capture();
+
                         if shutdown_flag.load(Ordering::SeqCst) {
                             debug!("Capture task: shutdown signal received");
                             break;
@@ -653,10 +667,12 @@ impl ObservationRuntime {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let metrics = Arc::clone(&self.metrics);
         let event_bus = self.event_bus.clone();
+        let heartbeats = Arc::clone(&self.heartbeats);
 
         tokio::spawn(async move {
             // Process events until channel closes or shutdown
             while let Some(event) = capture_rx.recv().await {
+                heartbeats.record_persistence();
                 // Check shutdown flag - if set, drain remaining events quickly
                 if shutdown_flag.load(Ordering::SeqCst) {
                     debug!("Persistence task: shutdown signal received, draining remaining events");
@@ -819,6 +835,8 @@ pub struct RuntimeHandle {
     config_tx: watch::Sender<HotReloadableConfig>,
     /// Optional event bus for workflow integration
     pub event_bus: Option<Arc<EventBus>>,
+    /// Heartbeat registry for watchdog monitoring
+    pub heartbeats: Arc<HeartbeatRegistry>,
 }
 
 impl RuntimeHandle {

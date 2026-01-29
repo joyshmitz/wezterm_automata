@@ -67,6 +67,7 @@ pub mod storage;
 pub mod suggestions;
 pub mod tailer;
 pub mod wait;
+pub mod watchdog;
 pub mod wezterm;
 pub mod workflows;
 

@@ -200,8 +200,9 @@ where
             Ok(value) => {
                 if attempt > 0 {
                     debug!(
-                        attempt = attempt + 1,
-                        "Operation succeeded after {} retries", attempt
+                        total_attempts = attempt + 1,
+                        retries = attempt,
+                        "Operation succeeded after retries"
                     );
                 }
                 return RetryOutcome {
@@ -347,8 +348,9 @@ where
             Ok(value) => {
                 if attempt > 0 {
                     debug!(
-                        attempt = attempt + 1,
-                        "Operation succeeded after {} retries", attempt
+                        total_attempts = attempt + 1,
+                        retries = attempt,
+                        "Operation succeeded after retries"
                     );
                 }
                 return Ok(value);

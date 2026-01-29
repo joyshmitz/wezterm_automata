@@ -906,6 +906,277 @@ impl Default for NotificationCooldown {
     }
 }
 
+// ---- Event filter for notification gating ----
+
+/// Converts a [`Severity`] to a numeric level for threshold comparisons.
+///
+/// Higher values indicate more severe events:
+/// - Info = 0, Warning = 1, Critical = 2
+fn severity_level(s: crate::patterns::Severity) -> u8 {
+    match s {
+        crate::patterns::Severity::Info => 0,
+        crate::patterns::Severity::Warning => 1,
+        crate::patterns::Severity::Critical => 2,
+    }
+}
+
+/// Parse a severity string (case-insensitive) into a [`Severity`].
+///
+/// Accepts: "info", "warning", "critical" (and case variants).
+/// Returns `None` for unrecognised strings.
+fn parse_severity(s: &str) -> Option<crate::patterns::Severity> {
+    match s.to_lowercase().as_str() {
+        "info" => Some(crate::patterns::Severity::Info),
+        "warning" => Some(crate::patterns::Severity::Warning),
+        "critical" => Some(crate::patterns::Severity::Critical),
+        _ => None,
+    }
+}
+
+/// Parse an agent-type string (case-insensitive) into an [`AgentType`].
+///
+/// Accepts the serde-canonical names: "codex", "claude_code", "gemini",
+/// "wezterm", "unknown".
+fn parse_agent_type(s: &str) -> Option<crate::patterns::AgentType> {
+    match s.to_lowercase().as_str() {
+        "codex" => Some(crate::patterns::AgentType::Codex),
+        "claude_code" => Some(crate::patterns::AgentType::ClaudeCode),
+        "gemini" => Some(crate::patterns::AgentType::Gemini),
+        "wezterm" => Some(crate::patterns::AgentType::Wezterm),
+        "unknown" => Some(crate::patterns::AgentType::Unknown),
+        _ => None,
+    }
+}
+
+/// Simple glob matcher for rule-ID patterns.
+///
+/// Supports `*` (any sequence) and `?` (any single char).
+/// Without wildcards, performs exact equality.
+fn match_rule_glob(pattern: &str, value: &str) -> bool {
+    if !pattern.contains('*') && !pattern.contains('?') {
+        return value == pattern;
+    }
+
+    // Convert glob → regex
+    let mut re = String::from("^");
+    for ch in pattern.chars() {
+        match ch {
+            '*' => re.push_str(".*"),
+            '?' => re.push('.'),
+            '.' | '+' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' | ':' => {
+                re.push('\\');
+                re.push(ch);
+            }
+            _ => re.push(ch),
+        }
+    }
+    re.push('$');
+
+    fancy_regex::Regex::new(&re).is_ok_and(|r| r.is_match(value).unwrap_or(false))
+}
+
+/// Event notification filter.
+///
+/// Decides whether a [`Detection`] should trigger a notification based on
+/// configurable include/exclude glob patterns, minimum severity, and
+/// agent-type allowlist.
+///
+/// **Evaluation order:**
+/// 1. Exclude patterns are checked first — if *any* match, the event is
+///    filtered out (regardless of include rules).
+/// 2. If `include` is non-empty, the rule-ID must match at least one
+///    include pattern.
+/// 3. Severity must meet or exceed `min_severity` (if set).
+/// 4. Agent type must be in `agent_types` (if the list is non-empty).
+#[derive(Debug, Clone)]
+pub struct EventFilter {
+    include: Vec<String>,
+    exclude: Vec<String>,
+    min_severity: Option<crate::patterns::Severity>,
+    agent_types: Vec<crate::patterns::AgentType>,
+}
+
+impl EventFilter {
+    /// Build a filter from raw config values.
+    ///
+    /// Unknown severity / agent-type strings are silently ignored so that
+    /// forward-compatible config files don't break older binaries.
+    #[must_use]
+    pub fn from_config(
+        include: &[String],
+        exclude: &[String],
+        min_severity: Option<&str>,
+        agent_types: &[String],
+    ) -> Self {
+        Self {
+            include: include.to_vec(),
+            exclude: exclude.to_vec(),
+            min_severity: min_severity.and_then(parse_severity),
+            agent_types: agent_types.iter().filter_map(|s| parse_agent_type(s)).collect(),
+        }
+    }
+
+    /// Create a permissive filter that passes everything through.
+    #[must_use]
+    pub fn allow_all() -> Self {
+        Self {
+            include: Vec::new(),
+            exclude: Vec::new(),
+            min_severity: None,
+            agent_types: Vec::new(),
+        }
+    }
+
+    /// Returns `true` if the detection passes the filter and should be
+    /// forwarded to the notification pipeline.
+    #[must_use]
+    pub fn matches(&self, detection: &Detection) -> bool {
+        let rule_id = &detection.rule_id;
+
+        // 1. Exclude wins
+        if self.exclude.iter().any(|pat| match_rule_glob(pat, rule_id)) {
+            return false;
+        }
+
+        // 2. Include (if non-empty, at least one must match)
+        if !self.include.is_empty()
+            && !self.include.iter().any(|pat| match_rule_glob(pat, rule_id))
+        {
+            return false;
+        }
+
+        // 3. Minimum severity
+        if let Some(min) = self.min_severity {
+            if severity_level(detection.severity) < severity_level(min) {
+                return false;
+            }
+        }
+
+        // 4. Agent type allowlist
+        if !self.agent_types.is_empty() && !self.agent_types.contains(&detection.agent_type) {
+            return false;
+        }
+
+        true
+    }
+
+    /// Returns `true` when the filter has no restrictions (equivalent to
+    /// [`EventFilter::allow_all`]).
+    #[must_use]
+    pub fn is_permissive(&self) -> bool {
+        self.include.is_empty()
+            && self.exclude.is_empty()
+            && self.min_severity.is_none()
+            && self.agent_types.is_empty()
+    }
+}
+
+impl Default for EventFilter {
+    fn default() -> Self {
+        Self::allow_all()
+    }
+}
+
+/// Composite notification gate that combines filtering, deduplication, and
+/// cooldown into a single decision point.
+///
+/// Typical usage in the runtime persistence task:
+///
+/// ```ignore
+/// if gate.should_notify(&detection) == NotifyDecision::Send { … }
+/// ```
+#[derive(Debug)]
+pub struct NotificationGate {
+    filter: EventFilter,
+    dedup: EventDeduplicator,
+    cooldown: NotificationCooldown,
+}
+
+/// Decision produced by [`NotificationGate::should_notify`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotifyDecision {
+    /// The event should produce a notification.
+    Send {
+        /// Number of similar events suppressed since the last notification.
+        suppressed_since_last: u64,
+    },
+    /// The event was filtered out by pattern/severity/agent-type rules.
+    Filtered,
+    /// The event was suppressed as a duplicate within the dedup window.
+    Deduplicated { suppressed_count: u64 },
+    /// The event was suppressed by notification cooldown.
+    Throttled { total_suppressed: u64 },
+}
+
+impl NotificationGate {
+    /// Create a gate with the given filter, dedup, and cooldown settings.
+    #[must_use]
+    pub fn new(
+        filter: EventFilter,
+        dedup: EventDeduplicator,
+        cooldown: NotificationCooldown,
+    ) -> Self {
+        Self {
+            filter,
+            dedup,
+            cooldown,
+        }
+    }
+
+    /// Create a gate from notification config values.
+    #[must_use]
+    pub fn from_config(
+        filter: EventFilter,
+        dedup_window: Duration,
+        cooldown_period: Duration,
+    ) -> Self {
+        Self {
+            filter,
+            dedup: EventDeduplicator::with_config(dedup_window, EventDeduplicator::DEFAULT_MAX_CAPACITY),
+            cooldown: NotificationCooldown::with_config(cooldown_period, NotificationCooldown::DEFAULT_MAX_CAPACITY),
+        }
+    }
+
+    /// Decide whether a detection should produce a notification.
+    ///
+    /// The dedup key is formed from `rule_id + pane_id` so that the same
+    /// detection from different panes is treated independently.
+    pub fn should_notify(&mut self, detection: &Detection, pane_id: u64) -> NotifyDecision {
+        // Step 1: apply filter
+        if !self.filter.matches(detection) {
+            return NotifyDecision::Filtered;
+        }
+
+        // Step 2: dedup
+        let dedup_key = format!("{}:{}", detection.rule_id, pane_id);
+        match self.dedup.check(&dedup_key) {
+            DedupeVerdict::Duplicate { suppressed_count } => {
+                return NotifyDecision::Deduplicated { suppressed_count };
+            }
+            DedupeVerdict::New => {}
+        }
+
+        // Step 3: cooldown
+        let cooldown_key = format!("{}:{}", detection.rule_id, pane_id);
+        match self.cooldown.check(&cooldown_key) {
+            CooldownVerdict::Suppress { total_suppressed } => {
+                NotifyDecision::Throttled { total_suppressed }
+            }
+            CooldownVerdict::Send {
+                suppressed_since_last,
+            } => NotifyDecision::Send {
+                suppressed_since_last,
+            },
+        }
+    }
+
+    /// Access the inner filter (e.g., for status output).
+    #[must_use]
+    pub fn filter(&self) -> &EventFilter {
+        &self.filter
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1647,5 +1918,508 @@ mod tests {
                 suppressed_since_last: 0
             }
         );
+    }
+
+    // ========================================================================
+    // EventFilter tests (wa-psm.3)
+    // ========================================================================
+
+    fn make_detection(
+        rule_id: &str,
+        severity: crate::patterns::Severity,
+        agent_type: crate::patterns::AgentType,
+    ) -> Detection {
+        Detection {
+            rule_id: rule_id.to_string(),
+            agent_type,
+            event_type: "test".to_string(),
+            severity,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "test".to_string(),
+            span: (0, 4),
+        }
+    }
+
+    #[test]
+    fn filter_allow_all_passes_everything() {
+        let f = EventFilter::allow_all();
+        assert!(f.is_permissive());
+        let d = make_detection(
+            "core.codex:usage_reached",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Codex,
+        );
+        assert!(f.matches(&d));
+    }
+
+    #[test]
+    fn filter_include_glob_star() {
+        // Pattern "*:usage_*" matches rule_ids with ":usage_" separator
+        let f = EventFilter::from_config(
+            &["*:usage_*".to_string()],
+            &[],
+            None,
+            &[],
+        );
+        let hit = make_detection(
+            "core.codex:usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        let miss = make_detection(
+            "core.codex:session_end",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        assert!(f.matches(&hit));
+        assert!(!f.matches(&miss));
+    }
+
+    #[test]
+    fn filter_include_glob_dot_separated() {
+        // Pattern "*.error" matches rule_ids like "codex.error"
+        let f = EventFilter::from_config(
+            &["*.error".to_string()],
+            &[],
+            None,
+            &[],
+        );
+        let hit = make_detection(
+            "codex.error",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        let miss = make_detection(
+            "codex.warning",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        assert!(f.matches(&hit));
+        assert!(!f.matches(&miss));
+    }
+
+    #[test]
+    fn filter_include_exact_match() {
+        let f = EventFilter::from_config(
+            &["core.codex:usage_reached".to_string()],
+            &[],
+            None,
+            &[],
+        );
+        let hit = make_detection(
+            "core.codex:usage_reached",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Codex,
+        );
+        let miss = make_detection(
+            "core.codex:usage_warning",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Codex,
+        );
+        assert!(f.matches(&hit));
+        assert!(!f.matches(&miss));
+    }
+
+    #[test]
+    fn filter_exclude_wins_over_include() {
+        let f = EventFilter::from_config(
+            &["codex.*".to_string()],
+            &["codex.debug".to_string()],
+            None,
+            &[],
+        );
+        let pass = make_detection(
+            "codex.error",
+            crate::patterns::Severity::Critical,
+            crate::patterns::AgentType::Codex,
+        );
+        let blocked = make_detection(
+            "codex.debug",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Codex,
+        );
+        assert!(f.matches(&pass));
+        assert!(!f.matches(&blocked));
+    }
+
+    #[test]
+    fn filter_exclude_glob() {
+        let f = EventFilter::from_config(
+            &[],
+            &["*.debug".to_string(), "test.*".to_string()],
+            None,
+            &[],
+        );
+        let blocked1 = make_detection(
+            "core.debug",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Unknown,
+        );
+        let blocked2 = make_detection(
+            "test.something",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Unknown,
+        );
+        let pass = make_detection(
+            "core.codex:usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        assert!(!f.matches(&blocked1));
+        assert!(!f.matches(&blocked2));
+        assert!(f.matches(&pass));
+    }
+
+    #[test]
+    fn filter_min_severity_info() {
+        let f = EventFilter::from_config(&[], &[], Some("info"), &[]);
+        let d = make_detection(
+            "x",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Codex,
+        );
+        assert!(f.matches(&d));
+    }
+
+    #[test]
+    fn filter_min_severity_warning_blocks_info() {
+        let f = EventFilter::from_config(&[], &[], Some("warning"), &[]);
+        let info = make_detection(
+            "x",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Codex,
+        );
+        let warning = make_detection(
+            "x",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        let critical = make_detection(
+            "x",
+            crate::patterns::Severity::Critical,
+            crate::patterns::AgentType::Codex,
+        );
+        assert!(!f.matches(&info));
+        assert!(f.matches(&warning));
+        assert!(f.matches(&critical));
+    }
+
+    #[test]
+    fn filter_min_severity_critical_blocks_warning() {
+        let f = EventFilter::from_config(&[], &[], Some("critical"), &[]);
+        let warning = make_detection(
+            "x",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        let critical = make_detection(
+            "x",
+            crate::patterns::Severity::Critical,
+            crate::patterns::AgentType::Codex,
+        );
+        assert!(!f.matches(&warning));
+        assert!(f.matches(&critical));
+    }
+
+    #[test]
+    fn filter_agent_type_allowlist() {
+        let f = EventFilter::from_config(
+            &[],
+            &[],
+            None,
+            &["codex".to_string(), "gemini".to_string()],
+        );
+        let codex = make_detection(
+            "x",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Codex,
+        );
+        let gemini = make_detection(
+            "x",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Gemini,
+        );
+        let claude = make_detection(
+            "x",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::ClaudeCode,
+        );
+        assert!(f.matches(&codex));
+        assert!(f.matches(&gemini));
+        assert!(!f.matches(&claude));
+    }
+
+    #[test]
+    fn filter_empty_agent_types_allows_all() {
+        let f = EventFilter::from_config(&[], &[], None, &[]);
+        let d = make_detection(
+            "x",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::ClaudeCode,
+        );
+        assert!(f.matches(&d));
+    }
+
+    #[test]
+    fn filter_combined_severity_and_agent() {
+        let f = EventFilter::from_config(
+            &[],
+            &[],
+            Some("warning"),
+            &["codex".to_string()],
+        );
+        // Codex + Warning → pass
+        assert!(f.matches(&make_detection(
+            "x",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        )));
+        // Codex + Info → blocked by severity
+        assert!(!f.matches(&make_detection(
+            "x",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Codex,
+        )));
+        // Claude + Warning → blocked by agent
+        assert!(!f.matches(&make_detection(
+            "x",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::ClaudeCode,
+        )));
+    }
+
+    #[test]
+    fn filter_unknown_severity_ignored() {
+        let f = EventFilter::from_config(&[], &[], Some("bogus"), &[]);
+        // Unknown severity string → min_severity is None → passes
+        assert!(f.matches(&make_detection(
+            "x",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Codex,
+        )));
+    }
+
+    #[test]
+    fn filter_question_mark_glob() {
+        let f = EventFilter::from_config(
+            &["codex.usage_?eached".to_string()],
+            &[],
+            None,
+            &[],
+        );
+        assert!(f.matches(&make_detection(
+            "codex.usage_reached",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Codex,
+        )));
+        assert!(!f.matches(&make_detection(
+            "codex.usage_breached",
+            crate::patterns::Severity::Info,
+            crate::patterns::AgentType::Codex,
+        )));
+    }
+
+    #[test]
+    fn filter_default_is_permissive() {
+        let f = EventFilter::default();
+        assert!(f.is_permissive());
+    }
+
+    // ========================================================================
+    // NotificationGate tests (wa-psm.3)
+    // ========================================================================
+
+    #[test]
+    fn gate_first_event_sends() {
+        let mut gate = NotificationGate::from_config(
+            EventFilter::allow_all(),
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+        );
+        let d = make_detection(
+            "codex.usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        assert_eq!(
+            gate.should_notify(&d, 1),
+            NotifyDecision::Send {
+                suppressed_since_last: 0
+            }
+        );
+    }
+
+    #[test]
+    fn gate_filtered_event_returns_filtered() {
+        let filter = EventFilter::from_config(
+            &[],
+            &["codex.*".to_string()],
+            None,
+            &[],
+        );
+        let mut gate = NotificationGate::from_config(
+            filter,
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+        );
+        let d = make_detection(
+            "codex.usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        assert_eq!(gate.should_notify(&d, 1), NotifyDecision::Filtered);
+    }
+
+    #[test]
+    fn gate_dedup_suppresses_repeated() {
+        let mut gate = NotificationGate::from_config(
+            EventFilter::allow_all(),
+            Duration::from_secs(300),
+            Duration::from_millis(1), // very short cooldown so dedup kicks in first
+        );
+        let d = make_detection(
+            "codex.usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        // First: Send
+        assert!(matches!(
+            gate.should_notify(&d, 1),
+            NotifyDecision::Send { .. }
+        ));
+        // Second: Deduplicated (within 300s dedup window)
+        assert!(matches!(
+            gate.should_notify(&d, 1),
+            NotifyDecision::Deduplicated { .. }
+        ));
+    }
+
+    #[test]
+    fn gate_cooldown_throttles_after_dedup_expiry() {
+        // Short dedup window, longer cooldown
+        let mut gate = NotificationGate::from_config(
+            EventFilter::allow_all(),
+            Duration::from_millis(1),   // dedup expires fast
+            Duration::from_secs(300),   // cooldown stays
+        );
+        let d = make_detection(
+            "codex.usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        // First: Send
+        assert!(matches!(
+            gate.should_notify(&d, 1),
+            NotifyDecision::Send { .. }
+        ));
+        // Wait for dedup to expire
+        std::thread::sleep(Duration::from_millis(5));
+        // Now dedup is expired but cooldown is still active → Throttled
+        assert!(matches!(
+            gate.should_notify(&d, 1),
+            NotifyDecision::Throttled { .. }
+        ));
+    }
+
+    #[test]
+    fn gate_different_panes_independent() {
+        let mut gate = NotificationGate::from_config(
+            EventFilter::allow_all(),
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+        );
+        let d = make_detection(
+            "codex.usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        // Pane 1: Send
+        assert!(matches!(
+            gate.should_notify(&d, 1),
+            NotifyDecision::Send { .. }
+        ));
+        // Pane 2: also Send (independent key)
+        assert!(matches!(
+            gate.should_notify(&d, 2),
+            NotifyDecision::Send { .. }
+        ));
+    }
+
+    #[test]
+    fn gate_filter_accessor() {
+        let filter = EventFilter::from_config(
+            &["test.*".to_string()],
+            &[],
+            None,
+            &[],
+        );
+        let gate = NotificationGate::from_config(
+            filter,
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+        );
+        assert!(!gate.filter().is_permissive());
+    }
+
+    // ---- match_rule_glob unit tests ----
+
+    #[test]
+    fn glob_exact_match() {
+        assert!(match_rule_glob("codex.error", "codex.error"));
+        assert!(!match_rule_glob("codex.error", "codex.warning"));
+    }
+
+    #[test]
+    fn glob_star_suffix() {
+        assert!(match_rule_glob("codex.*", "codex.error"));
+        assert!(match_rule_glob("codex.*", "codex.warning"));
+        assert!(!match_rule_glob("codex.*", "gemini.error"));
+    }
+
+    #[test]
+    fn glob_star_prefix() {
+        assert!(match_rule_glob("*.error", "codex.error"));
+        assert!(match_rule_glob("*.error", "gemini.error"));
+        assert!(!match_rule_glob("*.error", "codex.warning"));
+    }
+
+    #[test]
+    fn glob_star_middle() {
+        assert!(match_rule_glob("core.*:usage_reached", "core.codex:usage_reached"));
+        assert!(!match_rule_glob("core.*:usage_reached", "core.codex:session_end"));
+    }
+
+    #[test]
+    fn glob_question_mark() {
+        assert!(match_rule_glob("codex.?rror", "codex.error"));
+        assert!(!match_rule_glob("codex.?rror", "codex.error2"));
+    }
+
+    // ---- severity_level / parse tests ----
+
+    #[test]
+    fn severity_level_ordering() {
+        assert!(severity_level(crate::patterns::Severity::Info)
+            < severity_level(crate::patterns::Severity::Warning));
+        assert!(severity_level(crate::patterns::Severity::Warning)
+            < severity_level(crate::patterns::Severity::Critical));
+    }
+
+    #[test]
+    fn parse_severity_roundtrip() {
+        assert_eq!(parse_severity("info"), Some(crate::patterns::Severity::Info));
+        assert_eq!(parse_severity("WARNING"), Some(crate::patterns::Severity::Warning));
+        assert_eq!(parse_severity("Critical"), Some(crate::patterns::Severity::Critical));
+        assert_eq!(parse_severity("bogus"), None);
+    }
+
+    #[test]
+    fn parse_agent_type_roundtrip() {
+        assert_eq!(parse_agent_type("codex"), Some(crate::patterns::AgentType::Codex));
+        assert_eq!(parse_agent_type("CLAUDE_CODE"), Some(crate::patterns::AgentType::ClaudeCode));
+        assert_eq!(parse_agent_type("Gemini"), Some(crate::patterns::AgentType::Gemini));
+        assert_eq!(parse_agent_type("wezterm"), Some(crate::patterns::AgentType::Wezterm));
+        assert_eq!(parse_agent_type("nope"), None);
     }
 }

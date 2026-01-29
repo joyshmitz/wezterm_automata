@@ -23,6 +23,7 @@ use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // =============================================================================
 // Main Config
@@ -55,6 +56,9 @@ pub struct Config {
 
     /// Metrics/telemetry settings
     pub metrics: MetricsConfig,
+
+    /// Notification filtering and throttling settings
+    pub notifications: NotificationConfig,
 }
 
 // =============================================================================
@@ -493,6 +497,208 @@ pub struct PackOverride {
 }
 
 // =============================================================================
+// Compaction Prompt Config
+// =============================================================================
+
+/// Default prompt for Claude Code agents after compaction.
+pub const DEFAULT_COMPACTION_PROMPT_CLAUDE_CODE: &str =
+    "Reread AGENTS.md so it's still fresh in your mind.\n";
+
+/// Default prompt for Codex CLI agents after compaction.
+pub const DEFAULT_COMPACTION_PROMPT_CODEX: &str =
+    "Please re-read AGENTS.md and any key project context files.\n";
+
+/// Default prompt for Gemini CLI agents after compaction.
+pub const DEFAULT_COMPACTION_PROMPT_GEMINI: &str =
+    "Please re-examine AGENTS.md and project context.\n";
+
+/// Default prompt for unknown agents after compaction.
+pub const DEFAULT_COMPACTION_PROMPT_UNKNOWN: &str =
+    "Please review the project context files (AGENTS.md, README.md).\n";
+
+const COMPACTION_PROMPT_TOKENS: [&str; 5] = [
+    "agent_type",
+    "pane_id",
+    "pane_domain",
+    "pane_title",
+    "pane_cwd",
+];
+
+/// Per-project/pane-matching prompt override.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompactionPromptOverride {
+    /// Pane-matching rule for selecting this override
+    #[serde(flatten)]
+    pub rule: PaneFilterRule,
+
+    /// Prompt template to use when the rule matches
+    pub prompt: String,
+}
+
+impl Default for CompactionPromptOverride {
+    fn default() -> Self {
+        Self {
+            rule: PaneFilterRule::default(),
+            prompt: String::new(),
+        }
+    }
+}
+
+impl CompactionPromptOverride {
+    /// Validate the override rule and prompt.
+    pub fn validate(&self) -> Result<(), String> {
+        self.rule
+            .validate()
+            .map_err(|e| format!("compaction_prompts override invalid: {e}"))?;
+        if self.prompt.trim().is_empty() {
+            return Err(format!(
+                "compaction_prompts override '{}' has empty prompt",
+                self.rule.id
+            ));
+        }
+        validate_compaction_prompt_template(&self.prompt)?;
+        Ok(())
+    }
+}
+
+/// Prompt templates for the handle_compaction workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompactionPromptConfig {
+    /// Global default prompt template.
+    pub default: String,
+
+    /// Maximum total prompt length (characters).
+    pub max_prompt_len: u32,
+
+    /// Maximum length of any embedded snippet value.
+    pub max_snippet_len: u32,
+
+    /// Per-agent prompt overrides (keys: codex, claude_code, gemini, unknown).
+    pub by_agent: HashMap<String, String>,
+
+    /// Per-pane prompt overrides (keyed by pane_id).
+    pub by_pane: HashMap<u64, String>,
+
+    /// Per-project/path prompt overrides (first match wins).
+    pub by_project: Vec<CompactionPromptOverride>,
+}
+
+impl Default for CompactionPromptConfig {
+    fn default() -> Self {
+        let mut by_agent = HashMap::new();
+        by_agent.insert(
+            "claude_code".to_string(),
+            DEFAULT_COMPACTION_PROMPT_CLAUDE_CODE.to_string(),
+        );
+        by_agent.insert(
+            "codex".to_string(),
+            DEFAULT_COMPACTION_PROMPT_CODEX.to_string(),
+        );
+        by_agent.insert(
+            "gemini".to_string(),
+            DEFAULT_COMPACTION_PROMPT_GEMINI.to_string(),
+        );
+        by_agent.insert(
+            "unknown".to_string(),
+            DEFAULT_COMPACTION_PROMPT_UNKNOWN.to_string(),
+        );
+
+        Self {
+            default: DEFAULT_COMPACTION_PROMPT_UNKNOWN.to_string(),
+            max_prompt_len: 2000,
+            max_snippet_len: 400,
+            by_agent,
+            by_pane: HashMap::new(),
+            by_project: Vec::new(),
+        }
+    }
+}
+
+impl CompactionPromptConfig {
+    /// Validate compaction prompt configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_prompt_len == 0 {
+            return Err("workflows.compaction_prompts.max_prompt_len must be >= 1".to_string());
+        }
+        if self.max_snippet_len == 0 {
+            return Err("workflows.compaction_prompts.max_snippet_len must be >= 1".to_string());
+        }
+        if self.default.trim().is_empty() {
+            return Err("workflows.compaction_prompts.default must not be empty".to_string());
+        }
+        validate_compaction_prompt_template(&self.default)?;
+
+        for (agent, prompt) in &self.by_agent {
+            if !is_valid_agent_key(agent) {
+                return Err(format!(
+                    "workflows.compaction_prompts.by_agent has invalid key: {agent}"
+                ));
+            }
+            if prompt.trim().is_empty() {
+                return Err(format!(
+                    "workflows.compaction_prompts.by_agent.{agent} must not be empty"
+                ));
+            }
+            validate_compaction_prompt_template(prompt)?;
+        }
+
+        for (pane_id, prompt) in &self.by_pane {
+            if prompt.trim().is_empty() {
+                return Err(format!(
+                    "workflows.compaction_prompts.by_pane.{pane_id} must not be empty"
+                ));
+            }
+            validate_compaction_prompt_template(prompt)?;
+        }
+
+        for override_item in &self.by_project {
+            override_item.validate()?;
+        }
+
+        Ok(())
+    }
+}
+
+fn is_valid_agent_key(key: &str) -> bool {
+    matches!(key, "codex" | "claude_code" | "gemini" | "unknown")
+}
+
+fn validate_compaction_prompt_template(template: &str) -> Result<(), String> {
+    for token in extract_prompt_placeholders(template)? {
+        if !COMPACTION_PROMPT_TOKENS.contains(&token.as_str()) {
+            return Err(format!(
+                "Unknown placeholder '{{{{{token}}}}}' in compaction prompt template"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn extract_prompt_placeholders(template: &str) -> Result<Vec<String>, String> {
+    let mut placeholders = Vec::new();
+    let mut cursor = template;
+
+    while let Some(start) = cursor.find("{{") {
+        let after_start = &cursor[start + 2..];
+        let Some(end) = after_start.find("}}") else {
+            return Err("Unterminated '{{' in compaction prompt template".to_string());
+        };
+
+        let token = after_start[..end].trim();
+        if token.is_empty() {
+            return Err("Empty placeholder in compaction prompt template".to_string());
+        }
+
+        placeholders.push(token.to_string());
+        cursor = &after_start[end + 2..];
+    }
+
+    Ok(placeholders)
+}
+
+// =============================================================================
 // Workflows Config
 // =============================================================================
 
@@ -517,6 +723,9 @@ pub struct WorkflowsConfig {
 
     /// Enable step-level audit logging
     pub audit_steps: bool,
+
+    /// Prompt templates for handle_compaction
+    pub compaction_prompts: CompactionPromptConfig,
 }
 
 impl Default for WorkflowsConfig {
@@ -531,6 +740,7 @@ impl Default for WorkflowsConfig {
             max_concurrent: 3,
             default_step_timeout_ms: 30_000, // 30 seconds
             audit_steps: true,
+            compaction_prompts: CompactionPromptConfig::default(),
         }
     }
 }
@@ -971,6 +1181,111 @@ impl Default for MetricsConfig {
             bind: "127.0.0.1:9090".to_string(),
             prefix: "wa".to_string(),
         }
+    }
+}
+
+// =============================================================================
+// Notification Config
+// =============================================================================
+
+/// Notification filtering and throttling configuration.
+///
+/// Controls which detected events are forwarded to the notification pipeline
+/// (webhooks, desktop alerts, etc.) and how aggressively repeated events are
+/// suppressed.
+///
+/// # Example (wa.toml)
+///
+/// ```toml
+/// [notifications]
+/// enabled = true
+/// cooldown_ms = 30000
+/// dedup_window_ms = 300000
+/// min_severity = "warning"
+///
+/// # Only notify on usage-limit and auth events (glob patterns)
+/// include = ["*.usage_*", "*.auth_*", "*.error"]
+///
+/// # Never notify on debug/test rules
+/// exclude = ["*.debug", "test.*"]
+///
+/// # Only for codex and claude_code agents
+/// agent_types = ["codex", "claude_code"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationConfig {
+    /// Master switch for the notification pipeline
+    pub enabled: bool,
+
+    /// Notification cooldown period in milliseconds.
+    /// Within this window, repeated notifications for the same event key
+    /// are suppressed and the suppressed count is included in the next
+    /// notification that fires.
+    pub cooldown_ms: u64,
+
+    /// Event deduplication window in milliseconds.
+    /// Identical events (same rule_id + pane) within this window are
+    /// collapsed into a single notification.
+    pub dedup_window_ms: u64,
+
+    /// Include patterns: events whose `rule_id` matches ANY of these
+    /// glob patterns pass through. If empty, all events are included
+    /// (subject to exclude rules).
+    ///
+    /// Supports `*` (any sequence) and `?` (any single char).
+    /// Examples: `"*.error"`, `"codex.*"`, `"core.codex:usage_*"`
+    pub include: Vec<String>,
+
+    /// Exclude patterns: events whose `rule_id` matches ANY of these
+    /// glob patterns are filtered out. Exclude always wins over include.
+    pub exclude: Vec<String>,
+
+    /// Minimum severity for notification. Events below this threshold
+    /// are silently filtered out.
+    /// Accepts: `"info"`, `"warning"`, `"critical"` (case-insensitive).
+    pub min_severity: Option<String>,
+
+    /// Agent type allowlist. If non-empty, only events from these agent
+    /// types are forwarded.
+    /// Accepts: `"codex"`, `"claude_code"`, `"gemini"`, `"wezterm"`, `"unknown"`.
+    pub agent_types: Vec<String>,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cooldown_ms: 30_000,        // 30 seconds
+            dedup_window_ms: 300_000,    // 5 minutes
+            include: Vec::new(),
+            exclude: Vec::new(),
+            min_severity: None,
+            agent_types: Vec::new(),
+        }
+    }
+}
+
+impl NotificationConfig {
+    /// Build an [`EventFilter`](crate::events::EventFilter) from this config.
+    #[must_use]
+    pub fn to_event_filter(&self) -> crate::events::EventFilter {
+        crate::events::EventFilter::from_config(
+            &self.include,
+            &self.exclude,
+            self.min_severity.as_deref(),
+            &self.agent_types,
+        )
+    }
+
+    /// Build a [`NotificationGate`](crate::events::NotificationGate) from this config.
+    #[must_use]
+    pub fn to_notification_gate(&self) -> crate::events::NotificationGate {
+        crate::events::NotificationGate::from_config(
+            self.to_event_filter(),
+            Duration::from_millis(self.dedup_window_ms),
+            Duration::from_millis(self.cooldown_ms),
+        )
     }
 }
 
@@ -1548,6 +1863,11 @@ impl Config {
             .into());
         }
 
+        self.workflows
+            .compaction_prompts
+            .validate()
+            .map_err(crate::error::ConfigError::ValidationError)?;
+
         Ok(())
     }
 
@@ -2104,6 +2424,22 @@ disabled_rules = ["codex.usage_warning"]
     }
 
     #[test]
+    fn compaction_prompt_config_rejects_unknown_placeholder() {
+        let mut config = Config::default();
+        config.workflows.compaction_prompts.default = "Please review {{unknown_token}}".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("Unknown placeholder"));
+    }
+
+    #[test]
+    fn compaction_prompt_config_rejects_empty_prompt() {
+        let mut config = Config::default();
+        config.workflows.compaction_prompts.default = "   ".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("compaction_prompts.default"));
+    }
+
+    #[test]
     fn redaction_patterns_are_valid_regex() {
         let config = Config::default();
         for pattern in &config.safety.redaction.patterns {
@@ -2618,5 +2954,90 @@ title = "vim"
         assert!(output.contains("storage.db_path"));
         assert!(output.contains("Hot-reloadable changes"));
         assert!(output.contains("ingest.poll_interval_ms"));
+    }
+
+    // ========================================================================
+    // NotificationConfig tests (wa-psm.3)
+    // ========================================================================
+
+    #[test]
+    fn notification_config_defaults() {
+        let nc = NotificationConfig::default();
+        assert!(nc.enabled);
+        assert_eq!(nc.cooldown_ms, 30_000);
+        assert_eq!(nc.dedup_window_ms, 300_000);
+        assert!(nc.include.is_empty());
+        assert!(nc.exclude.is_empty());
+        assert!(nc.min_severity.is_none());
+        assert!(nc.agent_types.is_empty());
+    }
+
+    #[test]
+    fn notification_config_in_default_config() {
+        let config = Config::default();
+        assert!(config.notifications.enabled);
+    }
+
+    #[test]
+    fn notification_config_toml_roundtrip() {
+        let toml_str = r#"
+[notifications]
+enabled = true
+cooldown_ms = 5000
+dedup_window_ms = 60000
+include = ["*.error", "codex.*"]
+exclude = ["test.*"]
+min_severity = "warning"
+agent_types = ["codex", "claude_code"]
+"#;
+        let config: Config = toml::from_str(toml_str).expect("parse");
+        assert!(config.notifications.enabled);
+        assert_eq!(config.notifications.cooldown_ms, 5000);
+        assert_eq!(config.notifications.dedup_window_ms, 60000);
+        assert_eq!(config.notifications.include, vec!["*.error", "codex.*"]);
+        assert_eq!(config.notifications.exclude, vec!["test.*"]);
+        assert_eq!(config.notifications.min_severity, Some("warning".to_string()));
+        assert_eq!(config.notifications.agent_types, vec!["codex", "claude_code"]);
+    }
+
+    #[test]
+    fn notification_config_builds_event_filter() {
+        let nc = NotificationConfig {
+            enabled: true,
+            cooldown_ms: 1000,
+            dedup_window_ms: 5000,
+            include: vec!["codex.*".to_string()],
+            exclude: vec!["*.debug".to_string()],
+            min_severity: Some("warning".to_string()),
+            agent_types: vec!["codex".to_string()],
+        };
+        let filter = nc.to_event_filter();
+        assert!(!filter.is_permissive());
+    }
+
+    #[test]
+    fn notification_config_builds_gate() {
+        let nc = NotificationConfig::default();
+        let _gate = nc.to_notification_gate();
+        // Smoke test: gate creation doesn't panic
+    }
+
+    #[test]
+    fn notification_config_missing_section_uses_defaults() {
+        // Config with no [notifications] section
+        let toml_str = r#"
+[general]
+log_level = "debug"
+"#;
+        let config: Config = toml::from_str(toml_str).expect("parse");
+        assert!(config.notifications.enabled);
+        assert_eq!(config.notifications.cooldown_ms, 30_000);
+    }
+
+    #[test]
+    fn default_config_serializes_notifications_section() {
+        let config = Config::default();
+        let toml = config.to_toml().expect("Failed to serialize");
+        assert!(toml.contains("[notifications]"));
     }
 }

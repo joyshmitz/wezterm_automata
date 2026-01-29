@@ -33,10 +33,10 @@
 //! }
 //! ```
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -621,6 +621,293 @@ impl Drop for EventSubscriber {
     }
 }
 
+// ---- Event deduplication with occurrence counting ----
+
+/// Tracks per-key dedup state: occurrence count, first and last seen.
+#[derive(Debug, Clone)]
+pub struct DedupeEntry {
+    /// Total occurrences of this event key
+    pub count: u64,
+    /// When the first occurrence was seen
+    pub first_seen: Instant,
+    /// When the most recent occurrence was seen
+    pub last_seen: Instant,
+}
+
+/// Result of checking an event against the deduplicator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DedupeVerdict {
+    /// First occurrence of this event key (or re-emerged after expiry).
+    New,
+    /// Duplicate within the dedup window. `suppressed_count` is how many
+    /// duplicates have been suppressed since the first/re-emerged occurrence.
+    Duplicate { suppressed_count: u64 },
+}
+
+/// Event deduplicator with occurrence counting and bounded capacity.
+///
+/// Collapses repeated identical events within a configurable time window.
+/// Unlike `DetectionContext::mark_seen()`, this tracks how many duplicates
+/// were suppressed and exposes first/last seen timestamps.
+#[derive(Debug, Clone)]
+pub struct EventDeduplicator {
+    entries: HashMap<String, DedupeEntry>,
+    insertion_order: VecDeque<String>,
+    window: Duration,
+    max_capacity: usize,
+}
+
+impl EventDeduplicator {
+    /// Default dedup window: 5 minutes
+    pub const DEFAULT_WINDOW: Duration = Duration::from_secs(5 * 60);
+    /// Default maximum tracked keys
+    pub const DEFAULT_MAX_CAPACITY: usize = 2000;
+
+    /// Create a deduplicator with default settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            window: Self::DEFAULT_WINDOW,
+            max_capacity: Self::DEFAULT_MAX_CAPACITY,
+        }
+    }
+
+    /// Create a deduplicator with a custom window and capacity.
+    #[must_use]
+    pub fn with_config(window: Duration, max_capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            window,
+            max_capacity,
+        }
+    }
+
+    /// Check and record an event. Returns whether it's new or a duplicate.
+    pub fn check(&mut self, key: &str) -> DedupeVerdict {
+        let now = Instant::now();
+
+        if let Some(entry) = self.entries.get_mut(key) {
+            if now.duration_since(entry.last_seen) < self.window {
+                // Within window: duplicate
+                entry.count += 1;
+                entry.last_seen = now;
+                return DedupeVerdict::Duplicate {
+                    suppressed_count: entry.count - 1,
+                };
+            }
+            // Window expired: reset as new occurrence
+            entry.count = 1;
+            entry.first_seen = now;
+            entry.last_seen = now;
+            return DedupeVerdict::New;
+        }
+
+        // Never seen: evict oldest if at capacity
+        if self.entries.len() >= self.max_capacity {
+            if let Some(oldest_key) = self.insertion_order.pop_front() {
+                self.entries.remove(&oldest_key);
+            }
+        }
+
+        self.entries.insert(
+            key.to_string(),
+            DedupeEntry {
+                count: 1,
+                first_seen: now,
+                last_seen: now,
+            },
+        );
+        self.insertion_order.push_back(key.to_string());
+        DedupeVerdict::New
+    }
+
+    /// Get the current entry for a key, if tracked and within the window.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&DedupeEntry> {
+        let entry = self.entries.get(key)?;
+        if Instant::now().duration_since(entry.last_seen) < self.window {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    /// Get the suppressed count for a key (0 if not tracked or expired).
+    #[must_use]
+    pub fn suppressed_count(&self, key: &str) -> u64 {
+        self.get(key)
+            .map(|e| e.count.saturating_sub(1))
+            .unwrap_or(0)
+    }
+
+    /// Number of tracked keys (including expired ones not yet evicted).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the deduplicator has no tracked keys.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Remove all tracked entries.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.insertion_order.clear();
+    }
+}
+
+impl Default for EventDeduplicator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---- Notification cooldown ----
+
+/// Tracks per-key notification cooldown state.
+#[derive(Debug, Clone)]
+pub struct CooldownEntry {
+    /// When the last notification was sent
+    pub last_notified: Instant,
+    /// Events suppressed since the last notification
+    pub suppressed_since_notify: u64,
+}
+
+/// Result of checking whether a notification should be sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CooldownVerdict {
+    /// Send the notification. `suppressed_since_last` is how many were
+    /// suppressed since the previous notification (0 for the first).
+    Send { suppressed_since_last: u64 },
+    /// Suppress this notification (cooldown still active).
+    Suppress { total_suppressed: u64 },
+}
+
+/// Notification cooldown tracker.
+///
+/// Prevents repeated notifications for the same event key within a
+/// configurable cooldown period. When the cooldown expires, the next
+/// occurrence sends a notification that includes the suppressed count.
+#[derive(Debug, Clone)]
+pub struct NotificationCooldown {
+    entries: HashMap<String, CooldownEntry>,
+    insertion_order: VecDeque<String>,
+    cooldown: Duration,
+    max_capacity: usize,
+}
+
+impl NotificationCooldown {
+    /// Default cooldown: 30 seconds
+    pub const DEFAULT_COOLDOWN: Duration = Duration::from_secs(30);
+    /// Default maximum tracked keys
+    pub const DEFAULT_MAX_CAPACITY: usize = 2000;
+
+    /// Create a cooldown tracker with default settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            cooldown: Self::DEFAULT_COOLDOWN,
+            max_capacity: Self::DEFAULT_MAX_CAPACITY,
+        }
+    }
+
+    /// Create a cooldown tracker with a custom period and capacity.
+    #[must_use]
+    pub fn with_config(cooldown: Duration, max_capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            cooldown,
+            max_capacity,
+        }
+    }
+
+    /// Check whether a notification should be sent for this key.
+    ///
+    /// On `Send`: the caller should send the notification and include
+    /// `suppressed_since_last` in the message so operators know how many
+    /// were collapsed.
+    ///
+    /// On `Suppress`: the caller should skip the notification.
+    pub fn check(&mut self, key: &str) -> CooldownVerdict {
+        let now = Instant::now();
+
+        if let Some(entry) = self.entries.get_mut(key) {
+            if now.duration_since(entry.last_notified) < self.cooldown {
+                // Still in cooldown: suppress
+                entry.suppressed_since_notify += 1;
+                return CooldownVerdict::Suppress {
+                    total_suppressed: entry.suppressed_since_notify,
+                };
+            }
+            // Cooldown expired: send with suppressed count
+            let suppressed = entry.suppressed_since_notify;
+            entry.last_notified = now;
+            entry.suppressed_since_notify = 0;
+            return CooldownVerdict::Send {
+                suppressed_since_last: suppressed,
+            };
+        }
+
+        // First occurrence: evict oldest if at capacity
+        if self.entries.len() >= self.max_capacity {
+            if let Some(oldest_key) = self.insertion_order.pop_front() {
+                self.entries.remove(&oldest_key);
+            }
+        }
+
+        self.entries.insert(
+            key.to_string(),
+            CooldownEntry {
+                last_notified: now,
+                suppressed_since_notify: 0,
+            },
+        );
+        self.insertion_order.push_back(key.to_string());
+        CooldownVerdict::Send {
+            suppressed_since_last: 0,
+        }
+    }
+
+    /// Get the current cooldown entry for a key.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&CooldownEntry> {
+        self.entries.get(key)
+    }
+
+    /// Number of tracked keys.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the cooldown tracker has no tracked keys.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Remove all tracked entries.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.insertion_order.clear();
+    }
+}
+
+impl Default for NotificationCooldown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,5 +1403,262 @@ mod tests {
         assert!(signal_sub.try_recv().is_some());
         // Should NOT be in delta channel
         assert!(delta_sub.try_recv().is_none());
+    }
+
+    // ---- EventDeduplicator tests ----
+
+    #[test]
+    fn dedup_first_occurrence_is_new() {
+        let mut dedup = EventDeduplicator::new();
+        assert_eq!(dedup.check("key-a"), DedupeVerdict::New);
+    }
+
+    #[test]
+    fn dedup_second_occurrence_is_duplicate() {
+        let mut dedup = EventDeduplicator::new();
+        assert_eq!(dedup.check("key-a"), DedupeVerdict::New);
+        assert_eq!(
+            dedup.check("key-a"),
+            DedupeVerdict::Duplicate {
+                suppressed_count: 1
+            }
+        );
+    }
+
+    #[test]
+    fn dedup_counter_increments() {
+        let mut dedup = EventDeduplicator::new();
+        dedup.check("k");
+        dedup.check("k");
+        dedup.check("k");
+        assert_eq!(
+            dedup.check("k"),
+            DedupeVerdict::Duplicate {
+                suppressed_count: 3
+            }
+        );
+    }
+
+    #[test]
+    fn dedup_different_keys_independent() {
+        let mut dedup = EventDeduplicator::new();
+        assert_eq!(dedup.check("a"), DedupeVerdict::New);
+        assert_eq!(dedup.check("b"), DedupeVerdict::New);
+        assert_eq!(
+            dedup.check("a"),
+            DedupeVerdict::Duplicate {
+                suppressed_count: 1
+            }
+        );
+        assert_eq!(
+            dedup.check("b"),
+            DedupeVerdict::Duplicate {
+                suppressed_count: 1
+            }
+        );
+    }
+
+    #[test]
+    fn dedup_expired_key_resets_as_new() {
+        let mut dedup =
+            EventDeduplicator::with_config(Duration::from_millis(10), 100);
+        dedup.check("key");
+        dedup.check("key"); // suppressed_count=1
+        std::thread::sleep(Duration::from_millis(20));
+        // After expiry, treated as new
+        assert_eq!(dedup.check("key"), DedupeVerdict::New);
+    }
+
+    #[test]
+    fn dedup_suppressed_count_query() {
+        let mut dedup = EventDeduplicator::new();
+        assert_eq!(dedup.suppressed_count("nope"), 0);
+        dedup.check("k");
+        assert_eq!(dedup.suppressed_count("k"), 0);
+        dedup.check("k");
+        assert_eq!(dedup.suppressed_count("k"), 1);
+        dedup.check("k");
+        assert_eq!(dedup.suppressed_count("k"), 2);
+    }
+
+    #[test]
+    fn dedup_capacity_eviction() {
+        let mut dedup =
+            EventDeduplicator::with_config(Duration::from_secs(300), 3);
+        dedup.check("a");
+        dedup.check("b");
+        dedup.check("c");
+        assert_eq!(dedup.len(), 3);
+        // Adding a 4th evicts the oldest
+        dedup.check("d");
+        assert_eq!(dedup.len(), 3);
+        // "a" was evicted, should be treated as new
+        assert_eq!(dedup.check("a"), DedupeVerdict::New);
+    }
+
+    #[test]
+    fn dedup_entry_timestamps() {
+        let mut dedup = EventDeduplicator::new();
+        dedup.check("k");
+        let entry = dedup.get("k").unwrap();
+        assert_eq!(entry.count, 1);
+        let first = entry.first_seen;
+        let last = entry.last_seen;
+        assert!(last >= first);
+
+        std::thread::sleep(Duration::from_millis(5));
+        dedup.check("k");
+        let entry = dedup.get("k").unwrap();
+        assert_eq!(entry.count, 2);
+        assert_eq!(entry.first_seen, first);
+        assert!(entry.last_seen > last);
+    }
+
+    #[test]
+    fn dedup_clear_resets() {
+        let mut dedup = EventDeduplicator::new();
+        dedup.check("a");
+        dedup.check("b");
+        assert_eq!(dedup.len(), 2);
+        dedup.clear();
+        assert!(dedup.is_empty());
+        assert_eq!(dedup.check("a"), DedupeVerdict::New);
+    }
+
+    // ---- NotificationCooldown tests ----
+
+    #[test]
+    fn cooldown_first_occurrence_sends() {
+        let mut cd = NotificationCooldown::new();
+        assert_eq!(
+            cd.check("key"),
+            CooldownVerdict::Send {
+                suppressed_since_last: 0
+            }
+        );
+    }
+
+    #[test]
+    fn cooldown_within_period_suppresses() {
+        let mut cd = NotificationCooldown::new();
+        cd.check("key");
+        assert_eq!(
+            cd.check("key"),
+            CooldownVerdict::Suppress {
+                total_suppressed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn cooldown_suppressed_count_increments() {
+        let mut cd = NotificationCooldown::new();
+        cd.check("k");
+        cd.check("k");
+        cd.check("k");
+        assert_eq!(
+            cd.check("k"),
+            CooldownVerdict::Suppress {
+                total_suppressed: 3
+            }
+        );
+    }
+
+    #[test]
+    fn cooldown_expired_sends_with_suppressed_count() {
+        let mut cd = NotificationCooldown::with_config(
+            Duration::from_millis(10),
+            100,
+        );
+        cd.check("k"); // Send(0)
+        cd.check("k"); // Suppress(1)
+        cd.check("k"); // Suppress(2)
+        std::thread::sleep(Duration::from_millis(20));
+        // After cooldown expires, sends with suppressed count
+        assert_eq!(
+            cd.check("k"),
+            CooldownVerdict::Send {
+                suppressed_since_last: 2
+            }
+        );
+    }
+
+    #[test]
+    fn cooldown_reset_after_send() {
+        let mut cd = NotificationCooldown::with_config(
+            Duration::from_millis(10),
+            100,
+        );
+        cd.check("k");
+        cd.check("k"); // Suppress(1)
+        std::thread::sleep(Duration::from_millis(20));
+        cd.check("k"); // Send(1) - resets counter
+        // Now within cooldown again, suppressed count starts fresh
+        assert_eq!(
+            cd.check("k"),
+            CooldownVerdict::Suppress {
+                total_suppressed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn cooldown_different_keys_independent() {
+        let mut cd = NotificationCooldown::new();
+        assert_eq!(
+            cd.check("a"),
+            CooldownVerdict::Send {
+                suppressed_since_last: 0
+            }
+        );
+        assert_eq!(
+            cd.check("b"),
+            CooldownVerdict::Send {
+                suppressed_since_last: 0
+            }
+        );
+        assert_eq!(
+            cd.check("a"),
+            CooldownVerdict::Suppress {
+                total_suppressed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn cooldown_capacity_eviction() {
+        let mut cd = NotificationCooldown::with_config(
+            Duration::from_secs(300),
+            3,
+        );
+        cd.check("a");
+        cd.check("b");
+        cd.check("c");
+        assert_eq!(cd.len(), 3);
+        cd.check("d"); // evicts "a"
+        assert_eq!(cd.len(), 3);
+        // "a" was evicted, treated as new
+        assert_eq!(
+            cd.check("a"),
+            CooldownVerdict::Send {
+                suppressed_since_last: 0
+            }
+        );
+    }
+
+    #[test]
+    fn cooldown_clear_resets() {
+        let mut cd = NotificationCooldown::new();
+        cd.check("a");
+        cd.check("b");
+        assert_eq!(cd.len(), 2);
+        cd.clear();
+        assert!(cd.is_empty());
+        assert_eq!(
+            cd.check("a"),
+            CooldownVerdict::Send {
+                suppressed_since_last: 0
+            }
+        );
     }
 }

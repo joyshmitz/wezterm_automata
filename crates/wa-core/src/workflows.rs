@@ -5645,6 +5645,309 @@ impl Workflow for HandleSessionEnd {
     }
 }
 
+// ============================================================================
+// HandleAuthRequired — centralize auth recovery (wa-nu4.2.2.4)
+// ============================================================================
+
+/// Default cooldown window in milliseconds (5 minutes).
+/// Auth events within this window for the same pane are suppressed.
+const AUTH_COOLDOWN_MS: i64 = 5 * 60 * 1000;
+
+/// Recovery strategy for an auth-required event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "strategy")]
+pub enum AuthRecoveryStrategy {
+    /// Device code auth: user must enter code in browser.
+    DeviceCode {
+        code: Option<String>,
+        url: Option<String>,
+    },
+    /// API key error: environment variable needs fixing.
+    ApiKeyError {
+        key_hint: Option<String>,
+    },
+    /// Generic auth prompt requiring manual intervention.
+    ManualIntervention {
+        agent_type: String,
+        hint: String,
+    },
+}
+
+impl AuthRecoveryStrategy {
+    /// Determine recovery strategy from a detection trigger.
+    pub fn from_detection(trigger: &serde_json::Value) -> Self {
+        let event_type = trigger
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let rule_id = trigger
+            .get("rule_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let extracted = trigger.get("extracted");
+        let agent_type = trigger
+            .get("agent_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        if event_type == "auth.device_code" || rule_id.contains("device_code") {
+            let code = extracted
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let url = extracted
+                .and_then(|e| e.get("url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            AuthRecoveryStrategy::DeviceCode { code, url }
+        } else if event_type == "auth.error" || rule_id.contains("api_key") {
+            let key_hint = extracted
+                .and_then(|e| e.get("key_name"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            AuthRecoveryStrategy::ApiKeyError { key_hint }
+        } else {
+            AuthRecoveryStrategy::ManualIntervention {
+                agent_type: agent_type.to_string(),
+                hint: format!("Auth required for {agent_type}; manual login may be needed"),
+            }
+        }
+    }
+
+    /// Human-readable label for the strategy.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::DeviceCode { .. } => "device_code",
+            Self::ApiKeyError { .. } => "api_key_error",
+            Self::ManualIntervention { .. } => "manual_intervention",
+        }
+    }
+}
+
+/// Centralize auth-required events into a single workflow that selects the
+/// correct recovery strategy, records the outcome, and avoids spamming.
+pub struct HandleAuthRequired {
+    cooldown_ms: i64,
+}
+
+impl HandleAuthRequired {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            cooldown_ms: AUTH_COOLDOWN_MS,
+        }
+    }
+
+    /// Create with a custom cooldown (useful for testing or configuration).
+    #[allow(dead_code)]
+    pub fn with_cooldown_ms(cooldown_ms: i64) -> Self {
+        Self { cooldown_ms }
+    }
+}
+
+impl Default for HandleAuthRequired {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Workflow for HandleAuthRequired {
+    fn name(&self) -> &'static str {
+        "handle_auth_required"
+    }
+
+    fn description(&self) -> &'static str {
+        "Centralize auth-required events with strategy selection and cooldown"
+    }
+
+    fn handles(&self, detection: &crate::patterns::Detection) -> bool {
+        matches!(
+            detection.event_type.as_str(),
+            "auth.device_code" | "auth.error"
+        )
+    }
+
+    fn trigger_event_types(&self) -> &'static [&'static str] {
+        &["auth.device_code", "auth.error"]
+    }
+
+    fn supported_agent_types(&self) -> &'static [&'static str] {
+        &["codex", "claude_code", "gemini"]
+    }
+
+    fn requires_pane(&self) -> bool {
+        true
+    }
+
+    fn requires_approval(&self) -> bool {
+        false
+    }
+
+    fn is_destructive(&self) -> bool {
+        false
+    }
+
+    fn steps(&self) -> Vec<WorkflowStep> {
+        vec![
+            WorkflowStep::new("check_cooldown", "Skip if auth was recently handled for this pane"),
+            WorkflowStep::new("classify_auth", "Determine auth type and recovery strategy"),
+            WorkflowStep::new("record_and_plan", "Record auth event and produce recovery plan"),
+        ]
+    }
+
+    fn execute_step(
+        &self,
+        ctx: &mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'_, StepResult> {
+        let pane_id = ctx.pane_id();
+        let storage = ctx.storage().clone();
+        let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
+        let execution_id = ctx.execution_id().to_string();
+        let cooldown_ms = self.cooldown_ms;
+
+        Box::pin(async move {
+            match step_idx {
+                // Step 0: Check cooldown — query audit log for recent auth events
+                0 => {
+                    let since = now_ms() - cooldown_ms;
+                    let query = crate::storage::AuditQuery {
+                        pane_id: Some(pane_id),
+                        action_kind: Some("auth_required".to_string()),
+                        since: Some(since),
+                        limit: Some(1),
+                        ..Default::default()
+                    };
+
+                    match storage.get_audit_actions(query).await {
+                        Ok(recent) if !recent.is_empty() => {
+                            tracing::info!(
+                                pane_id,
+                                last_auth_ts = recent[0].ts,
+                                "handle_auth_required: within cooldown, skipping"
+                            );
+                            StepResult::done(serde_json::json!({
+                                "status": "cooldown_skipped",
+                                "pane_id": pane_id,
+                                "last_auth_ts": recent[0].ts,
+                            }))
+                        }
+                        Ok(_) => {
+                            tracing::debug!(
+                                pane_id,
+                                "handle_auth_required: no recent auth events, proceeding"
+                            );
+                            StepResult::cont()
+                        }
+                        Err(e) => {
+                            // Non-fatal: if we can't check cooldown, proceed anyway
+                            tracing::warn!(
+                                pane_id,
+                                error = %e,
+                                "handle_auth_required: cooldown check failed, proceeding"
+                            );
+                            StepResult::cont()
+                        }
+                    }
+                }
+
+                // Step 1: Classify the auth event
+                1 => {
+                    if trigger.is_null() {
+                        return StepResult::abort("No trigger detection available");
+                    }
+
+                    let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let event_type = trigger
+                        .get("event_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+
+                    tracing::info!(
+                        pane_id,
+                        agent_type,
+                        event_type,
+                        strategy = strategy.label(),
+                        "handle_auth_required: classified auth event"
+                    );
+
+                    StepResult::cont()
+                }
+
+                // Step 2: Record audit event and produce recovery plan
+                2 => {
+                    let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+                    let strategy_json = serde_json::to_value(&strategy).unwrap_or_default();
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let rule_id = trigger
+                        .get("rule_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    // Record the auth event in the audit log
+                    let audit = crate::storage::AuditActionRecord {
+                        id: 0,
+                        ts: now_ms(),
+                        actor_kind: "workflow".to_string(),
+                        actor_id: Some(execution_id.clone()),
+                        pane_id: Some(pane_id),
+                        domain: None,
+                        action_kind: "auth_required".to_string(),
+                        policy_decision: "allow".to_string(),
+                        decision_reason: None,
+                        rule_id,
+                        input_summary: Some(format!(
+                            "Auth required for {agent_type}: {}",
+                            strategy.label()
+                        )),
+                        verification_summary: None,
+                        decision_context: Some(
+                            serde_json::to_string(&strategy_json).unwrap_or_default(),
+                        ),
+                        result: "recorded".to_string(),
+                    };
+
+                    match storage.record_audit_action(audit).await {
+                        Ok(audit_id) => {
+                            tracing::info!(
+                                pane_id,
+                                audit_id,
+                                strategy = strategy.label(),
+                                "handle_auth_required: recorded auth event"
+                            );
+
+                            StepResult::done(serde_json::json!({
+                                "status": "recorded",
+                                "pane_id": pane_id,
+                                "agent_type": agent_type,
+                                "strategy": strategy_json,
+                                "audit_id": audit_id,
+                            }))
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                pane_id,
+                                error = %e,
+                                "handle_auth_required: failed to record auth event"
+                            );
+                            StepResult::abort(format!("Failed to record auth event: {e}"))
+                        }
+                    }
+                }
+
+                _ => StepResult::abort("Unexpected step"),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9933,5 +10236,287 @@ Try again at 3:00 PM UTC.
         assert_eq!(session.output_tokens, Some(2000));
         assert!(session.ended_at.is_some());
         assert_eq!(session.end_reason.as_deref(), Some("completed"));
+    }
+
+    // ========================================================================
+    // HandleAuthRequired Tests (wa-nu4.2.2.4)
+    // ========================================================================
+
+    #[test]
+    fn handle_auth_required_metadata() {
+        let wf = HandleAuthRequired::new();
+        assert_eq!(wf.name(), "handle_auth_required");
+        assert!(!wf.description().is_empty());
+        assert_eq!(wf.steps().len(), 3);
+        assert_eq!(wf.steps()[0].name, "check_cooldown");
+        assert_eq!(wf.steps()[1].name, "classify_auth");
+        assert_eq!(wf.steps()[2].name, "record_and_plan");
+    }
+
+    #[test]
+    fn handle_auth_required_handles_device_code() {
+        let wf = HandleAuthRequired::new();
+        let detection = Detection {
+            rule_id: "codex.auth.device_code_prompt".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "auth.device_code".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: Default::default(),
+            matched_text: "Enter code".to_string(),
+            span: (0, 10),
+        };
+        assert!(wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_auth_required_handles_auth_error() {
+        let wf = HandleAuthRequired::new();
+        let detection = Detection {
+            rule_id: "claude_code.auth.api_key_error".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "auth.error".to_string(),
+            severity: Severity::Critical,
+            confidence: 1.0,
+            extracted: Default::default(),
+            matched_text: "API key invalid".to_string(),
+            span: (0, 15),
+        };
+        assert!(wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_auth_required_ignores_session_events() {
+        let wf = HandleAuthRequired::new();
+        let detection = Detection {
+            rule_id: "codex.session.token_usage".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "session.summary".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: Default::default(),
+            matched_text: "Token usage".to_string(),
+            span: (0, 11),
+        };
+        assert!(!wf.handles(&detection));
+    }
+
+    #[test]
+    fn auth_strategy_device_code_from_detection() {
+        let trigger = serde_json::json!({
+            "agent_type": "codex",
+            "event_type": "auth.device_code",
+            "rule_id": "codex.auth.device_code_prompt",
+            "extracted": {
+                "code": "ABCD-12345",
+            }
+        });
+        let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+        assert_eq!(strategy.label(), "device_code");
+        match &strategy {
+            AuthRecoveryStrategy::DeviceCode { code, url } => {
+                assert_eq!(code.as_deref(), Some("ABCD-12345"));
+                assert!(url.is_none());
+            }
+            _ => panic!("Expected DeviceCode strategy"),
+        }
+    }
+
+    #[test]
+    fn auth_strategy_api_key_error_from_detection() {
+        let trigger = serde_json::json!({
+            "agent_type": "claude_code",
+            "event_type": "auth.error",
+            "rule_id": "claude_code.auth.api_key_error",
+            "extracted": {}
+        });
+        let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+        assert_eq!(strategy.label(), "api_key_error");
+    }
+
+    #[test]
+    fn auth_strategy_manual_intervention_fallback() {
+        let trigger = serde_json::json!({
+            "agent_type": "gemini",
+            "event_type": "auth.unknown",
+            "rule_id": "gemini.auth.something",
+            "extracted": {}
+        });
+        let strategy = AuthRecoveryStrategy::from_detection(&trigger);
+        assert_eq!(strategy.label(), "manual_intervention");
+        match &strategy {
+            AuthRecoveryStrategy::ManualIntervention { agent_type, hint } => {
+                assert_eq!(agent_type, "gemini");
+                assert!(hint.contains("gemini"));
+            }
+            _ => panic!("Expected ManualIntervention strategy"),
+        }
+    }
+
+    #[test]
+    fn handle_auth_required_trigger_event_types() {
+        let wf = HandleAuthRequired::new();
+        let types = wf.trigger_event_types();
+        assert!(types.contains(&"auth.device_code"));
+        assert!(types.contains(&"auth.error"));
+    }
+
+    #[test]
+    fn handle_auth_required_supported_agents() {
+        let wf = HandleAuthRequired::new();
+        let agents = wf.supported_agent_types();
+        assert!(agents.contains(&"codex"));
+        assert!(agents.contains(&"claude_code"));
+        assert!(agents.contains(&"gemini"));
+    }
+
+    #[test]
+    fn handle_auth_required_not_destructive() {
+        let wf = HandleAuthRequired::new();
+        assert!(!wf.is_destructive());
+        assert!(!wf.requires_approval());
+        assert!(wf.requires_pane());
+    }
+
+    #[test]
+    fn auth_strategy_serializes() {
+        let strategy = AuthRecoveryStrategy::DeviceCode {
+            code: Some("ABCD-12345".to_string()),
+            url: Some("https://auth.openai.com/device".to_string()),
+        };
+        let json = serde_json::to_value(&strategy).unwrap();
+        assert_eq!(json["strategy"], "DeviceCode");
+        assert_eq!(json["code"], "ABCD-12345");
+        assert_eq!(json["url"], "https://auth.openai.com/device");
+    }
+
+    #[tokio::test]
+    async fn handle_auth_required_audit_roundtrip() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::SeqCst);
+        let db_path = std::env::temp_dir().join(format!(
+            "wa_test_auth_req_{}_{n}.db",
+            std::process::id()
+        ));
+        let db = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .expect("temp DB");
+
+        // Insert pane record
+        let pane = crate::storage::PaneRecord {
+            pane_id: 88,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: None,
+            cwd: None,
+            tty_name: None,
+            first_seen_at: now_ms(),
+            last_seen_at: now_ms(),
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        db.upsert_pane(pane).await.expect("insert pane");
+
+        // Record an auth event
+        let audit = crate::storage::AuditActionRecord {
+            id: 0,
+            ts: now_ms(),
+            actor_kind: "workflow".to_string(),
+            actor_id: Some("test-exec-1".to_string()),
+            pane_id: Some(88),
+            domain: None,
+            action_kind: "auth_required".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: Some("codex.auth.device_code_prompt".to_string()),
+            input_summary: Some("Auth required for codex: device_code".to_string()),
+            verification_summary: None,
+            decision_context: None,
+            result: "recorded".to_string(),
+        };
+        let audit_id = db.record_audit_action(audit).await.expect("record");
+        assert!(audit_id > 0);
+
+        // Query back
+        let query = crate::storage::AuditQuery {
+            pane_id: Some(88),
+            action_kind: Some("auth_required".to_string()),
+            limit: Some(10),
+            ..Default::default()
+        };
+        let results = db.get_audit_actions(query).await.expect("query");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].action_kind, "auth_required");
+        assert_eq!(results[0].pane_id, Some(88));
+    }
+
+    #[tokio::test]
+    async fn handle_auth_required_cooldown_blocks_repeat() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR2: AtomicU64 = AtomicU64::new(0);
+        let n = CTR2.fetch_add(1, Ordering::SeqCst);
+        let db_path = std::env::temp_dir().join(format!(
+            "wa_test_auth_cooldown_{}_{n}.db",
+            std::process::id()
+        ));
+        let db = crate::storage::StorageHandle::new(&db_path.to_string_lossy())
+            .await
+            .expect("temp DB");
+
+        // Insert pane
+        let pane = crate::storage::PaneRecord {
+            pane_id: 89,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: None,
+            cwd: None,
+            tty_name: None,
+            first_seen_at: now_ms(),
+            last_seen_at: now_ms(),
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        };
+        db.upsert_pane(pane).await.expect("insert pane");
+
+        // Insert a recent auth event (within cooldown)
+        let audit = crate::storage::AuditActionRecord {
+            id: 0,
+            ts: now_ms(), // Just now
+            actor_kind: "workflow".to_string(),
+            actor_id: Some("test-exec-2".to_string()),
+            pane_id: Some(89),
+            domain: None,
+            action_kind: "auth_required".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: None,
+            rule_id: None,
+            input_summary: None,
+            verification_summary: None,
+            decision_context: None,
+            result: "recorded".to_string(),
+        };
+        db.record_audit_action(audit).await.expect("record");
+
+        // Now check cooldown: query for recent auth events within default window
+        let since = now_ms() - AUTH_COOLDOWN_MS;
+        let query = crate::storage::AuditQuery {
+            pane_id: Some(89),
+            action_kind: Some("auth_required".to_string()),
+            since: Some(since),
+            limit: Some(1),
+            ..Default::default()
+        };
+        let results = db.get_audit_actions(query).await.expect("query");
+        assert!(
+            !results.is_empty(),
+            "Should find recent auth event within cooldown window"
+        );
     }
 }

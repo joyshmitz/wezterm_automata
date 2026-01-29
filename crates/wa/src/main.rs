@@ -3716,7 +3716,8 @@ async fn run_watcher(
         workflow_runner.register_workflow(Arc::new(HandleCompaction::default()));
         workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleUsageLimits::new()));
         workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleSessionEnd::new()));
-        tracing::info!("Registered workflows: handle_compaction, handle_usage_limits, handle_session_end");
+        workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleAuthRequired::new()));
+        tracing::info!("Registered workflows: handle_compaction, handle_usage_limits, handle_session_end, handle_auth_required");
 
         // Spawn workflow runner event loop
         let event_bus_clone = Arc::clone(&event_bus);

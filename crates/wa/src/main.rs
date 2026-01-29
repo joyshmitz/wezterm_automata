@@ -837,6 +837,43 @@ enum ConfigCommands {
         #[arg(long)]
         path: Option<String>,
     },
+
+    /// Export configuration to a TOML file
+    Export {
+        /// Output path (default: stdout)
+        #[arg(long, short = 'o')]
+        output: Option<String>,
+
+        /// Output as JSON instead of TOML
+        #[arg(long)]
+        json: bool,
+
+        /// Source config path
+        #[arg(long)]
+        path: Option<String>,
+    },
+
+    /// Import configuration from a TOML file
+    Import {
+        /// Path to the config file to import
+        source: String,
+
+        /// Preview changes without applying
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Replace entire config instead of merging
+        #[arg(long)]
+        replace: bool,
+
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+
+        /// Target config path
+        #[arg(long)]
+        path: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -7151,8 +7188,8 @@ fn handle_fatal_error(err: &anyhow::Error, robot_mode: bool) {
 /// Handle `wa rules` subcommands
 fn handle_rules_command(command: RulesCommands) {
     use wa_core::output::{
-        OutputFormat, RenderContext, RuleDetail, RuleDetailRenderer, RuleListItem,
-        RuleTestMatch, RulesListRenderer, RulesTestRenderer, detect_format,
+        OutputFormat, RenderContext, RuleDetail, RuleDetailRenderer, RuleListItem, RuleTestMatch,
+        RulesListRenderer, RulesTestRenderer, detect_format,
     };
     use wa_core::patterns::{AgentType, PatternEngine};
 
@@ -7499,9 +7536,246 @@ async fn handle_config_command(
             println!("Set {key} = {value}");
             println!("Config file: {}", config_path.display());
         }
+
+        ConfigCommands::Export { output, json, path } => {
+            let config_path = if let Some(p) = path {
+                Some(std::path::PathBuf::from(p))
+            } else {
+                cli_config.map(std::path::PathBuf::from)
+            };
+
+            let config = Config::load_with_overrides(
+                config_path.as_deref(),
+                false,
+                &ConfigOverrides::default(),
+            )?;
+
+            let exported = if json {
+                serde_json::to_string_pretty(&config)?
+            } else {
+                let mut header = String::new();
+                header.push_str("# wa configuration export\n");
+                header.push_str(&format!("# Exported: {}\n", chrono_stub_now()));
+                header.push_str(&format!("# wa version: {}\n\n", wa_core::VERSION));
+
+                let toml_body = config.to_toml()?;
+                format!("{header}{toml_body}")
+            };
+
+            if let Some(out_path) = output {
+                let out = std::path::PathBuf::from(&out_path);
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&out, &exported)?;
+                println!("Exported config to: {out_path}");
+            } else {
+                print!("{exported}");
+            }
+        }
+
+        ConfigCommands::Import {
+            source,
+            dry_run,
+            replace,
+            yes,
+            path,
+        } => {
+            let source_path = std::path::PathBuf::from(&source);
+            if !source_path.exists() {
+                anyhow::bail!("Source config not found: {source}");
+            }
+
+            // Load and validate the incoming config
+            let source_content = std::fs::read_to_string(&source_path)?;
+            let incoming: Config = toml::from_str(&source_content)
+                .map_err(|e| anyhow::anyhow!("Invalid config in {source}: {e}"))?;
+            incoming.validate()?;
+
+            // Resolve target config path
+            let config_path = if let Some(p) = path {
+                std::path::PathBuf::from(p)
+            } else if let Some(p) = cli_config {
+                std::path::PathBuf::from(p)
+            } else {
+                let cwd_config = std::path::PathBuf::from("wa.toml");
+                if cwd_config.exists() {
+                    cwd_config
+                } else {
+                    dirs::config_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+                        .join("wa")
+                        .join("wa.toml")
+                }
+            };
+
+            // Show what would change
+            let existing_toml = if config_path.exists() {
+                std::fs::read_to_string(&config_path)?
+            } else {
+                generate_default_config_toml()
+            };
+            let incoming_toml = incoming.to_toml()?;
+
+            // Compute simple diff summary
+            let diff_lines = compute_config_diff(&existing_toml, &incoming_toml);
+            if diff_lines.is_empty() {
+                println!("No changes detected — configs are equivalent.");
+                return Ok(());
+            }
+
+            let mode_label = if replace { "Replace" } else { "Import" };
+            println!(
+                "{mode_label} preview ({} change{}):",
+                diff_lines.len(),
+                if diff_lines.len() == 1 { "" } else { "s" }
+            );
+            for line in &diff_lines {
+                println!("  {line}");
+            }
+
+            if dry_run {
+                println!("\n(dry run — no changes applied)");
+                return Ok(());
+            }
+
+            if replace && !yes {
+                println!();
+                eprintln!("Warning: --replace will overwrite your entire configuration.");
+                if !prompt_confirm("Continue? [y/N]: ")? {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+
+            // Backup existing config before overwriting
+            if config_path.exists() {
+                let backup = config_path.with_extension("toml.bak");
+                std::fs::copy(&config_path, &backup)?;
+                println!("Backup saved to: {}", backup.display());
+            }
+
+            // Write the new config
+            if let Some(parent) = config_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            if replace {
+                // Full replacement
+                let header = format!(
+                    "# wa configuration (imported)\n# Imported: {}\n# Source: {}\n\n",
+                    chrono_stub_now(),
+                    source,
+                );
+                std::fs::write(&config_path, format!("{header}{incoming_toml}"))?;
+            } else {
+                // Merge: load incoming on top of existing defaults
+                // Parse both as TOML documents and overlay incoming sections
+                let mut existing_doc = existing_toml
+                    .parse::<toml_edit::DocumentMut>()
+                    .map_err(|e| anyhow::anyhow!("Failed to parse existing config: {e}"))?;
+                let incoming_doc = incoming_toml
+                    .parse::<toml_edit::DocumentMut>()
+                    .map_err(|e| anyhow::anyhow!("Failed to parse incoming config: {e}"))?;
+
+                // Overlay all top-level tables from incoming into existing
+                for (key, item) in incoming_doc.iter() {
+                    existing_doc[key] = item.clone();
+                }
+                std::fs::write(&config_path, existing_doc.to_string())?;
+            }
+
+            println!("Config updated: {}", config_path.display());
+        }
     }
 
     Ok(())
+}
+
+/// Stub for timestamp generation (avoids chrono dependency)
+fn chrono_stub_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Basic ISO 8601 approximation
+    let days = secs / 86400;
+    let time = secs % 86400;
+    let hours = time / 3600;
+    let mins = (time % 3600) / 60;
+    let secs_rem = time % 60;
+
+    let mut year: u64 = 1970;
+    let mut rem = days;
+    loop {
+        let ydays = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if rem < ydays {
+            break;
+        }
+        rem -= ydays;
+        year += 1;
+    }
+    let mut month: u64 = 1;
+    loop {
+        let mdays = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            2 => {
+                if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 30,
+        };
+        if rem < mdays {
+            break;
+        }
+        rem -= mdays;
+        month += 1;
+    }
+    let day = rem + 1;
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{mins:02}:{secs_rem:02}Z")
+}
+
+/// Compute a simple line-level diff summary between two TOML strings
+fn compute_config_diff(existing: &str, incoming: &str) -> Vec<String> {
+    let existing_lines: Vec<&str> = existing.lines().collect();
+    let incoming_lines: Vec<&str> = incoming.lines().collect();
+    let mut diffs = Vec::new();
+
+    // Build sets for quick lookup
+    let existing_set: std::collections::HashSet<&str> = existing_lines.iter().copied().collect();
+    let incoming_set: std::collections::HashSet<&str> = incoming_lines.iter().copied().collect();
+
+    // Find added lines (in incoming but not existing), skip comments and blanks
+    for line in &incoming_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !existing_set.contains(line) {
+            diffs.push(format!("+ {trimmed}"));
+        }
+    }
+
+    // Find removed lines (in existing but not incoming), skip comments and blanks
+    for line in &existing_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !incoming_set.contains(line) {
+            diffs.push(format!("- {trimmed}"));
+        }
+    }
+
+    diffs
 }
 
 /// Handle `wa db` subcommands

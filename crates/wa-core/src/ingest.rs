@@ -549,6 +549,27 @@ impl PaneCursor {
         self.in_gap = true;
     }
 
+    /// Emit a synthetic gap due to backpressure overflow.
+    ///
+    /// Called by the tailer when consecutive backpressure events exceed the
+    /// overflow threshold, indicating that capture data was likely lost.
+    /// The gap has empty content because no snapshot was captured during the
+    /// overflow period.
+    pub fn emit_overflow_gap(&mut self, reason: &str) -> CapturedSegment {
+        self.in_gap = true;
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        CapturedSegment {
+            pane_id: self.pane_id,
+            seq,
+            content: String::new(),
+            kind: CapturedSegmentKind::Gap {
+                reason: reason.to_string(),
+            },
+            captured_at: epoch_ms(),
+        }
+    }
+
     /// Alias for `capture_snapshot` for backward compatibility.
     pub fn capture(&mut self, content: &str, overlap_size: usize) -> Option<CapturedSegment> {
         self.capture_snapshot(content, overlap_size, None)
@@ -3068,5 +3089,65 @@ mod tests {
         let uuid4 = reg.get_entry(4).unwrap().pane_uuid.clone();
         assert_ne!(uuid4, uuid1, "new pane gets distinct UUID");
         assert_ne!(uuid4, uuid3, "new pane gets distinct UUID");
+    }
+
+    #[test]
+    fn emit_overflow_gap_creates_gap_segment() {
+        let mut cursor = PaneCursor::new(7);
+        // Advance to seq 3
+        cursor.next_seq = 3;
+
+        let seg = cursor.emit_overflow_gap("backpressure_overflow");
+        assert_eq!(seg.pane_id, 7);
+        assert_eq!(seg.seq, 3);
+        assert_eq!(seg.content, "");
+        assert!(matches!(
+            seg.kind,
+            CapturedSegmentKind::Gap { ref reason } if reason == "backpressure_overflow"
+        ));
+        assert!(seg.captured_at > 0);
+    }
+
+    #[test]
+    fn emit_overflow_gap_advances_seq() {
+        let mut cursor = PaneCursor::new(1);
+        assert_eq!(cursor.next_seq, 0);
+
+        let seg = cursor.emit_overflow_gap("test_overflow");
+        assert_eq!(seg.seq, 0);
+        assert_eq!(cursor.next_seq, 1);
+
+        let seg2 = cursor.emit_overflow_gap("test_overflow_2");
+        assert_eq!(seg2.seq, 1);
+        assert_eq!(cursor.next_seq, 2);
+    }
+
+    #[test]
+    fn emit_overflow_gap_sets_in_gap_flag() {
+        let mut cursor = PaneCursor::new(1);
+        assert!(!cursor.in_gap);
+
+        cursor.emit_overflow_gap("backpressure_overflow");
+        assert!(cursor.in_gap);
+    }
+
+    #[test]
+    fn emit_overflow_gap_then_normal_capture_works() {
+        let mut cursor = PaneCursor::new(1);
+
+        // First: emit overflow gap
+        let gap = cursor.emit_overflow_gap("backpressure_overflow");
+        assert_eq!(gap.seq, 0);
+        assert!(cursor.in_gap);
+
+        // Second: normal capture after gap
+        let seg = cursor
+            .capture_snapshot("hello world\n", 1024, None)
+            .expect("should produce a segment after gap");
+        assert_eq!(seg.seq, 1);
+        // After an overflow gap, the cursor is in_gap state.
+        // The next capture with content change may produce a Delta or Gap
+        // depending on overlap extraction.  Either is valid.
+        assert!(seg.pane_id == 1);
     }
 }

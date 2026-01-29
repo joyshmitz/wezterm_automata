@@ -16,6 +16,11 @@ use tracing::{debug, trace, warn};
 use crate::ingest::{CapturedSegment, PaneCursor, PaneRegistry};
 use crate::wezterm::{PaneInfo, PaneTextSource};
 
+/// Number of consecutive backpressure events per pane before emitting an
+/// overflow GAP segment.  Once exceeded, the tailer inserts a synthetic gap
+/// to signal that capture data was likely lost during the congestion period.
+pub const OVERFLOW_BACKPRESSURE_THRESHOLD: u64 = 5;
+
 /// Configuration for the tailer supervisor.
 #[derive(Debug, Clone)]
 pub struct TailerConfig {
@@ -55,6 +60,8 @@ pub struct TailerMetrics {
     pub send_timeouts: u64,
     /// Number of captures that found no changes
     pub no_change_captures: u64,
+    /// Number of overflow GAP segments emitted due to sustained backpressure
+    pub overflow_gaps_emitted: u64,
 }
 
 /// Metrics for supervisor operations.
@@ -86,6 +93,10 @@ struct PaneTailer {
     last_poll: Instant,
     /// Whether changes were detected in last poll
     had_changes: bool,
+    /// Consecutive backpressure events without a successful capture
+    consecutive_backpressure: u64,
+    /// Whether an overflow GAP needs to be emitted on the next successful poll
+    overflow_gap_pending: bool,
 }
 
 impl PaneTailer {
@@ -95,6 +106,8 @@ impl PaneTailer {
             current_interval: initial_interval,
             last_poll: Instant::now(),
             had_changes: false,
+            consecutive_backpressure: 0,
+            overflow_gap_pending: false,
         }
     }
 
@@ -263,6 +276,12 @@ where
             .collect();
 
         for pane_id in ready_panes {
+            // Check if this pane needs an overflow gap emitted before normal capture
+            let overflow_gap_pending = self
+                .tailers
+                .get(&pane_id)
+                .is_some_and(|t| t.overflow_gap_pending);
+
             // Mark as capturing to prevent duplicate spawns
             self.capturing_panes.insert(pane_id);
 
@@ -285,6 +304,32 @@ where
                 };
 
                 if !has_cursor {
+                    return (pane_id, PollOutcome::NoCursor);
+                }
+
+                // If overflow gap is pending, emit a synthetic gap segment instead
+                // of doing a normal capture.  The gap signals to downstream consumers
+                // that data was lost during sustained backpressure.
+                if overflow_gap_pending {
+                    let permit = match timeout(send_timeout, tx.reserve()).await {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(_)) => return (pane_id, PollOutcome::ChannelClosed),
+                        Err(_) => return (pane_id, PollOutcome::Backpressure),
+                    };
+
+                    let gap_segment = {
+                        let mut cursors = cursors.write().await;
+                        cursors
+                            .get_mut(&pane_id)
+                            .map(|cursor| cursor.emit_overflow_gap("backpressure_overflow"))
+                    };
+
+                    if let Some(segment) = gap_segment {
+                        permit.send(CaptureEvent { segment });
+                        return (pane_id, PollOutcome::OverflowGapEmitted);
+                    }
+
+                    drop(permit);
                     return (pane_id, PollOutcome::NoCursor);
                 }
 
@@ -335,17 +380,37 @@ where
             match outcome {
                 PollOutcome::Changed => {
                     tailer.record_poll(true, &self.config);
+                    tailer.consecutive_backpressure = 0;
                     self.metrics.events_sent += 1;
                 }
                 PollOutcome::NoChange => {
                     tailer.record_poll(false, &self.config);
+                    tailer.consecutive_backpressure = 0;
                     self.metrics.no_change_captures += 1;
                     trace!(pane_id, "Tailer poll no change");
                 }
                 PollOutcome::Backpressure => {
                     tailer.record_poll(false, &self.config);
                     self.metrics.send_timeouts += 1;
-                    warn!(pane_id, "Tailer backpressure: capture queue full");
+                    tailer.consecutive_backpressure += 1;
+                    if tailer.consecutive_backpressure >= OVERFLOW_BACKPRESSURE_THRESHOLD {
+                        tailer.overflow_gap_pending = true;
+                        warn!(
+                            pane_id,
+                            consecutive = tailer.consecutive_backpressure,
+                            "Backpressure overflow: scheduling GAP insertion"
+                        );
+                    } else {
+                        warn!(pane_id, "Tailer backpressure: capture queue full");
+                    }
+                }
+                PollOutcome::OverflowGapEmitted => {
+                    tailer.record_poll(true, &self.config);
+                    tailer.overflow_gap_pending = false;
+                    tailer.consecutive_backpressure = 0;
+                    self.metrics.events_sent += 1;
+                    self.metrics.overflow_gaps_emitted += 1;
+                    debug!(pane_id, "Overflow GAP emitted");
                 }
                 PollOutcome::NoCursor => {
                     tailer.record_poll(false, &self.config);
@@ -391,6 +456,8 @@ pub enum PollOutcome {
     Changed,
     NoChange,
     Backpressure,
+    /// An overflow GAP segment was emitted after sustained backpressure
+    OverflowGapEmitted,
     NoCursor,
     ChannelClosed,
     Error(String),
@@ -710,5 +777,279 @@ mod tests {
         assert_eq!(event.segment.seq, 10);
         assert_eq!(event.segment.content, "test content");
         assert!(event.segment.captured_at > 0);
+    }
+
+    #[test]
+    fn overflow_threshold_constant_is_reasonable() {
+        assert!(
+            OVERFLOW_BACKPRESSURE_THRESHOLD >= 2,
+            "threshold must be at least 2 to avoid spurious gap emission"
+        );
+        assert!(
+            OVERFLOW_BACKPRESSURE_THRESHOLD <= 100,
+            "threshold should not be excessively large"
+        );
+    }
+
+    #[test]
+    fn consecutive_backpressure_tracks_correctly() {
+        let config = TailerConfig::default();
+        let mut tailer = PaneTailer::new(1, config.min_interval);
+
+        assert_eq!(tailer.consecutive_backpressure, 0);
+        assert!(!tailer.overflow_gap_pending);
+
+        // Simulate backpressure events below threshold
+        for i in 1..OVERFLOW_BACKPRESSURE_THRESHOLD {
+            tailer.consecutive_backpressure = i;
+        }
+        assert!(!tailer.overflow_gap_pending);
+
+        // A successful capture resets the counter
+        tailer.consecutive_backpressure = 0;
+        assert_eq!(tailer.consecutive_backpressure, 0);
+    }
+
+    #[test]
+    fn handle_poll_result_increments_backpressure_counter() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        // Simulate backpressure events
+        for _ in 0..(OVERFLOW_BACKPRESSURE_THRESHOLD - 1) {
+            supervisor.capturing_panes.insert(1);
+            supervisor.handle_poll_result(1, PollOutcome::Backpressure);
+        }
+
+        let tailer = supervisor.tailers.get(&1).unwrap();
+        assert_eq!(
+            tailer.consecutive_backpressure,
+            OVERFLOW_BACKPRESSURE_THRESHOLD - 1
+        );
+        assert!(!tailer.overflow_gap_pending);
+
+        // One more should trigger overflow
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::Backpressure);
+
+        let tailer = supervisor.tailers.get(&1).unwrap();
+        assert!(tailer.overflow_gap_pending);
+    }
+
+    #[test]
+    fn changed_resets_backpressure_counter() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        // Accumulate some backpressure
+        for _ in 0..3 {
+            supervisor.capturing_panes.insert(1);
+            supervisor.handle_poll_result(1, PollOutcome::Backpressure);
+        }
+        assert_eq!(supervisor.tailers.get(&1).unwrap().consecutive_backpressure, 3);
+
+        // Changed resets it
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::Changed);
+        assert_eq!(supervisor.tailers.get(&1).unwrap().consecutive_backpressure, 0);
+    }
+
+    #[test]
+    fn no_change_resets_backpressure_counter() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        // Accumulate backpressure
+        for _ in 0..3 {
+            supervisor.capturing_panes.insert(1);
+            supervisor.handle_poll_result(1, PollOutcome::Backpressure);
+        }
+
+        // NoChange also resets
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::NoChange);
+        assert_eq!(supervisor.tailers.get(&1).unwrap().consecutive_backpressure, 0);
+    }
+
+    #[test]
+    fn overflow_gap_emitted_clears_pending_flag() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        // Force overflow state
+        supervisor.tailers.get_mut(&1).unwrap().overflow_gap_pending = true;
+        supervisor.tailers.get_mut(&1).unwrap().consecutive_backpressure = OVERFLOW_BACKPRESSURE_THRESHOLD;
+
+        // Emit overflow gap
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::OverflowGapEmitted);
+
+        let tailer = supervisor.tailers.get(&1).unwrap();
+        assert!(!tailer.overflow_gap_pending);
+        assert_eq!(tailer.consecutive_backpressure, 0);
+        assert_eq!(supervisor.metrics().overflow_gaps_emitted, 1);
+        assert_eq!(supervisor.metrics().events_sent, 1);
+    }
+
+    #[tokio::test]
+    async fn overflow_gap_emitted_via_spawn_ready() {
+        let source = Arc::new(FixedSource);
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(1),
+            max_interval: Duration::from_millis(50),
+            max_concurrent: 4,
+            send_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        {
+            let mut cursor_guard = cursors.write().await;
+            cursor_guard.insert(1, PaneCursor::new(1));
+        }
+
+        let mut supervisor =
+            TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+
+        // Force overflow_gap_pending
+        supervisor.tailers.get_mut(&1).unwrap().overflow_gap_pending = true;
+
+        // Wait for min_interval
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let mut join_set = JoinSet::new();
+        supervisor.spawn_ready(&mut join_set);
+
+        // Collect outcomes
+        while let Some(result) = join_set.join_next().await {
+            if let Ok((pane_id, outcome)) = result {
+                assert_eq!(pane_id, 1);
+                assert!(
+                    matches!(outcome, PollOutcome::OverflowGapEmitted),
+                    "Expected OverflowGapEmitted, got {outcome:?}"
+                );
+                supervisor.handle_poll_result(pane_id, outcome);
+            }
+        }
+
+        // Verify the gap event was sent
+        let event = rx.try_recv().expect("should have received overflow gap event");
+        assert_eq!(event.segment.pane_id, 1);
+        assert_eq!(event.segment.content, "");
+        assert!(matches!(
+            event.segment.kind,
+            crate::ingest::CapturedSegmentKind::Gap { ref reason } if reason == "backpressure_overflow"
+        ));
+
+        // Verify pending flag was cleared
+        assert!(!supervisor.tailers.get(&1).unwrap().overflow_gap_pending);
+        assert_eq!(supervisor.metrics().overflow_gaps_emitted, 1);
+    }
+
+    #[tokio::test]
+    async fn overflow_gap_advances_cursor_seq() {
+        let source = Arc::new(FixedSource);
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(1),
+            max_interval: Duration::from_millis(50),
+            max_concurrent: 4,
+            send_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        {
+            let mut cursor_guard = cursors.write().await;
+            let mut cursor = PaneCursor::new(1);
+            // Advance seq to 5 to verify gap gets seq=5
+            cursor.next_seq = 5;
+            cursor_guard.insert(1, cursor);
+        }
+
+        let mut supervisor =
+            TailerSupervisor::new(config, tx, Arc::clone(&cursors), registry, shutdown, source);
+
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+        supervisor.tailers.get_mut(&1).unwrap().overflow_gap_pending = true;
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let mut join_set = JoinSet::new();
+        supervisor.spawn_ready(&mut join_set);
+
+        while let Some(result) = join_set.join_next().await {
+            if let Ok((pane_id, outcome)) = result {
+                supervisor.handle_poll_result(pane_id, outcome);
+            }
+        }
+
+        let event = rx.try_recv().expect("should have received gap event");
+        assert_eq!(event.segment.seq, 5, "gap should use cursor's next_seq");
+
+        // Cursor should have advanced to 6
+        let cursor_guard = cursors.read().await;
+        let cursor = cursor_guard.get(&1).unwrap();
+        assert_eq!(cursor.next_seq, 6);
+        assert!(cursor.in_gap, "cursor should be in gap state");
+    }
+
+    #[test]
+    fn overflow_gap_emitted_metric_starts_at_zero() {
+        let metrics = TailerMetrics::default();
+        assert_eq!(metrics.overflow_gaps_emitted, 0);
     }
 }

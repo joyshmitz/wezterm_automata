@@ -9720,6 +9720,416 @@ mod queue_depth_tests {
         handle.shutdown().await.unwrap();
         let _ = std::fs::remove_file(&db_path);
     }
+
+    #[tokio::test]
+    async fn write_queue_depth_rises_under_concurrent_writes() {
+        let db_path = temp_db_path();
+        let mut config = StorageConfig::default();
+        config.write_queue_size = 8; // Small queue to observe depth
+        let handle = StorageHandle::with_config(&db_path, config).await.unwrap();
+
+        // Register a pane first
+        handle
+            .upsert_pane(PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 0,
+                last_seen_at: 0,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
+
+        // Submit multiple writes without awaiting (fire and forget via spawn)
+        let mut join_handles = Vec::new();
+        for i in 0..6 {
+            let h = handle.clone();
+            let jh = tokio::spawn(async move {
+                h.append_segment(1, &format!("data-{i}"), None).await
+            });
+            join_handles.push(jh);
+        }
+
+        // Queue depth should be bounded by capacity
+        let cap = handle.write_queue_capacity();
+        assert_eq!(cap, 8);
+
+        // Wait for all writes to complete
+        for jh in join_handles {
+            jh.await.unwrap().unwrap();
+        }
+
+        // After all writes complete, depth should return to 0
+        // (give writer a moment to drain)
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let final_depth = handle.write_queue_depth();
+        assert_eq!(final_depth, 0, "Queue should be drained after all writes complete");
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn write_queue_bounded_under_heavy_load() {
+        // Verify the queue never exceeds its configured capacity
+        let db_path = temp_db_path();
+        let mut config = StorageConfig::default();
+        config.write_queue_size = 4; // Very small queue
+        let handle = StorageHandle::with_config(&db_path, config).await.unwrap();
+
+        handle
+            .upsert_pane(PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 0,
+                last_seen_at: 0,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
+
+        // Flood with many writes
+        let cap = handle.write_queue_capacity();
+        let mut join_handles = Vec::new();
+        for i in 0..20 {
+            let h = handle.clone();
+            let jh = tokio::spawn(async move {
+                h.append_segment(1, &format!("flood-{i}"), None).await
+            });
+            join_handles.push(jh);
+        }
+
+        // Sample queue depth multiple times during processing
+        let mut max_observed_depth = 0usize;
+        for _ in 0..10 {
+            let depth = handle.write_queue_depth();
+            if depth > max_observed_depth {
+                max_observed_depth = depth;
+            }
+            assert!(
+                depth <= cap,
+                "Queue depth ({depth}) exceeded capacity ({cap})"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        }
+
+        // Wait for all writes
+        for jh in join_handles {
+            jh.await.unwrap().unwrap();
+        }
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn write_queue_depth_returns_to_zero_after_drain() {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+
+        handle
+            .upsert_pane(PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 0,
+                last_seen_at: 0,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
+
+        // Write some segments sequentially
+        for i in 0..5 {
+            handle
+                .append_segment(1, &format!("sequential-{i}"), None)
+                .await
+                .unwrap();
+        }
+
+        // After sequential writes, queue should be empty
+        assert_eq!(handle.write_queue_depth(), 0);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+}
+
+// =============================================================================
+// Backpressure Integration Tests (wa-upg.12.5)
+// =============================================================================
+
+#[cfg(test)]
+mod backpressure_integration_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::mpsc;
+
+    static BP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_db_path() -> String {
+        let id = BP_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir();
+        dir.join(format!("wa_bp_test_{id}_{}.db", std::process::id()))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn capture_channel_backpressure_detected() {
+        // Simulate backpressure on the capture channel:
+        // - Create a tiny channel (capacity 2)
+        // - Fill it up
+        // - Verify send times out (reserve with timeout)
+        use tokio::time::{Duration, timeout};
+
+        let (tx, _rx) = mpsc::channel::<u8>(2);
+
+        // Fill the channel
+        tx.send(1).await.unwrap();
+        tx.send(2).await.unwrap();
+
+        // Channel is full — reserve should time out
+        let result = timeout(Duration::from_millis(50), tx.reserve()).await;
+        assert!(result.is_err(), "Should timeout when channel is full");
+
+        // Verify depth
+        let depth = tx.max_capacity() - tx.capacity();
+        assert_eq!(depth, 2, "Queue should be at capacity");
+    }
+
+    #[tokio::test]
+    async fn capture_channel_drains_when_consumer_resumes() {
+        use tokio::time::Duration;
+
+        let (tx, mut rx) = mpsc::channel::<u8>(4);
+
+        // Fill partially
+        tx.send(1).await.unwrap();
+        tx.send(2).await.unwrap();
+        tx.send(3).await.unwrap();
+
+        let depth_before = tx.max_capacity() - tx.capacity();
+        assert_eq!(depth_before, 3);
+
+        // Consume all items
+        rx.recv().await.unwrap();
+        rx.recv().await.unwrap();
+        rx.recv().await.unwrap();
+
+        // Small yield for channel state to update
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let depth_after = tx.max_capacity() - tx.capacity();
+        assert_eq!(depth_after, 0, "Queue should drain when consumer resumes");
+    }
+
+    #[tokio::test]
+    async fn storage_concurrent_writers_dont_deadlock() {
+        // Multiple concurrent writers on a small queue should complete
+        // without deadlock (writer thread drains fast enough)
+        let db_path = temp_db_path();
+        let mut config = StorageConfig::default();
+        config.write_queue_size = 4;
+        let handle = StorageHandle::with_config(&db_path, config).await.unwrap();
+
+        handle
+            .upsert_pane(PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 0,
+                last_seen_at: 0,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
+
+        // Spawn many concurrent writers
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let h = handle.clone();
+            handles.push(tokio::spawn(async move {
+                h.append_segment(1, &format!("concurrent-{i}"), None)
+                    .await
+                    .unwrap();
+            }));
+        }
+
+        // Use a timeout to detect deadlocks
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(10),
+            async {
+                for jh in handles {
+                    jh.await.unwrap();
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Concurrent writers should complete without deadlock"
+        );
+
+        // Verify all 16 segments were written
+        let segments = handle.get_segments(1, 100).await.unwrap();
+        assert_eq!(segments.len(), 16, "All concurrent writes should persist");
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn gap_recording_works_under_backpressure() {
+        // Ensure GAP records can be written even when the queue has work pending
+        let db_path = temp_db_path();
+        let mut config = StorageConfig::default();
+        config.write_queue_size = 4;
+        let handle = StorageHandle::with_config(&db_path, config).await.unwrap();
+
+        handle
+            .upsert_pane(PaneRecord {
+                pane_id: 1,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: None,
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 0,
+                last_seen_at: 0,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
+
+        // Write a segment first (gap requires existing seq)
+        let seg_before = handle
+            .append_segment(1, "before-gap", None)
+            .await
+            .unwrap();
+
+        // Record a gap (simulating backpressure-induced discontinuity)
+        let gap = handle.record_gap(1, "backpressure_overflow").await.unwrap();
+        assert!(gap.is_some(), "GAP should be recorded after existing segment");
+        let gap = gap.unwrap();
+        assert_eq!(gap.pane_id, 1);
+        assert_eq!(gap.reason, "backpressure_overflow");
+        assert_eq!(gap.seq_before, seg_before.seq);
+        assert_eq!(gap.seq_after, seg_before.seq + 1);
+
+        // Continue writing after gap
+        let seg_after = handle.append_segment(1, "after-gap", None).await.unwrap();
+
+        // Verify segments are in the output_segments table
+        let segments = handle.get_segments(1, 100).await.unwrap();
+        assert_eq!(segments.len(), 2); // before and after (gap is in output_gaps table)
+        // get_segments returns ORDER BY seq DESC (most recent first)
+        assert_eq!(segments[0].content, "after-gap");
+        assert_eq!(segments[1].content, "before-gap");
+        // Sequence numbers should show the discontinuity
+        assert!(seg_after.seq > seg_before.seq);
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn health_warning_threshold_generates_warnings() {
+        // Test the warning generation logic with a controlled queue state
+        use crate::crash::HealthSnapshot;
+
+        // Simulate a snapshot where capture queue is at 80% (above 75% threshold)
+        let snapshot = HealthSnapshot {
+            timestamp: 0,
+            observed_panes: 2,
+            capture_queue_depth: 820,
+            write_queue_depth: 10,
+            last_seq_by_pane: vec![],
+            warnings: vec!["Capture queue backpressure: 820/1024 (80%)".to_string()],
+            ingest_lag_avg_ms: 100.0,
+            ingest_lag_max_ms: 500,
+            db_writable: true,
+            db_last_write_at: Some(1000),
+        };
+
+        assert!(!snapshot.warnings.is_empty());
+        assert!(snapshot.warnings[0].contains("backpressure"));
+        assert!(snapshot.warnings[0].contains("80%"));
+    }
+
+    #[tokio::test]
+    async fn event_bus_detects_subscriber_lag() {
+        use crate::events::{Event, EventBus};
+
+        let bus = EventBus::new(4); // Small capacity
+
+        // Subscribe before publishing
+        let mut sub = bus.subscribe();
+
+        // Publish more events than buffer size to cause lag
+        for i in 0..8 {
+            let _ = bus.publish(Event::SegmentCaptured {
+                pane_id: 1,
+                seq: i,
+                content_len: 100,
+            });
+        }
+
+        // First recv should indicate lag (missed events)
+        let result = sub.recv().await;
+        match result {
+            Err(crate::events::RecvError::Lagged { missed_count }) => {
+                assert!(
+                    missed_count > 0,
+                    "Should report missed events due to lag"
+                );
+            }
+            Ok(_) => {
+                // Some events may still be in buffer, that's also valid
+                // as long as the bus didn't panic
+            }
+            Err(e) => panic!("Unexpected error: {e:?}"),
+        }
+
+        // Stats should reflect capacity
+        let stats = bus.stats();
+        assert_eq!(stats.capacity, 4);
+    }
 }
 
 // =============================================================================

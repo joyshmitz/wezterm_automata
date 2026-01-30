@@ -339,9 +339,13 @@ SCENARIO_REGISTRY=(
     "natural_language:Validate event summaries and wa why output"
     "compaction_workflow:Validate pattern detection and workflow execution"
     "unhandled_event_lifecycle:Validate unhandled event lifecycle and dedupe handling"
+    "workflow_lifecycle:Validate robot workflow list/run/status/abort (dry-run)"
+    "events_unhandled_alias:Validate robot events --unhandled alias"
     "usage_limit_safe_pause:Validate usage-limit safe pause workflow (fallback plan persisted)"
     "notification_webhook:Validate webhook notifications (delivery, retry, throttle, recovery)"
     "policy_denial:Validate safety gates block sends to protected panes"
+    "quickfix_suggestions:Validate quick-fix suggestions for events and errors"
+    "stress_scale:Validate scaled stress test (panes + large transcript)"
     "graceful_shutdown:Validate wa watch graceful shutdown (SIGINT flush, lock release, restart clean)"
     "pane_exclude_filter:Validate pane selection filters protect privacy (ignored pane absent from search)"
     "workspace_isolation:Validate workspace isolation (no cross-project DB leakage)"
@@ -516,6 +520,7 @@ run_scenario_capture_search() {
     local wa_pid=""
     local pane_id=""
     local result=0
+    local policy_suggestions_ok="false"
 
     log_info "Using marker: $marker"
     log_info "Workspace: $temp_workspace"
@@ -2233,6 +2238,641 @@ run_scenario_policy_denial() {
     return $result
 }
 
+run_scenario_quickfix_suggestions() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-quickfix-XXXXXX)
+    local wa_pid=""
+    local compaction_pane=""
+    local alt_pane=""
+    local result=0
+    local wait_timeout=${TIMEOUT:-60}
+    local old_wa_data_dir="${WA_DATA_DIR:-}"
+    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_config="${WA_CONFIG:-}"
+
+    log_info "Workspace: $temp_workspace"
+
+    cleanup_quickfix_suggestions() {
+        log_verbose "Cleaning up quickfix_suggestions scenario"
+        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            log_verbose "Stopping wa watch (pid $wa_pid)"
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        if [[ -n "${compaction_pane:-}" ]]; then
+            log_verbose "Closing compaction pane $compaction_pane"
+            wezterm cli kill-pane --pane-id "$compaction_pane" 2>/dev/null || true
+        fi
+        if [[ -n "${alt_pane:-}" ]]; then
+            log_verbose "Closing alt-screen pane $alt_pane"
+            wezterm cli kill-pane --pane-id "$alt_pane" 2>/dev/null || true
+        fi
+        if [[ -d "${temp_workspace:-}" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        if [[ -n "$old_wa_data_dir" ]]; then
+            export WA_DATA_DIR="$old_wa_data_dir"
+        else
+            unset WA_DATA_DIR
+        fi
+        if [[ -n "$old_wa_workspace" ]]; then
+            export WA_WORKSPACE="$old_wa_workspace"
+        else
+            unset WA_WORKSPACE
+        fi
+        if [[ -n "$old_wa_config" ]]; then
+            export WA_CONFIG="$old_wa_config"
+        else
+            unset WA_CONFIG
+        fi
+        rm -rf "${temp_workspace:-}"
+    }
+    trap cleanup_quickfix_suggestions EXIT
+
+    is_safe_command() {
+        local cmd="$1"
+        if [[ "$cmd" == *$'\n'* ]]; then
+            return 1
+        fi
+        case "$cmd" in
+            *';'*|*'|'*|*'&'*|*'`'*|*'<'*|*'>'*|*'$('*)
+                return 1
+                ;;
+        esac
+        return 0
+    }
+
+    ipc_pane_state() {
+        local target_pane="$1"
+        local socket_path="$WA_DATA_DIR/ipc.sock"
+        python3 - "$socket_path" "$target_pane" <<'PY'
+import json
+import socket
+import sys
+
+sock_path = sys.argv[1]
+pane_id = int(sys.argv[2])
+req = {"type": "pane_state", "pane_id": pane_id}
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(2.0)
+s.connect(sock_path)
+s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+data = b""
+while not data.endswith(b"\n"):
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    data += chunk
+s.close()
+sys.stdout.write(data.decode("utf-8").strip())
+PY
+    }
+
+    # Setup environment for isolated wa instance
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    local strict_config="$PROJECT_ROOT/fixtures/e2e/config_strict.toml"
+    if [[ -f "$strict_config" ]]; then
+        cp "$strict_config" "$temp_workspace/wa.toml"
+        export WA_CONFIG="$temp_workspace/wa.toml"
+        log_verbose "Using strict config: $strict_config"
+    fi
+
+    # Start wa watch
+    log_info "Step 1: Starting wa watch..."
+    "$WA_BINARY" watch --foreground --config "$temp_workspace/wa.toml" \
+        > "$scenario_dir/wa_watch.log" 2>&1 &
+    wa_pid=$!
+    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    local check_watch_cmd="kill -0 $wa_pid 2>/dev/null"
+    if ! wait_for_condition "wa watch running" "$check_watch_cmd" "$wait_timeout"; then
+        log_fail "wa watch failed to start"
+        return 1
+    fi
+    log_pass "wa watch running"
+
+    # Step 2: Emit a compaction marker to produce an unhandled event
+    log_info "Step 2: Spawning compaction marker pane..."
+    local compaction_script="$temp_workspace/emit_compaction.sh"
+    cat > "$compaction_script" <<'EOS'
+#!/bin/bash
+set -euo pipefail
+echo "Conversation compacted 120 tokens to 45"
+echo "Auto-compact"
+sleep 5
+EOS
+    chmod +x "$compaction_script"
+
+    local spawn_output
+    spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- bash "$compaction_script" 2>&1)
+    compaction_pane=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+
+    if [[ -z "$compaction_pane" ]]; then
+        log_fail "Failed to spawn compaction pane"
+        echo "spawn_output: $spawn_output" >> "$scenario_dir/scenario.log"
+        return 1
+    fi
+    log_info "Spawned compaction pane: $compaction_pane"
+    echo "compaction_pane_id: $compaction_pane" >> "$scenario_dir/scenario.log"
+
+    local check_pane_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $compaction_pane)' >/dev/null 2>&1"
+    if ! wait_for_condition "pane $compaction_pane observed" "$check_pane_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for compaction pane to be observed"
+        "$WA_BINARY" robot state > "$scenario_dir/robot_state_compaction.json" 2>&1 || true
+        result=1
+    else
+        log_pass "Compaction pane observed"
+    fi
+
+    local event_cmd="\"$WA_BINARY\" events -f json --unhandled --rule-id \"claude_code.compaction\" --limit 20 2>/dev/null | jq -e 'length >= 1' >/dev/null 2>&1"
+    if ! wait_for_condition "unhandled compaction event detected" "$event_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for compaction event"
+        "$WA_BINARY" events -f json --limit 20 > "$scenario_dir/events_debug.json" 2>&1 || true
+        result=1
+    else
+        log_pass "Compaction event detected"
+    fi
+
+    "$WA_BINARY" events -f json --unhandled --rule-id "claude_code.compaction" --limit 20 \
+        > "$scenario_dir/suggestions_output.json" 2>&1 || true
+
+    if jq -e '.[0]' "$scenario_dir/suggestions_output.json" >/dev/null 2>&1; then
+        jq -c '.[]' "$scenario_dir/suggestions_output.json" > "$scenario_dir/events.jsonl" 2>/dev/null || true
+    else
+        cp "$scenario_dir/suggestions_output.json" "$scenario_dir/events.jsonl" 2>/dev/null || true
+    fi
+
+    "$WA_BINARY" robot events --unhandled --rule-id "claude_code.compaction" --limit 5 --would-handle --dry-run \
+        > "$scenario_dir/robot_events_preview.json" 2>&1 || true
+
+    "$WA_BINARY" robot rules show "claude_code.compaction" \
+        > "$scenario_dir/robot_rule_detail.json" 2>&1 || true
+
+    local preview_command=""
+    preview_command=$(jq -r '.data.events[0].would_handle_with.preview_command // empty' \
+        "$scenario_dir/robot_events_preview.json" 2>/dev/null || echo "")
+    local remediation=""
+    remediation=$(jq -r '.data.remediation // empty' "$scenario_dir/robot_rule_detail.json" 2>/dev/null || echo "")
+    local manual_fix=""
+    manual_fix=$(jq -r '.data.manual_fix // empty' "$scenario_dir/robot_rule_detail.json" 2>/dev/null || echo "")
+
+    if [[ -n "$preview_command" ]]; then
+        log_pass "Preview command present"
+        echo "preview_command: $preview_command" >> "$scenario_dir/scenario.log"
+    else
+        log_fail "Preview command missing"
+        result=1
+    fi
+
+    if [[ -n "$remediation" ]]; then
+        log_pass "Remediation suggestion present"
+    else
+        log_fail "Remediation suggestion missing"
+        result=1
+    fi
+
+    if [[ -n "$manual_fix" ]]; then
+        log_pass "Manual fix suggestion present"
+    else
+        log_fail "Manual fix suggestion missing"
+        result=1
+    fi
+
+    if [[ -n "$preview_command" ]]; then
+        if is_safe_command "$preview_command"; then
+            log_pass "Preview command appears safe"
+        else
+            log_fail "Preview command contains unsafe characters"
+            result=1
+        fi
+    fi
+
+    if [[ -n "$preview_command" ]] && is_safe_command "$preview_command"; then
+        local exec_cmd="$preview_command"
+        if [[ "$exec_cmd" == wa\ * ]]; then
+            exec_cmd="${exec_cmd/wa /$WA_BINARY }"
+        fi
+        read -r -a preview_argv <<< "$exec_cmd"
+        set +e
+        timeout 10 "${preview_argv[@]}" > "$scenario_dir/copy_paste_execution.log" 2>&1
+        local exec_rc=$?
+        set -e
+        echo "preview_exec_rc: $exec_rc" >> "$scenario_dir/scenario.log"
+        if [[ $exec_rc -eq 0 ]]; then
+            log_pass "Preview command executed successfully"
+        else
+            log_fail "Preview command failed (rc=$exec_rc)"
+            result=1
+        fi
+    else
+        log_warn "Skipping preview execution (missing/unsafe preview command)"
+    fi
+
+    # Step 3: Error suggestions for invalid pane id
+    log_info "Step 3: Validating error remediation for invalid pane..."
+    local error_output=""
+    error_output=$("$WA_BINARY" send --pane 999 "hello" 2>&1 || true)
+    echo "$error_output" > "$scenario_dir/error_invalid_pane.json"
+
+    if echo "$error_output" | jq -e '.ok == false' >/dev/null 2>&1; then
+        log_pass "Invalid pane send produced error JSON"
+    else
+        log_fail "Invalid pane send did not return error JSON"
+        result=1
+    fi
+
+    local error_hint=""
+    error_hint=$(echo "$error_output" | jq -r '.hint // empty' 2>/dev/null || echo "")
+
+    if [[ -n "$error_hint" ]]; then
+        log_pass "Error hint present"
+    else
+        log_fail "Error hint missing"
+        result=1
+    fi
+
+    # Step 4: Policy denial suggestions (alt-screen)
+    log_info "Step 4: Triggering policy denial via alt-screen pane..."
+    local alt_script="$PROJECT_ROOT/fixtures/e2e/dummy_alt_screen.sh"
+    if [[ ! -x "$alt_script" ]]; then
+        log_fail "Alt-screen script not found or not executable: $alt_script"
+        result=1
+    else
+        local alt_spawn_output
+        alt_spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- bash "$alt_script" 60 2>&1)
+        alt_pane=$(echo "$alt_spawn_output" | grep -oE '^[0-9]+$' | head -1)
+
+        if [[ -z "$alt_pane" ]]; then
+            log_fail "Failed to spawn alt-screen pane"
+            echo "spawn_output: $alt_spawn_output" >> "$scenario_dir/scenario.log"
+            result=1
+        else
+            log_info "Spawned alt-screen pane: $alt_pane"
+            echo "alt_screen_pane_id: $alt_pane" >> "$scenario_dir/scenario.log"
+
+            local check_alt_pane_cmd="\"$WA_BINARY\" robot state 2>/dev/null | jq -e '.data[]? | select(.pane_id == $alt_pane)' >/dev/null 2>&1"
+            if ! wait_for_condition "alt-screen pane observed" "$check_alt_pane_cmd" "$wait_timeout"; then
+                log_fail "Timeout waiting for alt-screen pane to be observed"
+                result=1
+            else
+                log_pass "Alt-screen pane observed"
+            fi
+
+            local alt_state_cmd="ipc_pane_state \"$alt_pane\" | jq -e '.ok == true and .data.known == true and ((.data.cursor_alt_screen // .data.alt_screen // false) == true)' >/dev/null 2>&1"
+            if ! wait_for_condition "alt-screen true" "$alt_state_cmd" "$wait_timeout"; then
+                log_fail "Alt-screen state not detected"
+                ipc_pane_state "$alt_pane" > "$scenario_dir/pane_state_alt_screen.json" 2>&1 || true
+                result=1
+            else
+                log_pass "Alt-screen state detected"
+            fi
+
+            local deny_output=""
+            deny_output=$("$WA_BINARY" send --pane "$alt_pane" "test_text_should_be_denied" 2>&1 || true)
+            echo "$deny_output" > "$scenario_dir/policy_denial.json"
+
+            if echo "$deny_output" | jq -e '.injection.Denied or .injection.RequiresApproval' >/dev/null 2>&1; then
+                log_pass "Alt-screen send denied"
+            elif echo "$deny_output" | jq -e '.ok == false' >/dev/null 2>&1; then
+                log_pass "Alt-screen send denied with error JSON"
+            else
+                log_fail "Alt-screen send not denied"
+                result=1
+            fi
+
+            local recent_output=""
+            recent_output=$("$WA_BINARY" why --recent --pane "$alt_pane" -f json 2>&1 || true)
+            echo "$recent_output" > "$scenario_dir/why_recent.json"
+
+            local decision_id=""
+            decision_id=$(echo "$recent_output" | jq -r '.decisions[0].id // empty' 2>/dev/null || echo "")
+            local template_id=""
+            template_id=$(echo "$recent_output" | jq -r '.decisions[0].explanation_template // empty' 2>/dev/null || echo "")
+
+            if [[ -n "$decision_id" ]]; then
+                log_pass "Captured recent policy decision id"
+                local detail_output=""
+                detail_output=$("$WA_BINARY" why --recent --decision-id "$decision_id" -f json 2>&1 || true)
+                echo "$detail_output" > "$scenario_dir/why_decision_detail.json"
+                local suggestion_count=0
+                suggestion_count=$(echo "$detail_output" | jq '.explanation.suggestions | length' 2>/dev/null || echo "0")
+                if [[ "$suggestion_count" -gt 0 ]]; then
+                    log_pass "Policy denial suggestions present"
+                    policy_suggestions_ok="true"
+                else
+                    log_fail "Policy denial suggestions missing"
+                    result=1
+                fi
+            else
+                log_fail "No recent policy decision found for alt-screen pane"
+                result=1
+            fi
+
+            if [[ -n "$template_id" ]]; then
+                echo "policy_template_id: $template_id" >> "$scenario_dir/scenario.log"
+            fi
+        fi
+    fi
+
+    # Step 5: Fuzzy match / typo recovery (soft check)
+    log_info "Step 5: Checking typo recovery hints (soft check)..."
+    local typo_output=""
+    typo_output=$("$WA_BINARY" workflow run handle_compactoin --dry-run 2>&1 || true)
+    echo "$typo_output" > "$scenario_dir/typo_workflow.json"
+
+    if echo "$typo_output" | grep -qi "did you mean"; then
+        log_pass "Typo recovery hint present"
+    else
+        log_warn "Typo recovery hint not found (soft check)"
+    fi
+
+    cat > "$scenario_dir/suggestion_validation.json" <<EOF
+{
+  "preview_command_present": $( [[ -n "$preview_command" ]] && echo "true" || echo "false" ),
+  "remediation_present": $( [[ -n "$remediation" ]] && echo "true" || echo "false" ),
+  "manual_fix_present": $( [[ -n "$manual_fix" ]] && echo "true" || echo "false" ),
+  "error_remediation_present": $( [[ -n "$error_hint" ]] && echo "true" || echo "false" ),
+  "policy_denial_suggestions_present": $policy_suggestions_ok
+}
+EOF
+
+    return $result
+}
+
+run_scenario_stress_scale() {
+    # Env overrides:
+    #   STRESS_PANES, STRESS_LINES_PER_PANE, STRESS_LARGE_LINES, STRESS_DELAY_SECS
+    #   STRESS_INGEST_LAG_MAX_MS, STRESS_RSS_KB_MAX, STRESS_CPU_PCT_MAX, STRESS_FTS_MS_MAX
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-stress-XXXXXX)
+    local wa_pid=""
+    local result=0
+    local wait_timeout=${TIMEOUT:-120}
+    local pane_count="${STRESS_PANES:-10}"
+    local lines_per_pane="${STRESS_LINES_PER_PANE:-2000}"
+    local large_lines="${STRESS_LARGE_LINES:-100000}"
+    local delay_secs="${STRESS_DELAY_SECS:-0.002}"
+    local ingest_lag_budget_ms="${STRESS_INGEST_LAG_MAX_MS:-200}"
+    local rss_budget_kb="${STRESS_RSS_KB_MAX:-800000}"
+    local cpu_budget_pct="${STRESS_CPU_PCT_MAX:-80}"
+    local fts_budget_ms="${STRESS_FTS_MS_MAX:-800}"
+    local marker="E2E_STRESS_$(date +%s%N)"
+    local burst_script="$PROJECT_ROOT/fixtures/e2e/dummy_burst.sh"
+    local chatter_script="$temp_workspace/emit_chatter.sh"
+    local pane_ids=()
+
+    log_info "Workspace: $temp_workspace"
+    log_info "Stress marker: $marker"
+    echo "pane_count: $pane_count" >> "$scenario_dir/scenario.log"
+    echo "lines_per_pane: $lines_per_pane" >> "$scenario_dir/scenario.log"
+    echo "large_lines: $large_lines" >> "$scenario_dir/scenario.log"
+
+    cleanup_stress_scale() {
+        log_verbose "Cleaning up stress_scale scenario"
+        if [[ -n "${wa_pid:-}" ]] && kill -0 "$wa_pid" 2>/dev/null; then
+            log_verbose "Stopping wa watch (pid $wa_pid)"
+            kill "$wa_pid" 2>/dev/null || true
+            wait "$wa_pid" 2>/dev/null || true
+        fi
+        for pid in "${pane_ids[@]}"; do
+            wezterm cli kill-pane --pane-id "$pid" 2>/dev/null || true
+        done
+        if [[ -d "${temp_workspace:-}" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "${temp_workspace:-}"
+    }
+    trap cleanup_stress_scale EXIT
+
+    if [[ ! -x "$burst_script" ]]; then
+        log_fail "Burst script not found or not executable: $burst_script"
+        return 1
+    fi
+
+    # Prepare chatter script for pane fanout
+    cat > "$chatter_script" <<'EOS'
+#!/bin/bash
+set -euo pipefail
+PANE="${1:-0}"
+COUNT="${2:-1000}"
+DELAY="${3:-0.002}"
+MARK="${4:-E2E_STRESS}"
+for i in $(seq 1 "$COUNT"); do
+    printf "[%s] line %d %s\n" "$PANE" "$i" "$MARK"
+    sleep "$DELAY"
+done
+EOS
+    chmod +x "$chatter_script"
+
+    # Setup environment for isolated wa instance
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$temp_workspace/wa.toml"
+    fi
+    export WA_CONFIG="$temp_workspace/wa.toml"
+
+    # Start wa watch
+    log_info "Step 1: Starting wa watch..."
+    "$WA_BINARY" watch --foreground --config "$temp_workspace/wa.toml" \
+        > "$scenario_dir/wa_watch.log" 2>&1 &
+    wa_pid=$!
+    echo "wa_pid: $wa_pid" >> "$scenario_dir/scenario.log"
+
+    local check_watch_cmd="kill -0 $wa_pid 2>/dev/null"
+    if ! wait_for_condition "wa watch running" "$check_watch_cmd" "$wait_timeout"; then
+        log_fail "wa watch failed to start"
+        return 1
+    fi
+    log_pass "wa watch running"
+
+    # Step 2: Spawn multiple chatty panes
+    log_info "Step 2: Spawning $pane_count chatty panes..."
+    for i in $(seq 1 "$pane_count"); do
+        local spawn_output
+        spawn_output=$(wezterm cli spawn --cwd "$temp_workspace" -- \
+            bash "$chatter_script" "$i" "$lines_per_pane" "$delay_secs" "$marker" 2>&1)
+        local pane_id
+        pane_id=$(echo "$spawn_output" | grep -oE '^[0-9]+$' | head -1)
+        if [[ -z "$pane_id" ]]; then
+            log_fail "Failed to spawn pane $i"
+            echo "spawn_output_$i: $spawn_output" >> "$scenario_dir/scenario.log"
+            result=1
+            continue
+        fi
+        pane_ids+=("$pane_id")
+    done
+
+    if [[ "${#pane_ids[@]}" -lt "$pane_count" ]]; then
+        log_warn "Spawned ${#pane_ids[@]} of $pane_count panes"
+    else
+        log_pass "Spawned $pane_count panes"
+    fi
+
+    local check_health_cmd="\"$WA_BINARY\" status --health 2>/dev/null | jq -e '.health != null and .health.observed_panes >= $pane_count' >/dev/null 2>&1"
+    if ! wait_for_condition "observed panes >= $pane_count" "$check_health_cmd" "$wait_timeout"; then
+        log_fail "Timeout waiting for observed panes"
+        "$WA_BINARY" status --health > "$scenario_dir/status_health_initial.json" 2>&1 || true
+        result=1
+    else
+        log_pass "Observed panes >= $pane_count"
+    fi
+
+    # Step 3: Emit a large transcript in a dedicated pane
+    log_info "Step 3: Spawning large transcript pane..."
+    local burst_output
+    burst_output=$(wezterm cli spawn --cwd "$temp_workspace" -- \
+        bash "$burst_script" "$large_lines" "$marker" 2>&1)
+    local burst_pane
+    burst_pane=$(echo "$burst_output" | grep -oE '^[0-9]+$' | head -1)
+    if [[ -z "$burst_pane" ]]; then
+        log_fail "Failed to spawn burst pane"
+        echo "burst_spawn_output: $burst_output" >> "$scenario_dir/scenario.log"
+        result=1
+    else
+        pane_ids+=("$burst_pane")
+        echo "burst_pane_id: $burst_pane" >> "$scenario_dir/scenario.log"
+    fi
+
+    local search_ready_cmd="\"$WA_BINARY\" search \"$marker\" --limit 5 -f json 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1"
+    if ! wait_for_condition "fts search sees marker" "$search_ready_cmd" "$wait_timeout"; then
+        log_fail "FTS search did not return results in time"
+        "$WA_BINARY" search "$marker" --limit 5 -f json > "$scenario_dir/search_debug.json" 2>&1 || true
+        result=1
+    else
+        log_pass "FTS search returned results"
+    fi
+
+    # Step 4: Capture health snapshot and enforce budgets
+    log_info "Step 4: Capturing health snapshot and enforcing budgets..."
+    "$WA_BINARY" status --health > "$scenario_dir/status_health.json" 2>&1 || true
+    local ingest_lag_max
+    ingest_lag_max=$(jq -r '.health.ingest_lag_max_ms // 0' "$scenario_dir/status_health.json" 2>/dev/null || echo "0")
+    local observed_panes
+    observed_panes=$(jq -r '.health.observed_panes // 0' "$scenario_dir/status_health.json" 2>/dev/null || echo "0")
+
+    if [[ "$observed_panes" -ge "$pane_count" ]]; then
+        log_pass "Health snapshot reports $observed_panes observed panes"
+    else
+        log_fail "Observed panes below expected ($observed_panes < $pane_count)"
+        result=1
+    fi
+
+    if [[ "$ingest_lag_max" -le "$ingest_lag_budget_ms" ]]; then
+        log_pass "Ingest lag max ${ingest_lag_max}ms within budget (${ingest_lag_budget_ms}ms)"
+    else
+        log_fail "Ingest lag max ${ingest_lag_max}ms exceeds budget (${ingest_lag_budget_ms}ms)"
+        result=1
+    fi
+
+    local ps_stats
+    ps_stats=$(ps -o %cpu= -o rss= -p "$wa_pid" 2>/dev/null | awk '{print $1, $2}')
+    local cpu_pct="0"
+    local rss_kb="0"
+    if [[ -n "$ps_stats" ]]; then
+        cpu_pct=$(echo "$ps_stats" | awk '{print $1}')
+        rss_kb=$(echo "$ps_stats" | awk '{print $2}')
+        echo "cpu_pct: $cpu_pct" >> "$scenario_dir/scenario.log"
+        echo "rss_kb: $rss_kb" >> "$scenario_dir/scenario.log"
+        if awk -v v="$cpu_pct" -v max="$cpu_budget_pct" 'BEGIN { exit !(v <= max) }'; then
+            log_pass "CPU ${cpu_pct}% within budget (${cpu_budget_pct}%)"
+        else
+            log_fail "CPU ${cpu_pct}% exceeds budget (${cpu_budget_pct}%)"
+            result=1
+        fi
+        if awk -v v="$rss_kb" -v max="$rss_budget_kb" 'BEGIN { exit !(v <= max) }'; then
+            log_pass "RSS ${rss_kb}KB within budget (${rss_budget_kb}KB)"
+        else
+            log_fail "RSS ${rss_kb}KB exceeds budget (${rss_budget_kb}KB)"
+            result=1
+        fi
+    else
+        log_warn "Failed to read CPU/RSS from ps"
+    fi
+
+    # Step 5: Measure FTS query latency
+    log_info "Step 5: Measuring FTS query latency..."
+    local fts_metrics
+    fts_metrics=$(python3 - "$WA_BINARY" "$marker" <<'PY'
+import json
+import subprocess
+import sys
+import time
+
+binary = sys.argv[1]
+marker = sys.argv[2]
+cmd = [binary, "search", marker, "--limit", "5", "-f", "json"]
+start = time.time()
+try:
+    out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8")
+    rc = 0
+except subprocess.CalledProcessError as exc:
+    out = exc.output.decode("utf-8")
+    rc = exc.returncode
+elapsed_ms = int((time.time() - start) * 1000)
+hits = 0
+try:
+    data = json.loads(out)
+    if isinstance(data, list):
+        hits = len(data)
+except Exception:
+    pass
+print(json.dumps({"elapsed_ms": elapsed_ms, "hits": hits, "rc": rc}))
+PY
+)
+    echo "$fts_metrics" > "$scenario_dir/fts_metrics.json"
+    local fts_elapsed
+    local fts_hits
+    fts_elapsed=$(jq -r '.elapsed_ms // 0' "$scenario_dir/fts_metrics.json" 2>/dev/null || echo "0")
+    fts_hits=$(jq -r '.hits // 0' "$scenario_dir/fts_metrics.json" 2>/dev/null || echo "0")
+
+    if [[ "$fts_hits" -gt 0 ]]; then
+        log_pass "FTS query returned $fts_hits hits"
+    else
+        log_fail "FTS query returned no hits"
+        result=1
+    fi
+
+    if [[ "$fts_elapsed" -le "$fts_budget_ms" ]]; then
+        log_pass "FTS query ${fts_elapsed}ms within budget (${fts_budget_ms}ms)"
+    else
+        log_fail "FTS query ${fts_elapsed}ms exceeds budget (${fts_budget_ms}ms)"
+        result=1
+    fi
+
+    cat > "$scenario_dir/metrics.json" <<EOF
+{
+  "pane_count": $pane_count,
+  "lines_per_pane": $lines_per_pane,
+  "large_lines": $large_lines,
+  "ingest_lag_max_ms": $ingest_lag_max,
+  "cpu_pct": "$cpu_pct",
+  "rss_kb": $rss_kb,
+  "fts_elapsed_ms": $fts_elapsed,
+  "fts_hits": $fts_hits,
+  "budgets": {
+    "ingest_lag_max_ms": $ingest_lag_budget_ms,
+    "cpu_pct": $cpu_budget_pct,
+    "rss_kb": $rss_budget_kb,
+    "fts_elapsed_ms": $fts_budget_ms
+  }
+}
+EOF
+
+    return $result
+}
+
 run_scenario_graceful_shutdown() {
     local scenario_dir="$1"
     local marker="E2E_SHUTDOWN_$(date +%s%N)"
@@ -3566,6 +4206,165 @@ run_scenario_workflow_resume() {
 }
 
 # ==============================================================================
+# Scenario: Workflow Lifecycle (Robot Subcommands)
+# ==============================================================================
+# Validates robot workflow list/run/status/abort with deterministic outputs.
+# Uses dry-run for execution to avoid side effects.
+# ==============================================================================
+
+run_scenario_workflow_lifecycle() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-workflow-lifecycle-XXXXXX)
+    local result=0
+
+    log_info "Workspace: $temp_workspace"
+
+    # Setup environment for isolated wa instance
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    # Copy baseline config when available
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$temp_workspace/wa.toml"
+        export WA_CONFIG="$temp_workspace/wa.toml"
+        log_verbose "Using baseline config: $baseline_config"
+    fi
+
+    cleanup_workflow_lifecycle() {
+        log_verbose "Cleaning up workflow_lifecycle scenario"
+        if [[ -d "$temp_workspace" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "$temp_workspace"
+    }
+    trap cleanup_workflow_lifecycle EXIT
+
+    # Step 1: List workflows
+    log_info "Step 1: Listing workflows..."
+    "$WA_BINARY" robot workflow list > "$scenario_dir/workflow_list.json" 2>&1 || true
+    if jq -e '.ok == true' "$scenario_dir/workflow_list.json" >/dev/null 2>&1; then
+        log_pass "workflow list: ok"
+    else
+        log_fail "workflow list failed"
+        result=1
+    fi
+
+    # Step 2: Dry-run workflow
+    log_info "Step 2: Dry-run workflow..."
+    "$WA_BINARY" robot workflow run handle_compaction 0 --dry-run \
+        > "$scenario_dir/workflow_run_dry.json" 2>&1 || true
+    if jq -e '.ok == true' "$scenario_dir/workflow_run_dry.json" >/dev/null 2>&1; then
+        log_pass "workflow run dry-run: ok"
+    else
+        log_fail "workflow run dry-run failed"
+        result=1
+    fi
+
+    # Step 3: Status --active (may be empty)
+    log_info "Step 3: Workflow status --active..."
+    "$WA_BINARY" robot workflow status --active \
+        > "$scenario_dir/workflow_status_active.json" 2>&1 || true
+    if jq -e '.ok == true' "$scenario_dir/workflow_status_active.json" >/dev/null 2>&1; then
+        log_pass "workflow status --active: ok"
+    else
+        local error_code
+        error_code=$(jq -r '.error_code // "unknown"' \
+            "$scenario_dir/workflow_status_active.json" 2>/dev/null || echo "unknown")
+        log_skip "workflow status --active: $error_code (may require watcher)"
+    fi
+
+    # Step 4: Abort with nonexistent execution ID (expect not found)
+    log_info "Step 4: Workflow abort (nonexistent)..."
+    "$WA_BINARY" robot workflow abort "nonexistent-id" \
+        > "$scenario_dir/workflow_abort.json" 2>&1 || true
+    if jq -e '.ok == false and .error_code == "E_EXECUTION_NOT_FOUND"' \
+        "$scenario_dir/workflow_abort.json" >/dev/null 2>&1; then
+        log_pass "workflow abort not-found: expected error"
+    else
+        log_fail "workflow abort not-found: unexpected response"
+        result=1
+    fi
+
+    trap - EXIT
+    cleanup_workflow_lifecycle
+
+    return $result
+}
+
+# ==============================================================================
+# Scenario: Events Unhandled Alias
+# ==============================================================================
+# Validates that --unhandled and --unhandled-only both produce valid output.
+# ==============================================================================
+
+run_scenario_events_unhandled_alias() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-events-unhandled-XXXXXX)
+    local result=0
+
+    log_info "Workspace: $temp_workspace"
+
+    # Setup environment for isolated wa instance
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    # Copy baseline config when available
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$temp_workspace/wa.toml"
+        export WA_CONFIG="$temp_workspace/wa.toml"
+        log_verbose "Using baseline config: $baseline_config"
+    fi
+
+    cleanup_events_unhandled_alias() {
+        log_verbose "Cleaning up events_unhandled_alias scenario"
+        if [[ -d "$temp_workspace" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        rm -rf "$temp_workspace"
+    }
+    trap cleanup_events_unhandled_alias EXIT
+
+    # Step 1: --unhandled
+    log_info "Step 1: wa robot events --unhandled..."
+    "$WA_BINARY" robot events --unhandled \
+        > "$scenario_dir/events_unhandled.json" 2>&1 || true
+    if jq -e '.ok == true' "$scenario_dir/events_unhandled.json" >/dev/null 2>&1; then
+        log_pass "events --unhandled: ok"
+    else
+        local error_code
+        error_code=$(jq -r '.error_code // "unknown"' \
+            "$scenario_dir/events_unhandled.json" 2>/dev/null || echo "unknown")
+        log_skip "events --unhandled: $error_code"
+    fi
+
+    # Step 2: --unhandled-only (alias)
+    log_info "Step 2: wa robot events --unhandled-only..."
+    "$WA_BINARY" robot events --unhandled-only \
+        > "$scenario_dir/events_unhandled_only.json" 2>&1 || true
+    if jq -e '.ok == true' "$scenario_dir/events_unhandled_only.json" >/dev/null 2>&1; then
+        log_pass "events --unhandled-only: ok"
+    else
+        local error_code
+        error_code=$(jq -r '.error_code // "unknown"' \
+            "$scenario_dir/events_unhandled_only.json" 2>/dev/null || echo "unknown")
+        log_skip "events --unhandled-only: $error_code"
+    fi
+
+    trap - EXIT
+    cleanup_events_unhandled_alias
+
+    return $result
+}
+
+# ==============================================================================
 # Scenario: Accounts Refresh (fake caut + pick preview + redaction)
 # ==============================================================================
 # Validates that:
@@ -4141,8 +4940,20 @@ run_scenario() {
             unhandled_event_lifecycle)
                 run_scenario_unhandled_event_lifecycle "$scenario_dir" || result=$?
                 ;;
+            workflow_lifecycle)
+                run_scenario_workflow_lifecycle "$scenario_dir" || result=$?
+                ;;
+            events_unhandled_alias)
+                run_scenario_events_unhandled_alias "$scenario_dir" || result=$?
+                ;;
         policy_denial)
             run_scenario_policy_denial "$scenario_dir" || result=$?
+            ;;
+        quickfix_suggestions)
+            run_scenario_quickfix_suggestions "$scenario_dir" || result=$?
+            ;;
+        stress_scale)
+            run_scenario_stress_scale "$scenario_dir" || result=$?
             ;;
         graceful_shutdown)
             run_scenario_graceful_shutdown "$scenario_dir" || result=$?

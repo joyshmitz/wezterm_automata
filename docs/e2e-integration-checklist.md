@@ -26,7 +26,10 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - natural_language
 - compaction_workflow
 - unhandled_event_lifecycle
+- workflow_lifecycle
+- events_unhandled_alias
 - usage_limit_safe_pause
+- notification_webhook
 - policy_denial
 - graceful_shutdown
 - pane_exclude_filter
@@ -112,12 +115,12 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 #### Timeline/correlation (wa-6sk)
 - [ ] E2E: events appear in timeline. Scenario(s): none
 - [ ] E2E: correlations are deterministic on fixtures. Scenario(s): none
-- [ ] E2E: query performance acceptable under seeded dataset. Scenario(s): none
+- [ ] E2E: query performance acceptable under seeded dataset. Scenario(s): stress_scale
 
 #### Quick-fix suggestions (wa-bnm)
-- [ ] E2E: suggestions appear on common errors/events. Scenario(s): none
-- [ ] E2E: suggestions are copy-pasteable and safe. Scenario(s): none
-- [ ] Artifacts: suggestion IDs fired + dismissal persistence (if applicable). Scenario(s): none
+- [ ] E2E: suggestions appear on common errors/events. Scenario(s): quickfix_suggestions
+- [ ] E2E: suggestions are copy-pasteable and safe. Scenario(s): quickfix_suggestions
+- [ ] Artifacts: suggestion IDs fired + dismissal persistence (if applicable). Scenario(s): quickfix_suggestions
 
 ## E2E Case Requirements (non-negotiable)
 - No fixed `sleep N` synchronization; use wait-for conditions with timeouts.

@@ -4474,16 +4474,22 @@ fn format_local_datetime(value: chrono::DateTime<chrono::Local>) -> String {
 }
 
 fn format_bytes_compact(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    const GB: f64 = MB * 1024.0;
-    let value = bytes as f64;
-    if value >= GB {
-        format!("{:.1} GB", value / GB)
-    } else if value >= MB {
-        format!("{:.1} MB", value / MB)
-    } else if value >= KB {
-        format!("{:.1} KB", value / KB)
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    let format_with_one_decimal = |value: u64, unit: u64, label: &str| {
+        let whole = value / unit;
+        let frac = (value % unit) * 10 / unit;
+        format!("{whole}.{frac} {label}")
+    };
+
+    if bytes >= GB {
+        format_with_one_decimal(bytes, GB, "GB")
+    } else if bytes >= MB {
+        format_with_one_decimal(bytes, MB, "MB")
+    } else if bytes >= KB {
+        format_with_one_decimal(bytes, KB, "KB")
     } else {
         format!("{bytes} bytes")
     }

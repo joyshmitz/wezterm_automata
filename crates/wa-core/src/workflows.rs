@@ -8337,6 +8337,80 @@ steps:
     }
 
     #[tokio::test]
+    async fn descriptor_workflow_logs_policy_summary_on_send_text() {
+        let yaml = r#"
+workflow_schema_version: 1
+name: "send_text_policy"
+steps:
+  - type: send_text
+    id: send_cmd
+    text: "echo secret"
+"#;
+        let descriptor = WorkflowDescriptor::from_yaml_str(yaml).unwrap();
+        let workflow: Arc<dyn Workflow> = Arc::new(DescriptorWorkflow::new(descriptor));
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("descriptor_policy.db")
+            .to_string_lossy()
+            .to_string();
+
+        let engine = WorkflowEngine::default();
+        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+        let storage = Arc::new(crate::storage::StorageHandle::new(&db_path).await.unwrap());
+        let injector = Arc::new(tokio::sync::Mutex::new(
+            crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::strict(),
+                crate::wezterm::WeztermClient::new(),
+            ),
+        ));
+        let runner = WorkflowRunner::new(
+            engine,
+            lock_manager,
+            Arc::clone(&storage),
+            injector,
+            WorkflowRunnerConfig::default(),
+        );
+
+        let pane_id = 101u64;
+        create_test_pane(&storage, pane_id).await;
+        runner.register_workflow(Arc::clone(&workflow));
+
+        let execution_id = generate_workflow_id(workflow.name());
+        runner
+            .engine
+            .start_with_id(
+                &storage,
+                execution_id.clone(),
+                workflow.name(),
+                pane_id,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = runner
+            .run_workflow(pane_id, workflow, &execution_id, 0)
+            .await;
+        assert!(result.is_aborted(), "Expected policy-gated abort");
+
+        let logs = storage.get_step_logs(&execution_id).await.unwrap();
+        assert_eq!(logs.len(), 1, "Expected a single step log entry");
+
+        let policy_summary = logs[0]
+            .policy_summary
+            .as_ref()
+            .expect("policy summary missing");
+        let summary_json: serde_json::Value = serde_json::from_str(policy_summary).unwrap();
+        assert_ne!(
+            summary_json.get("decision").and_then(|v| v.as_str()),
+            Some("allow")
+        );
+    }
+
+    #[tokio::test]
     async fn pane_idle_uses_heuristics_when_no_osc133() {
         let source = MockPaneSource::new(vec!["user@host:~$ ".to_string()]);
         let engine = PatternEngine::new();

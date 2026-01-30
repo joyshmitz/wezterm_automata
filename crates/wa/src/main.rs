@@ -10319,13 +10319,23 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
             };
 
-            let query_client = ProductionQueryClient::with_storage(layout.clone(), storage);
             let tui_config = AppConfig {
                 refresh_interval: Duration::from_secs(refresh),
                 debug,
             };
 
-            if let Err(e) = run_tui(query_client, tui_config) {
+            // Spawn TUI in a blocking thread to completely isolate it from
+            // the main async runtime. The ProductionQueryClient creates its
+            // own dedicated runtime for async operations.
+            let layout_clone = layout.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let query_client = ProductionQueryClient::with_storage(layout_clone, storage);
+                run_tui(query_client, tui_config)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("TUI thread panicked: {e}"))?;
+
+            if let Err(e) = result {
                 eprintln!("TUI error: {e}");
                 return Err(e.into());
             }
@@ -10334,6 +10344,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         #[cfg(feature = "mcp")]
         Some(Commands::Mcp { command }) => {
             mcp::run_mcp(command, &config, &workspace_root)?;
+        }
+
+        Some(Commands::Prepare { command: _ }) => {
+            // TODO: Implement prepare command (wa-upg.4 - action plan preview)
+            eprintln!("Error: 'wa prepare' is not yet implemented.");
+            eprintln!("This feature is planned for action plan preview workflow.");
+            return Err(anyhow::anyhow!("wa prepare not yet implemented"));
+        }
+
+        Some(Commands::Commit {
+            plan_id: _,
+            text: _,
+            text_file: _,
+            approval_code: _,
+        }) => {
+            // TODO: Implement commit command (wa-upg.4 - action plan execution)
+            eprintln!("Error: 'wa commit' is not yet implemented.");
+            eprintln!("This feature is planned for action plan execution workflow.");
+            return Err(anyhow::anyhow!("wa commit not yet implemented"));
         }
 
         None => {

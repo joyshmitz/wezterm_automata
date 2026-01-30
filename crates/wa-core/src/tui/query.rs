@@ -124,31 +124,58 @@ pub trait QueryClient: Send + Sync {
 /// Production implementation of QueryClient
 ///
 /// Uses the actual wa-core storage and wezterm client to query data.
+/// Owns a dedicated tokio runtime for async operations, avoiding
+/// "cannot start a runtime from within a runtime" panics when the TUI
+/// runs in a separate thread from the main async context.
 pub struct ProductionQueryClient {
     workspace_layout: WorkspaceLayout,
     wezterm: WeztermClient,
     #[allow(dead_code)]
     storage: Option<StorageHandle>,
+    /// Dedicated runtime for async operations - avoids nested runtime panics
+    runtime: tokio::runtime::Runtime,
 }
 
 impl ProductionQueryClient {
-    /// Create a new production query client
+    /// Create a new production query client with a dedicated tokio runtime.
+    ///
+    /// The runtime is used to bridge sync TUI code with async operations,
+    /// avoiding "cannot start a runtime from within a runtime" panics.
     #[must_use]
     pub fn new(workspace_layout: WorkspaceLayout) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("tui-query-runtime")
+            .build()
+            .expect("Failed to create TUI query runtime");
+
         Self {
             workspace_layout,
             wezterm: WeztermClient::new(),
             storage: None,
+            runtime,
         }
     }
 
-    /// Create with an existing storage handle
+    /// Create with an existing storage handle and a dedicated tokio runtime.
+    ///
+    /// The runtime is used to bridge sync TUI code with async operations,
+    /// avoiding "cannot start a runtime from within a runtime" panics.
     #[must_use]
     pub fn with_storage(workspace_layout: WorkspaceLayout, storage: StorageHandle) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("tui-query-runtime")
+            .build()
+            .expect("Failed to create TUI query runtime");
+
         Self {
             workspace_layout,
             wezterm: WeztermClient::new(),
             storage: Some(storage),
+            runtime,
         }
     }
 
@@ -165,23 +192,17 @@ impl ProductionQueryClient {
 
 impl QueryClient for ProductionQueryClient {
     fn list_panes(&self) -> Result<Vec<PaneView>, QueryError> {
-        // Get a handle to the current tokio runtime
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|e| QueryError::QueryFailed(format!("No tokio runtime: {e}")))?;
-
         let wezterm = &self.wezterm;
 
-        // Use block_in_place to safely bridge sync/async from within a runtime.
-        // This moves the current thread out of the async context temporarily,
-        // allowing block_on to work without causing "nested runtime" panics.
-        tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                wezterm
-                    .list_panes()
-                    .await
-                    .map(|panes| panes.iter().map(PaneView::from).collect())
-                    .map_err(|e| QueryError::WeztermError(e.to_string()))
-            })
+        // Use the dedicated runtime to run async code from sync context.
+        // This avoids "cannot start a runtime from within a runtime" panics
+        // because this runtime is separate from any parent async context.
+        self.runtime.block_on(async {
+            wezterm
+                .list_panes()
+                .await
+                .map(|panes| panes.iter().map(PaneView::from).collect())
+                .map_err(|e| QueryError::WeztermError(e.to_string()))
         })
     }
 
@@ -191,10 +212,6 @@ impl QueryClient for ProductionQueryClient {
                 "Database connection not available".to_string(),
             ));
         };
-
-        // Get a handle to the current tokio runtime
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|e| QueryError::QueryFailed(format!("No tokio runtime: {e}")))?;
 
         let query = crate::storage::EventQuery {
             limit: Some(filters.limit),
@@ -206,13 +223,12 @@ impl QueryClient for ProductionQueryClient {
             until: None,
         };
 
-        let events = tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                storage
-                    .get_events(query)
-                    .await
-                    .map_err(|e| QueryError::StorageError(e.to_string()))
-            })
+        // Use the dedicated runtime to run async code from sync context.
+        let events = self.runtime.block_on(async {
+            storage
+                .get_events(query)
+                .await
+                .map_err(|e| QueryError::StorageError(e.to_string()))
         })?;
 
         Ok(events
@@ -238,10 +254,6 @@ impl QueryClient for ProductionQueryClient {
             ));
         };
 
-        // Get a handle to the current tokio runtime
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|e| QueryError::QueryFailed(format!("No tokio runtime: {e}")))?;
-
         let options = crate::storage::SearchOptions {
             limit: Some(limit),
             include_snippets: Some(true),
@@ -252,13 +264,12 @@ impl QueryClient for ProductionQueryClient {
         };
 
         let query = query.to_string();
-        let results = tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                storage
-                    .search_with_results(&query, options)
-                    .await
-                    .map_err(|e| QueryError::StorageError(e.to_string()))
-            })
+        // Use the dedicated runtime to run async code from sync context.
+        let results = self.runtime.block_on(async {
+            storage
+                .search_with_results(&query, options)
+                .await
+                .map_err(|e| QueryError::StorageError(e.to_string()))
         })?;
 
         Ok(results

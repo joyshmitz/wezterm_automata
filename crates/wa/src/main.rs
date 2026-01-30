@@ -4365,7 +4365,12 @@ async fn run_scheduled_backups(
                             result.output_path,
                             format_bytes_compact(result.total_size_bytes)
                         );
-                        send_backup_notification(&notifier, "wa backup success", &message);
+                        send_backup_notification(
+                            &notifier,
+                            "wa backup success",
+                            &message,
+                            wa_core::desktop_notify::Urgency::Normal,
+                        );
                     }
 
                     break;
@@ -4392,7 +4397,12 @@ async fn run_scheduled_backups(
                 let body = last_error
                     .as_deref()
                     .unwrap_or("Backup failed (unknown error)");
-                send_backup_notification(&notifier, "wa backup failed", body);
+                send_backup_notification(
+                    &notifier,
+                    "wa backup failed",
+                    body,
+                    wa_core::desktop_notify::Urgency::Critical,
+                );
             }
         }
     }
@@ -4499,11 +4509,12 @@ fn send_backup_notification(
     notifier: &wa_core::desktop_notify::DesktopNotifier,
     title: &str,
     body: &str,
+    urgency: wa_core::desktop_notify::Urgency,
 ) {
     if !notifier.is_available() {
         return;
     }
-    let _ = notifier.notify_message(title, body, wa_core::desktop_notify::Urgency::Normal);
+    let _ = notifier.notify_message(title, body, urgency);
 }
 
 #[tokio::main]

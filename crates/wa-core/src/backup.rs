@@ -293,16 +293,16 @@ fn cron_matches(candidate: DateTime<Local>, cron: &CronSchedule) -> bool {
         }
     }
 
-    let dom_match = cron.day_of_month.map_or(true, |dom| candidate.day() == dom);
-    let dow_match = cron.day_of_week.map_or(true, |dow| {
+    let day_of_month_matches = cron.day_of_month.map_or(true, |dom| candidate.day() == dom);
+    let day_of_week_matches = cron.day_of_week.map_or(true, |dow| {
         let normalized = if dow == 7 { 0 } else { dow };
         let candidate_dow = candidate.weekday().num_days_from_sunday();
         candidate_dow == normalized
     });
 
     match (cron.day_of_month.is_some(), cron.day_of_week.is_some()) {
-        (true, true) => dom_match || dow_match,
-        _ => dom_match && dow_match,
+        (true, true) => day_of_month_matches || day_of_week_matches,
+        _ => day_of_month_matches && day_of_week_matches,
     }
 }
 

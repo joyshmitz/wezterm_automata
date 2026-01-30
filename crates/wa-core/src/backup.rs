@@ -528,6 +528,12 @@ pub fn list_backup_entries(base_dir: &Path) -> Result<Vec<BackupEntry>> {
                 .map(|d| d.as_secs() as i64)
         });
 
+        let created_at = created_at.or_else(|| {
+            created_ts
+                .filter(|ts| *ts >= 0)
+                .map(|ts| format_iso8601(ts as u64))
+        });
+
         let total_size_bytes = dir_size(&path);
         entries.push(BackupEntry {
             path,

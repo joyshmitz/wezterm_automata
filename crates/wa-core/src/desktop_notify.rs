@@ -362,6 +362,61 @@ impl DesktopNotifier {
             }
         }
     }
+
+    /// Send a desktop notification with a custom title/body.
+    pub fn notify_message(
+        &self,
+        title: &str,
+        body: &str,
+        urgency: Urgency,
+    ) -> DesktopDeliveryResult {
+        if !self.config.enabled {
+            return DesktopDeliveryResult {
+                backend: self.backend.to_string(),
+                success: false,
+                error: Some("desktop notifications disabled".to_string()),
+            };
+        }
+
+        let Some(cmd) = build_command(self.backend, title, body, urgency, self.config.sound) else {
+            return DesktopDeliveryResult {
+                backend: self.backend.to_string(),
+                success: false,
+                error: Some("no notification backend available".to_string()),
+            };
+        };
+
+        tracing::debug!(
+            backend = %self.backend,
+            program = %cmd.program,
+            "sending desktop notification"
+        );
+
+        match Command::new(&cmd.program).args(&cmd.args).output() {
+            Ok(output) if output.status.success() => DesktopDeliveryResult {
+                backend: self.backend.to_string(),
+                success: true,
+                error: None,
+            },
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                DesktopDeliveryResult {
+                    backend: self.backend.to_string(),
+                    success: false,
+                    error: Some(format!(
+                        "exit {}: {}",
+                        output.status.code().unwrap_or(-1),
+                        stderr.trim()
+                    )),
+                }
+            }
+            Err(e) => DesktopDeliveryResult {
+                backend: self.backend.to_string(),
+                success: false,
+                error: Some(format!("command not found: {e}")),
+            },
+        }
+    }
 }
 
 /// Helper: severity as a display string.

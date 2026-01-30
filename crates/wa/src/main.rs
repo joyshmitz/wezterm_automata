@@ -15273,6 +15273,18 @@ mod tests {
                 ]),
                 requires_pane: Some(true),
             },
+            RobotWorkflowInfo {
+                name: "handle_gemini_quota".to_string(),
+                description: Some(
+                    "Safe-pause on Gemini quota/usage limits with recovery plan".to_string(),
+                ),
+                enabled: true,
+                trigger_event_types: Some(vec![
+                    "usage.warning".to_string(),
+                    "usage.reached".to_string(),
+                ]),
+                requires_pane: Some(true),
+            },
         ];
 
         assert_eq!(workflows.len(), 6, "must list exactly 6 workflows");

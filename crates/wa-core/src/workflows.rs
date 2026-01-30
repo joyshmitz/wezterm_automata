@@ -7968,19 +7968,6 @@ mod tests {
     use super::*;
     use crate::patterns::{AgentType, Detection, Severity};
 
-    fn make_detection(rule_id: &str, agent_type: AgentType, event_type: &str) -> Detection {
-        Detection {
-            rule_id: rule_id.to_string(),
-            agent_type,
-            event_type: event_type.to_string(),
-            severity: Severity::Info,
-            confidence: 1.0,
-            extracted: serde_json::json!({}),
-            matched_text: String::new(),
-            span: (0, 0),
-        }
-    }
-
     // ========================================================================
     // StepResult Tests
     // ========================================================================
@@ -13248,11 +13235,7 @@ Try again at 3:00 PM UTC.
 
     #[test]
     fn handle_gemini_quota_recovery_plan_warning() {
-        let plan = HandleGeminiQuota::build_recovery_plan(
-            "quota_warning",
-            Some("15"),
-            42,
-        );
+        let plan = HandleGeminiQuota::build_recovery_plan("quota_warning", Some("15"), 42);
         assert_eq!(plan["quota_type"], "quota_warning");
         assert_eq!(plan["pane_id"], 42);
         assert_eq!(plan["safe_to_send"], true);
@@ -13261,11 +13244,7 @@ Try again at 3:00 PM UTC.
 
     #[test]
     fn handle_gemini_quota_recovery_plan_reached() {
-        let plan = HandleGeminiQuota::build_recovery_plan(
-            "quota_reached",
-            Some("0"),
-            42,
-        );
+        let plan = HandleGeminiQuota::build_recovery_plan("quota_reached", Some("0"), 42);
         assert_eq!(plan["quota_type"], "quota_reached");
         assert_eq!(plan["safe_to_send"], false);
         assert!(plan["next_steps"].is_array());

@@ -485,7 +485,7 @@ pub fn scheduled_backup_output_path(
     now: DateTime<Local>,
 ) -> PathBuf {
     let base_dir = resolve_destination_root(workspace_root, destination);
-    let ts = format_timestamp_compact(now.timestamp() as u64);
+    let ts = format_timestamp_compact(now.timestamp().max(0) as u64);
     unique_backup_path(&base_dir, &format!("wa_backup_{ts}"))
 }
 
@@ -1327,7 +1327,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
 
-        let mut create_backup = |name: &str, created_at: &str| {
+        let create_backup = |name: &str, created_at: &str| {
             let dir = root.join(name);
             fs::create_dir_all(&dir).unwrap();
             let manifest = BackupManifest {

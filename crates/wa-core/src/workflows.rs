@@ -6738,6 +6738,295 @@ impl Workflow for HandleAuthRequired {
 }
 
 // ============================================================================
+// HandleClaudeCodeLimits — safe-pause on Claude Code usage/rate limits
+// (wa-03j, wa-nu4.2.2.1)
+// ============================================================================
+
+/// Default cooldown window in milliseconds (10 minutes).
+/// Usage-limit events within this window for the same pane are suppressed.
+const CLAUDE_CODE_LIMITS_COOLDOWN_MS: i64 = 10 * 60 * 1000;
+
+/// Handle Claude Code usage-limit and rate-limit events.
+///
+/// Unlike the Codex-specific [`HandleUsageLimits`], this workflow does **not**
+/// attempt account rotation or automated exit. Instead it:
+///   1. Guards against unsafe pane states.
+///   2. Applies a cooldown so repeated limit events don't spam actions.
+///   3. Classifies the limit type (usage warning, usage reached, rate limit).
+///   4. Persists an audit record and produces a recovery plan the operator
+///      can act on (wait for reset, switch accounts manually, etc.).
+pub struct HandleClaudeCodeLimits {
+    cooldown_ms: i64,
+}
+
+impl HandleClaudeCodeLimits {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            cooldown_ms: CLAUDE_CODE_LIMITS_COOLDOWN_MS,
+        }
+    }
+
+    /// Create with a custom cooldown (useful for testing).
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn with_cooldown_ms(cooldown_ms: i64) -> Self {
+        Self { cooldown_ms }
+    }
+
+    /// Classify the limit type from a detection trigger.
+    fn classify_limit(trigger: &serde_json::Value) -> (&'static str, Option<String>) {
+        let event_type = trigger
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let extracted = trigger.get("extracted");
+
+        let reset_time = extracted
+            .and_then(|e| e.get("reset_time"))
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
+
+        let limit_type = match event_type {
+            "usage.warning" => "usage_warning",
+            "usage.reached" => "usage_reached",
+            _ => "unknown_limit",
+        };
+
+        (limit_type, reset_time)
+    }
+
+    /// Build a recovery plan JSON object for the operator.
+    fn build_recovery_plan(
+        limit_type: &str,
+        reset_time: &Option<String>,
+        pane_id: u64,
+    ) -> serde_json::Value {
+        let next_steps = match limit_type {
+            "usage_warning" => vec![
+                "Save current work and commit progress",
+                "Consider wrapping up the current task",
+                "If approaching hard limit, start a new session",
+            ],
+            "usage_reached" => {
+                let mut steps = vec![
+                    "Session has hit its usage limit",
+                    "Do not send further input to avoid wasted tokens",
+                ];
+                if reset_time.is_some() {
+                    steps.push("Wait for the limit to reset (see reset_time)");
+                }
+                steps.push("Or start a new Claude Code session manually");
+                steps
+            }
+            _ => vec!["Unknown limit type; check pane output for details"],
+        };
+
+        serde_json::json!({
+            "limit_type": limit_type,
+            "pane_id": pane_id,
+            "reset_time": reset_time,
+            "next_steps": next_steps,
+            "safe_to_send": limit_type == "usage_warning",
+        })
+    }
+}
+
+impl Default for HandleClaudeCodeLimits {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Workflow for HandleClaudeCodeLimits {
+    fn name(&self) -> &'static str {
+        "handle_claude_code_limits"
+    }
+
+    fn description(&self) -> &'static str {
+        "Safe-pause on Claude Code usage/rate limits with recovery plan"
+    }
+
+    fn handles(&self, detection: &crate::patterns::Detection) -> bool {
+        detection.agent_type == crate::patterns::AgentType::ClaudeCode
+            && matches!(
+                detection.event_type.as_str(),
+                "usage.warning" | "usage.reached"
+            )
+    }
+
+    fn trigger_event_types(&self) -> &'static [&'static str] {
+        &["usage.warning", "usage.reached"]
+    }
+
+    fn supported_agent_types(&self) -> &'static [&'static str] {
+        &["claude_code"]
+    }
+
+    fn requires_pane(&self) -> bool {
+        true
+    }
+
+    fn requires_approval(&self) -> bool {
+        false
+    }
+
+    fn is_destructive(&self) -> bool {
+        false
+    }
+
+    fn steps(&self) -> Vec<WorkflowStep> {
+        vec![
+            WorkflowStep::new("check_guards", "Validate pane state allows interaction"),
+            WorkflowStep::new(
+                "check_cooldown",
+                "Skip if usage limit was recently handled for this pane",
+            ),
+            WorkflowStep::new(
+                "classify_and_record",
+                "Classify limit type, record audit event, and build recovery plan",
+            ),
+        ]
+    }
+
+    fn execute_step(
+        &self,
+        ctx: &mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'_, StepResult> {
+        let pane_id = ctx.pane_id();
+        let storage = ctx.storage().clone();
+        let trigger = ctx.trigger().cloned().unwrap_or(serde_json::Value::Null);
+        let execution_id = ctx.execution_id().to_string();
+        let cooldown_ms = self.cooldown_ms;
+        let caps = ctx.capabilities().to_owned();
+
+        Box::pin(async move {
+            match step_idx {
+                // Step 0: Guard checks
+                0 => {
+                    if caps.alt_screen == Some(true) {
+                        return StepResult::abort("Pane is in alt-screen mode");
+                    }
+                    if caps.command_running {
+                        return StepResult::abort("Command is running in pane");
+                    }
+                    tracing::debug!(pane_id, "handle_claude_code_limits: guard checks passed");
+                    StepResult::cont()
+                }
+
+                // Step 1: Cooldown check
+                1 => {
+                    let since = now_ms() - cooldown_ms;
+                    let query = crate::storage::AuditQuery {
+                        pane_id: Some(pane_id),
+                        action_kind: Some("claude_code_usage_limit".to_string()),
+                        since: Some(since),
+                        limit: Some(1),
+                        ..Default::default()
+                    };
+
+                    match storage.get_audit_actions(query).await {
+                        Ok(recent) if !recent.is_empty() => {
+                            tracing::info!(
+                                pane_id,
+                                last_limit_ts = recent[0].ts,
+                                "handle_claude_code_limits: within cooldown, skipping"
+                            );
+                            StepResult::done(serde_json::json!({
+                                "status": "cooldown_skipped",
+                                "pane_id": pane_id,
+                                "last_limit_ts": recent[0].ts,
+                            }))
+                        }
+                        Ok(_) => {
+                            tracing::debug!(
+                                pane_id,
+                                "handle_claude_code_limits: no recent limit events, proceeding"
+                            );
+                            StepResult::cont()
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                pane_id,
+                                error = %e,
+                                "handle_claude_code_limits: cooldown check failed, proceeding"
+                            );
+                            StepResult::cont()
+                        }
+                    }
+                }
+
+                // Step 2: Classify limit, record audit event, build plan
+                2 => {
+                    let (limit_type, reset_time) = Self::classify_limit(&trigger);
+                    let agent_type = trigger
+                        .get("agent_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("claude_code");
+                    let rule_id = trigger
+                        .get("rule_id")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+
+                    let plan = Self::build_recovery_plan(limit_type, &reset_time, pane_id);
+
+                    // Record the limit event in the audit log
+                    let audit = crate::storage::AuditActionRecord {
+                        id: 0,
+                        ts: now_ms(),
+                        actor_kind: "workflow".to_string(),
+                        actor_id: Some(execution_id.clone()),
+                        pane_id: Some(pane_id),
+                        domain: None,
+                        action_kind: "claude_code_usage_limit".to_string(),
+                        policy_decision: "allow".to_string(),
+                        decision_reason: None,
+                        rule_id,
+                        input_summary: Some(format!("Claude Code {limit_type} on pane {pane_id}")),
+                        verification_summary: None,
+                        decision_context: Some(serde_json::to_string(&plan).unwrap_or_default()),
+                        result: "recorded".to_string(),
+                    };
+
+                    match storage.record_audit_action(audit).await {
+                        Ok(audit_id) => {
+                            tracing::info!(
+                                pane_id,
+                                audit_id,
+                                limit_type,
+                                reset_time = ?reset_time,
+                                "handle_claude_code_limits: recorded usage limit event"
+                            );
+
+                            StepResult::done(serde_json::json!({
+                                "status": "recorded",
+                                "pane_id": pane_id,
+                                "agent_type": agent_type,
+                                "limit_type": limit_type,
+                                "reset_time": reset_time,
+                                "recovery_plan": plan,
+                                "audit_id": audit_id,
+                            }))
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                pane_id,
+                                error = %e,
+                                "handle_claude_code_limits: failed to record limit event"
+                            );
+                            StepResult::abort(format!("Failed to record usage limit event: {e}"))
+                        }
+                    }
+                }
+
+                _ => StepResult::abort("Unexpected step"),
+            }
+        })
+    }
+}
+
+// ============================================================================
 // Device Auth Workflow Step (wa-nu4.1.3.6)
 // ============================================================================
 //
@@ -12379,6 +12668,154 @@ Try again at 3:00 PM UTC.
             !results.is_empty(),
             "Should find recent auth event within cooldown window"
         );
+    }
+
+    // ========================================================================
+    // HandleClaudeCodeLimits Tests (wa-03j, wa-nu4.2.2.1)
+    // ========================================================================
+
+    #[test]
+    fn handle_claude_code_limits_metadata() {
+        let wf = HandleClaudeCodeLimits::new();
+        assert_eq!(wf.name(), "handle_claude_code_limits");
+        assert!(!wf.description().is_empty());
+        assert_eq!(wf.steps().len(), 3);
+        assert_eq!(wf.steps()[0].name, "check_guards");
+        assert_eq!(wf.steps()[1].name, "check_cooldown");
+        assert_eq!(wf.steps()[2].name, "classify_and_record");
+    }
+
+    #[test]
+    fn handle_claude_code_limits_handles_usage_warning() {
+        let wf = HandleClaudeCodeLimits::new();
+        let detection = Detection {
+            rule_id: "claude_code.usage.warning".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "usage.warning".to_string(),
+            severity: Severity::Warning,
+            confidence: 0.95,
+            extracted: serde_json::json!({"remaining": "10"}),
+            matched_text: "usage limit".to_string(),
+            span: (0, 11),
+        };
+        assert!(wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_claude_code_limits_handles_usage_reached() {
+        let wf = HandleClaudeCodeLimits::new();
+        let detection = Detection {
+            rule_id: "claude_code.usage.reached".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "usage.reached".to_string(),
+            severity: Severity::Critical,
+            confidence: 0.95,
+            extracted: serde_json::json!({}),
+            matched_text: "limit reached".to_string(),
+            span: (0, 13),
+        };
+        assert!(wf.handles(&detection));
+    }
+
+    #[test]
+    fn handle_claude_code_limits_ignores_codex_usage() {
+        let wf = HandleClaudeCodeLimits::new();
+        let detection = Detection {
+            rule_id: "codex.usage.reached".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: "usage.reached".to_string(),
+            severity: Severity::Critical,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "limit reached".to_string(),
+            span: (0, 13),
+        };
+        assert!(!wf.handles(&detection), "Should ignore Codex usage events");
+    }
+
+    #[test]
+    fn handle_claude_code_limits_ignores_session_events() {
+        let wf = HandleClaudeCodeLimits::new();
+        let detection = Detection {
+            rule_id: "claude_code.session.end".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: "session.end".to_string(),
+            severity: Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::json!({}),
+            matched_text: "Session ended".to_string(),
+            span: (0, 13),
+        };
+        assert!(!wf.handles(&detection), "Should ignore session.end events");
+    }
+
+    #[test]
+    fn handle_claude_code_limits_trigger_event_types() {
+        let wf = HandleClaudeCodeLimits::new();
+        let types = wf.trigger_event_types();
+        assert!(types.contains(&"usage.warning"));
+        assert!(types.contains(&"usage.reached"));
+    }
+
+    #[test]
+    fn handle_claude_code_limits_supported_agents() {
+        let wf = HandleClaudeCodeLimits::new();
+        let agents = wf.supported_agent_types();
+        assert_eq!(agents, &["claude_code"]);
+    }
+
+    #[test]
+    fn handle_claude_code_limits_not_destructive() {
+        let wf = HandleClaudeCodeLimits::new();
+        assert!(!wf.is_destructive());
+        assert!(!wf.requires_approval());
+        assert!(wf.requires_pane());
+    }
+
+    #[test]
+    fn handle_claude_code_limits_classify_usage_warning() {
+        let trigger = serde_json::json!({
+            "event_type": "usage.warning",
+            "extracted": { "remaining": "10" }
+        });
+        let (limit_type, reset_time) = HandleClaudeCodeLimits::classify_limit(&trigger);
+        assert_eq!(limit_type, "usage_warning");
+        assert!(reset_time.is_none());
+    }
+
+    #[test]
+    fn handle_claude_code_limits_classify_usage_reached() {
+        let trigger = serde_json::json!({
+            "event_type": "usage.reached",
+            "extracted": { "reset_time": "30 minutes" }
+        });
+        let (limit_type, reset_time) = HandleClaudeCodeLimits::classify_limit(&trigger);
+        assert_eq!(limit_type, "usage_reached");
+        assert_eq!(reset_time.as_deref(), Some("30 minutes"));
+    }
+
+    #[test]
+    fn handle_claude_code_limits_recovery_plan_warning() {
+        let plan = HandleClaudeCodeLimits::build_recovery_plan("usage_warning", &None, 42);
+        assert_eq!(plan["limit_type"], "usage_warning");
+        assert_eq!(plan["pane_id"], 42);
+        assert_eq!(plan["safe_to_send"], true);
+        assert!(plan["next_steps"].as_array().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn handle_claude_code_limits_recovery_plan_reached() {
+        let reset = Some("2 hours".to_string());
+        let plan = HandleClaudeCodeLimits::build_recovery_plan("usage_reached", &reset, 7);
+        assert_eq!(plan["limit_type"], "usage_reached");
+        assert_eq!(plan["safe_to_send"], false);
+        assert_eq!(plan["reset_time"], "2 hours");
+    }
+
+    #[test]
+    fn handle_claude_code_limits_custom_cooldown() {
+        let wf = HandleClaudeCodeLimits::with_cooldown_ms(30_000);
+        assert_eq!(wf.cooldown_ms, 30_000);
     }
 
     // ========================================================================

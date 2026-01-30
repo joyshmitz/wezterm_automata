@@ -50,6 +50,9 @@ features: {}",
     }
 }
 
+#[cfg(feature = "mcp")]
+mod mcp;
+
 static CLAP_VERSION: LazyLock<String> = LazyLock::new(build_meta::short_version);
 
 /// WezTerm Automata - Terminal hypervisor for AI agents
@@ -840,6 +843,18 @@ SEE ALSO:
         #[arg(long, default_value = "5")]
         refresh: u64,
     },
+
+    /// MCP server commands (Model Context Protocol)
+    #[cfg(feature = "mcp")]
+    #[command(after_help = r#"EXAMPLES:
+    wa mcp serve                      Start MCP server over stdio
+
+SEE ALSO:
+    wa robot     Machine-readable CLI surface (parity target)"#)]
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1188,6 +1203,17 @@ enum RobotReservationCommands {
 
     /// List active pane reservations
     List,
+}
+
+#[cfg(feature = "mcp")]
+#[derive(Subcommand)]
+enum McpCommands {
+    /// Start MCP server (stdio transport by default)
+    Serve {
+        /// Transport to use (currently only "stdio")
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3161,6 +3187,9 @@ fn resolve_workflow(
         "handle_usage_limits" => Some(std::sync::Arc::new(
             wa_core::workflows::HandleUsageLimits::new(),
         )),
+        "handle_claude_code_limits" => Some(std::sync::Arc::new(
+            wa_core::workflows::HandleClaudeCodeLimits::new(),
+        )),
         _ => None,
     }
 }
@@ -4046,8 +4075,10 @@ async fn run_watcher(
         workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleUsageLimits::new()));
         workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleSessionEnd::new()));
         workflow_runner.register_workflow(Arc::new(wa_core::workflows::HandleAuthRequired::new()));
+        workflow_runner
+            .register_workflow(Arc::new(wa_core::workflows::HandleClaudeCodeLimits::new()));
         tracing::info!(
-            "Registered workflows: handle_compaction, handle_usage_limits, handle_session_end, handle_auth_required"
+            "Registered workflows: handle_compaction, handle_usage_limits, handle_session_end, handle_auth_required, handle_claude_code_limits"
         );
 
         // Spawn workflow runner event loop
@@ -5362,6 +5393,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             enabled: true,
                                             trigger_event_types: Some(vec![
                                                 "auth_required".to_string(),
+                                            ]),
+                                            requires_pane: Some(true),
+                                        },
+                                        RobotWorkflowInfo {
+                                            name: "handle_claude_code_limits".to_string(),
+                                            description: Some(
+                                                "Safe-pause on Claude Code usage/rate limits \
+                                                 with recovery plan"
+                                                    .to_string(),
+                                            ),
+                                            enabled: true,
+                                            trigger_event_types: Some(vec![
+                                                "usage.warning".to_string(),
+                                                "usage.reached".to_string(),
                                             ]),
                                             requires_pane: Some(true),
                                         },
@@ -9012,6 +9057,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             handle_auth_command(command, &layout, cli.verbose > 0).await?;
         }
 
+        Some(Commands::Mcp { command }) => {
+            handle_mcp_command(command, &config).await?;
+        }
+
         Some(Commands::Triage {
             format,
             severity,
@@ -9388,6 +9437,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 eprintln!("TUI error: {e}");
                 return Err(e.into());
             }
+        }
+
+        #[cfg(feature = "mcp")]
+        Some(Commands::Mcp { command }) => {
+            mcp::run_mcp(command, &config, &workspace_root)?;
         }
 
         None => {
@@ -12589,7 +12643,7 @@ fn run_diagnostics(
     }
 
     // Check 7: Feature flags
-    #[allow(unused_mut)]
+    #[allow(unused_mut, clippy::vec_init_then_push)]
     let mut features: Vec<&str> = Vec::new();
     #[cfg(feature = "tui")]
     features.push("tui");
@@ -15193,14 +15247,27 @@ mod tests {
                 trigger_event_types: Some(vec!["auth_required".to_string()]),
                 requires_pane: Some(true),
             },
+            RobotWorkflowInfo {
+                name: "handle_claude_code_limits".to_string(),
+                description: Some(
+                    "Safe-pause on Claude Code usage/rate limits with recovery plan".to_string(),
+                ),
+                enabled: true,
+                trigger_event_types: Some(vec![
+                    "usage.warning".to_string(),
+                    "usage.reached".to_string(),
+                ]),
+                requires_pane: Some(true),
+            },
         ];
 
-        assert_eq!(workflows.len(), 4, "must list exactly 4 workflows");
+        assert_eq!(workflows.len(), 5, "must list exactly 5 workflows");
         let names: Vec<&str> = workflows.iter().map(|w| w.name.as_str()).collect();
         assert!(names.contains(&"handle_compaction"));
         assert!(names.contains(&"handle_usage_limits"));
         assert!(names.contains(&"handle_session_end"));
         assert!(names.contains(&"handle_auth_required"));
+        assert!(names.contains(&"handle_claude_code_limits"));
         assert!(
             workflows.iter().all(|w| w.enabled),
             "all workflows must be enabled"

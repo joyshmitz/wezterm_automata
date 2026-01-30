@@ -53,6 +53,13 @@ All tools mirror `wa robot` semantics and schemas.
 | `wa.accounts_refresh` | Refresh account usage | `docs/json-schema/wa-robot-accounts-refresh.json` |
 | `wa.rules_list` | List detection rules | `docs/json-schema/wa-robot-rules-list.json` |
 | `wa.rules_test` | Test pattern matching | `docs/json-schema/wa-robot-rules-test.json` |
+| `wa.workflow_list` | List available workflows | `docs/json-schema/wa-robot-workflow-list.json` |
+| `wa.workflow_status` | Check workflow execution status | `docs/json-schema/wa-robot-workflow-status.json` |
+| `wa.workflow_abort` | Abort a running workflow | `docs/json-schema/wa-robot-workflow-abort.json` |
+| `wa.approve` | Submit approval code for pending action | `docs/json-schema/wa-robot-approve.json` |
+| `wa.why` | Explain an error code or policy denial | `docs/json-schema/wa-robot-why.json` |
+| `wa.rules_show` | Show details for a specific rule | `docs/json-schema/wa-robot-rules-show.json` |
+| `wa.rules_lint` | Lint rules: validate IDs, fixtures, regex | `docs/json-schema/wa-robot-rules-lint.json` |
 | `wa.reservations` | List active reservations | `docs/json-schema/wa-robot-reservations.json` |
 | `wa.reserve` | Create reservation | `docs/json-schema/wa-robot-reserve.json` |
 | `wa.release` | Release reservation | `docs/json-schema/wa-robot-release.json` |
@@ -94,6 +101,28 @@ Parameter types use JSON primitives; `u64` fields are JSON numbers.
 - `wa.rules_test`
   - Params: `{ text: string, agent?: string }`
 
+- `wa.rules_show`
+  - Params: `{ rule_id: string }`
+
+- `wa.rules_lint`
+  - Params: `{ pack?: string, fixtures?: bool=false, strict?: bool=false }`
+
+- `wa.workflow_list`
+  - Params: `{}`
+
+- `wa.workflow_status`
+  - Params: `{ execution_id?: string, pane_id?: u64, active?: bool=false, verbose?: bool=false }`
+  - Note: At least one of `execution_id`, `pane_id`, or `active` must be provided.
+
+- `wa.workflow_abort`
+  - Params: `{ execution_id: string, reason?: string, force?: bool=false }`
+
+- `wa.approve`
+  - Params: `{ code: string, pane_id?: u64, fingerprint?: string, dry_run?: bool=false }`
+
+- `wa.why`
+  - Params: `{ code: string }`
+
 - `wa.reservations`
   - Params: `{ pane_id?: u64 }`
 
@@ -130,12 +159,15 @@ All MCP errors use stable codes prefixed with `WA-MCP-`:
 | `WA-MCP-0008` | Workflow error | `robot.workflow_error` |
 | `WA-MCP-0009` | Timeout | `robot.timeout` |
 | `WA-MCP-0010` | Not implemented | `robot.not_implemented` |
+| `WA-MCP-0011` | Approval failed (expired, consumed, mismatch) | `robot.approval_error` |
+| `WA-MCP-0012` | Execution not found | `robot.execution_not_found` |
 
 ## Safety & Policy
 
 Any tool that causes side effects MUST pass the PolicyEngine, including:
 - `wa.send`
-- `wa.workflow_run`
+- `wa.workflow_run` / `wa.workflow_abort`
+- `wa.approve`
 - `wa.reserve` / `wa.release`
 - `wa.accounts_refresh` (if it triggers external calls)
 

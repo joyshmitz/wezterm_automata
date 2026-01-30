@@ -833,9 +833,9 @@ fn builtin_claude_code_pack() -> PatternPack {
                 regex: Some(r"(?:retry|reset|try again).*?(?P<reset_time>\d+\s*(?:seconds?|minutes?|hours?)|[\d:]+\s*(?:AM|PM|UTC))".to_string()),
                 description: "Claude Code usage limit reached".to_string(),
                 remediation: Some("Wait for limit reset or switch session".to_string()),
-                workflow: Some("handle_usage_limits".to_string()),
-                manual_fix: Some("Exit Claude Code with Ctrl-C, then switch to a different Anthropic account or wait for limit reset".to_string()),
-                preview_command: Some("wa workflow run handle_usage_limits --pane {pane} --dry-run".to_string()),
+                workflow: Some("handle_claude_code_limits".to_string()),
+                manual_fix: Some("Wait for limit reset or start a new Claude Code session".to_string()),
+                preview_command: Some("wa workflow run handle_claude_code_limits --pane {pane} --dry-run".to_string()),
                 learn_more_url: None,
             },
             // Session cost summary

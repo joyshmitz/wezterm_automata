@@ -58,6 +58,9 @@ wezterm-term = { workspace = true, optional = true }
 ratatui = { workspace = true, optional = true }
 crossterm = { workspace = true, optional = true }
 
+# MCP server (optional, behind feature)
+fastmcp = { workspace = true, optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 proptest = "1.8.0"
@@ -99,4 +102,4 @@ distributed = []
 # Optional heavy integrations - feature-gated (internal)
 vendored-wezterm = ["dep:codec", "dep:config", "dep:mux", "dep:wezterm-term"]
 browser-automation = []
-mcp-server = []
+mcp-server = ["dep:fastmcp"]

@@ -197,9 +197,24 @@ crossterm = "0.29.0"
 # Benchmarking
 criterion = { version = "0.7.0", features = ["async_tokio"] }
 
-# MCP (optional, local workspace)
+# FastMCP (optional MCP server dependencies)
+asupersync = { path = "../asupersync" }
+rich_rust = { path = "../rich_rust" }
+log = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+notify = "8"
+glob = "0.3"
+console = "0.15"
+getrandom = "0.3"
+trybuild = { version = "1", default-features = false }
 fastmcp = { path = "../fastmcp_rust/crates/fastmcp" }
+fastmcp-core = { path = "../fastmcp_rust/crates/fastmcp-core" }
 fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
+fastmcp-protocol = { path = "../fastmcp_rust/crates/fastmcp-protocol" }
+fastmcp-server = { path = "../fastmcp_rust/crates/fastmcp-server" }
+fastmcp-client = { path = "../fastmcp_rust/crates/fastmcp-client" }
+fastmcp-macros = { path = "../fastmcp_rust/crates/fastmcp-macros" }
+fastmcp-console = { path = "../fastmcp_rust/crates/fastmcp-console" }
 
 # Internal crates
 wa-core = { path = "crates/wa-core" }

@@ -64,6 +64,8 @@ pub mod ingest;
 pub mod ipc;
 pub mod lock;
 pub mod logging;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod output;
 pub mod patterns;
 pub mod plan;

@@ -77,6 +77,7 @@ pub mod session_correlation;
 pub mod setup;
 pub mod storage;
 pub mod suggestions;
+pub mod learn;
 pub mod tailer;
 pub mod wait;
 pub mod watchdog;

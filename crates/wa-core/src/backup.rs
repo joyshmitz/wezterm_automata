@@ -1309,7 +1309,10 @@ mod tests {
     #[test]
     fn schedule_next_daily_advances() {
         let schedule = BackupSchedule::parse("daily").unwrap();
-        let now = Local.with_ymd_and_hms(2026, 1, 18, 12, 0, 0).unwrap();
+        let now = Local
+            .with_ymd_and_hms(2026, 1, 18, 12, 0, 0)
+            .single()
+            .unwrap();
         let next = schedule.next_after(now).unwrap();
         assert!(next > now);
         assert_eq!(next.hour(), 3);
@@ -1347,7 +1350,10 @@ mod tests {
         create_backup("b2", "2026-01-10T00:00:00Z");
         create_backup("b3", "2026-01-20T00:00:00Z");
 
-        let now = Local.with_ymd_and_hms(2026, 1, 25, 12, 0, 0).unwrap();
+        let now = Local
+            .with_ymd_and_hms(2026, 1, 25, 12, 0, 0)
+            .single()
+            .unwrap();
         let summary = prune_backups(root, 0, 2, now).unwrap();
         assert_eq!(summary.kept, 2);
 

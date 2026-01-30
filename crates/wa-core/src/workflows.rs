@@ -13076,7 +13076,7 @@ Try again at 3:00 PM UTC.
         assert_eq!(plan["limit_type"], "usage_warning");
         assert_eq!(plan["pane_id"], 42);
         assert_eq!(plan["safe_to_send"], true);
-        assert!(plan["next_steps"].as_array().unwrap().len() > 0);
+        assert!(!plan["next_steps"].as_array().unwrap().is_empty());
     }
 
     #[test]

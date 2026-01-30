@@ -12657,18 +12657,16 @@ fn run_diagnostics(
     }
 
     // Check 7: Feature flags
-    #[allow(unused_mut, clippy::vec_init_then_push)]
-    let mut features: Vec<&str> = Vec::new();
-    #[cfg(feature = "tui")]
-    features.push("tui");
-    #[cfg(feature = "browser")]
-    features.push("browser");
-    #[cfg(feature = "mcp")]
-    features.push("mcp");
-    #[cfg(feature = "web")]
-    features.push("web");
-    #[cfg(feature = "metrics")]
-    features.push("metrics");
+    let features: Vec<&str> = [
+        (cfg!(feature = "tui"), "tui"),
+        (cfg!(feature = "browser"), "browser"),
+        (cfg!(feature = "mcp"), "mcp"),
+        (cfg!(feature = "web"), "web"),
+        (cfg!(feature = "metrics"), "metrics"),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, name)| enabled.then_some(name))
+    .collect();
 
     if features.is_empty() {
         checks.push(DiagnosticCheck::ok_with_detail(

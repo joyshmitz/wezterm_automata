@@ -9,9 +9,9 @@ use thiserror::Error;
 use crate::config::{DistributedAuthMode, DistributedConfig, DistributedTlsConfig};
 
 #[cfg(feature = "distributed")]
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
-#[cfg(feature = "distributed")]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+#[cfg(feature = "distributed")]
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 #[cfg(feature = "distributed")]
 use rustls_pemfile::{certs, private_key};
 
@@ -78,9 +78,9 @@ fn ensure_crypto_provider() -> Result<(), DistributedTlsError> {
     }
 
     let provider = rustls::crypto::ring::default_provider();
-    provider
-        .install_default()
-        .map_err(|_| DistributedTlsError::Config("failed to install crypto provider".to_string()))?;
+    provider.install_default().map_err(|_| {
+        DistributedTlsError::Config("failed to install crypto provider".to_string())
+    })?;
     INSTALLED.set(()).ok();
     Ok(())
 }
@@ -103,7 +103,9 @@ fn load_cert_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, Distribu
     );
     let cert_chain = certs(&mut reader).map_err(|e| DistributedTlsError::io(path, e))?;
     if cert_chain.is_empty() {
-        return Err(DistributedTlsError::EmptyCertChain(path.display().to_string()));
+        return Err(DistributedTlsError::EmptyCertChain(
+            path.display().to_string(),
+        ));
     }
     Ok(cert_chain)
 }
@@ -120,10 +122,7 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, DistributedTl
 }
 
 #[cfg(feature = "distributed")]
-fn add_to_root_store(
-    root_store: &mut RootCertStore,
-    certs: Vec<CertificateDer<'static>>,
-) {
+fn add_to_root_store(root_store: &mut RootCertStore, certs: Vec<CertificateDer<'static>>) {
     let _ = root_store.add_parsable_certificates(certs);
 }
 
@@ -243,11 +242,7 @@ pub fn build_tls_bundle(
 #[cfg(feature = "distributed")]
 #[must_use]
 pub fn build_tls_server_name(bind_addr: &str) -> Result<ServerName<'static>, DistributedTlsError> {
-    let host = bind_addr
-        .split(':')
-        .next()
-        .unwrap_or(bind_addr)
-        .trim();
+    let host = bind_addr.split(':').next().unwrap_or(bind_addr).trim();
     let name = if host.is_empty() { "localhost" } else { host };
     ServerName::try_from(name.to_string())
         .map_err(|_| DistributedTlsError::Config("invalid server name".to_string()))
@@ -264,16 +259,19 @@ mod tests {
     #[cfg(feature = "distributed")]
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+    #[cfg(feature = "distributed")]
     const SERVER_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIDCTCCAfGgAwIBAgIUE80IDTEN+Gsw+YEyX3/RxEm7y20wDQYJKoZIhvcNAQEL\nBQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDEzMTA1MzY1M1oXDTI2MDIw\nMTA1MzY1M1owFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF\nAAOCAQ8AMIIBCgKCAQEAm5+VdJZPpI5juiQSfWUOLTjo3A/beyX1etb8RCKBB167\n+KqDCZsPUNalAOl/kgFhZJjHHxBKhEwZORxRmPIM4EIIUA+yq2D7kKw0wQd50VjI\ncyHbjwtrAf9Q+xVSzZZNTJ/SbZzp6OH0uviiGzJGbzNigX6at1djdpMxMsMaj3Gk\nICw9Aa7WhOqIZBfO0rwVJdr+WqKvlfR20SwI7QuEdgSbHdEw09zhQjb9rkw5a4QA\n2klTDAJCWV/jNEsmIk7j7GQ22AGiR5Mxn4MPBpFcdb5NQ2lWY0M+Ph9S+9D8Oo98\nXBcwKIvc4ySN2ksz39wkFJfNz1QUpHvi59D9KPLiywIDAQABo1MwUTAdBgNVHQ4E\nFgQUvmP/SY9W7MqInyEWbEwCGlTVHGAwHwYDVR0jBBgwFoAUvmP/SY9W7MqInyEW\nbEwCGlTVHGAwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAW9Fg\noD5Z315yXijyqISH+AUxlfGHPCOtV1+zr7e9/AN48Fbwuw9F0PdbZUG6E3QIfVrW\nCgvAbkP8mNN+qKdsWdZ3QH9E6HFc9uAK/g8OhJ2ayYbR4bhc72QKy6uXC+Ku6w8f\nXbtIMe4mVOZC16ELB8NLT8lhqukR+XBzD23nQY3o+u9HZWUjDnJuHHs5KbrUp1TG\nyvIgZ+dtwZ8qfP08kU4JzZiJpMN6olXBTIywa10djmn4icvsaFs2gK8H4fZ5fSAG\neEdY/kurQVLOWuhJw7O7RAw+GwFKx4oQIAQ+u0OzyLo6LVEd1RKs5jAArOa7ojw4\nmUc9I1WRq6ivcBVZEg==\n-----END CERTIFICATE-----\n";
+    #[cfg(feature = "distributed")]
     const SERVER_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCbn5V0lk+kjmO6\nJBJ9ZQ4tOOjcD9t7JfV61vxEIoEHXrv4qoMJmw9Q1qUA6X+SAWFkmMcfEEqETBk5\nHFGY8gzgQghQD7KrYPuQrDTBB3nRWMhzIduPC2sB/1D7FVLNlk1Mn9JtnOno4fS6\n+KIbMkZvM2KBfpq3V2N2kzEywxqPcaQgLD0BrtaE6ohkF87SvBUl2v5aoq+V9HbR\nLAjtC4R2BJsd0TDT3OFCNv2uTDlrhADaSVMMAkJZX+M0SyYiTuPsZDbYAaJHkzGf\ngw8GkVx1vk1DaVZjQz4+H1L70Pw6j3xcFzAoi9zjJI3aSzPf3CQUl83PVBSke+Ln\n0P0o8uLLAgMBAAECggEAC/u9X/VlG5hFUKOPcu1xqoTL1Yo5DeIN5ZAha8O2aNFg\nKxVCMt6oTsLAgPH5+0206LClAJzaCBbuCEpIdD0LRcd/6V5UFUNKC8le5JBFTpwG\nD2uHgxvPeR9mZnctYZxVxnU2GG+xSVgA5tbXcL2t08lCqBMOKdkGVS6fZrfEV1A7\ngUM5yEv2YRuxM88jH3w39XOSj/vVQ31ua7P/GVByLCLwszIP+MKzVFjiFKmYRZPT\nI2sK1HZCFKTpfaUC9qXA2vUz+4yaz2c0ZA5Q0zzBkPXQ6i0k4l1V0LOPvgjJqcRW\npI6hoC5mrk5V/C0ptkd+O3TykjKIkjjjnLhdsw/HiQKBgQDbWis3xWvIltGUDjvS\nNDperl2GHjwvOJBp46cdaxrHe2GSPfxMK92xFsxc/gYtDoc+KOXd+dkcW8sqlD/c\nAVIQeJr1Wm9U+uRWgGT2v3y3gm7PqTmAZDXvmgTGUkIGC06eUqXNoWkVSEWyOoaQ\nrMiRrSUQMd+s1SZ3R5gmUyZNaQKBgQC1n7FF/STCv0wMIHnbQldvAeaG8bvW0I8z\nCxKWrJm9bnGVO4JzipDTB7fqcfHxuOBq+LQGyZ1qU5DO6te+hEbwlb7pCHYAsxPD\nzHiGIH9pb2xPhB35/M8N9e9Bem4uY4Ddleu7acnIteHpheOjWslHohs1LJQ/zDdF\nWItNUImEEwKBgB2B06588DLblvXDtGhifjeeXRZdmtr/UO3tod1jOwb6ofV6QSY+\nAGSCHJul0E7fVXIXLlTd90bJUls39h8yTkfI8Y9vyuozlePNAcfvmmdVNHLa4NFU\nqazBm0LSbe9CNiE2HPe8btZeEoIXPWLY22I9WG8FRoGJatNA3kbJiK2BAoGBAKNM\nDWtMCz0+GfXdTTKiF1KrdsVlmumtYtMV5YSrcx8qqdzvQH752vSiP+3+vPYEr2H+\ncn6Xz3zF3bDs3UViURYGzTtgbBh86gxlTwfpOCVoFQ35T6pwbwmyUYehuGbk9/xC\ny0wZ9V8MiS4ZP26kNcy+J5BLoI8r4ZXr4nOFMd8ZAoGASkM5+FpOEGOqMh3O8hSN\nOyaeaXyfP+lwB6HPCFaGFF5VQEercRxmso9l1jcjiTE6Iyu0oLBsrXa/odw1oNel\ncgV7HLLcnD13w2PbL+Z0cugOoYNvRg1RMkNFWSuQjL9Ol/a0Se0L1Ko/kCxlZ12r\n/l+dQ8wcNxsMVeXRyUXjnUU=\n-----END PRIVATE KEY-----\n";
+    #[cfg(feature = "distributed")]
     const CLIENT_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIDCTCCAfGgAwIBAgIUFeQdnrTv13mozVgbE4kfww8bIGgwDQYJKoZIhvcNAQEL\nBQAwFDESMBAGA1UEAwwJd2EtY2xpZW50MB4XDTI2MDEzMTA1MzY1OFoXDTI2MDIw\nMTA1MzY1OFowFDESMBAGA1UEAwwJd2EtY2xpZW50MIIBIjANBgkqhkiG9w0BAQEF\nAAOCAQ8AMIIBCgKCAQEArCXXSCsUISY9kVsZbwKwgxeKnvdyOMZRZiaZjCITIIax\nsANzwsVFpLjbMbCDxj1T3MkBXqE5WeLgdrATFupFev0uEKbkxOrifkLu2PdAvZiA\nrWqCsEaqchC6LV6l1GIcw42D8BPqY3q+ucE3lBmp6H4ZnmO4GiE+vYNL3EKN5h2a\ntgs2PEbq6azSHwaZpxNVYDV+D2US2nSFS7U1wWMOXlOpPiWPm6gJ6TQX+66iZfD9\nXUtL6+XQYtFzrRDI6zdUPp5bBvpvVqYTUjkW3tjzIhAVNvypCdTWlzIV+16MEgwF\nWEp8ZRvX6nNnQfsAegEHyhfg3XJmLZ2/dRk2mGrChQIDAQABo1MwUTAdBgNVHQ4E\nFgQUfCm6FqmAWt0R64dahvDaBh7SwoUwHwYDVR0jBBgwFoAUfCm6FqmAWt0R64da\nhvDaBh7SwoUwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAM3lI\nOiLsdrQ/CTjVC43HrdujgtrCDHvrQldVGvJRZrnNWy5Kxdh/kDXh4jXNfQM7TnJj\n+rZC5Gjns2yBAHXSbHAFx9BnbiRUbXM3y5BtyZUDqpkGyzjeUKhtgyRsrWeRmtn6\na+DBMv6F6EBX1Wf9v8EsAs7NLXElAR0aUUQtITH7vrAE2E+KzVKgLVKTV9DOv5wB\noXYnSXgvs88q6oZcD7v1qlnKEJTcGFlDWonjw7VHWvzAnMtUISWchXg4ym3zGpLN\nfLvxu7fsQ0+7aJIL5GWqer3PflkyW/SrfkhNwhH378LlPIuQctPhAS4SocR+O+Qu\nOjvE9T/zUgTCs0ULtQ==\n-----END CERTIFICATE-----\n";
+    #[cfg(feature = "distributed")]
     const CLIENT_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCsJddIKxQhJj2R\nWxlvArCDF4qe93I4xlFmJpmMIhMghrGwA3PCxUWkuNsxsIPGPVPcyQFeoTlZ4uB2\nsBMW6kV6/S4QpuTE6uJ+Qu7Y90C9mICtaoKwRqpyELotXqXUYhzDjYPwE+pjer65\nwTeUGanofhmeY7gaIT69g0vcQo3mHZq2CzY8RurprNIfBpmnE1VgNX4PZRLadIVL\ntTXBYw5eU6k+JY+bqAnpNBf7rqJl8P1dS0vr5dBi0XOtEMjrN1Q+nlsG+m9WphNS\nORbe2PMiEBU2/KkJ1NaXMhX7XowSDAVYSnxlG9fqc2dB+wB6AQfKF+DdcmYtnb91\nGTaYasKFAgMBAAECggEAARX0Nsz2WzCRgVeLGfkXa2nZDDntaYz1dpJspzNc0WvA\nEA18uK0Dv8j4F8CWm2GHvdP/uZAE24htV+cYfu1ao4hLkG8F10JPzBhe4Mi+16NJ\nwBSn2KkT1wg8RsZ6zC1G1xEb4XlpFRg98gNIg853CAbplI2DW8wILp8dU2xd1qZ1\nACk1RjxUJRC4SLkw1lVwoYLuGPRZP/bbVTSBZc9k4rHRDBNX6W5iQX+WFM2ce/cK\n1zZWYt3wX7t0ppaQDiD9pdtRt3xHRH6+8/2xaAIRQPd/rlgdhw/y2WsibTaNTNY3\n31At86X6IEr2tU93hGVEwKIaHyVTLC3eh46ZCxYocQKBgQDZaLi7TVpplNrKv2SF\nTywbCl+LQR9k0fWDOBO2i3D39q0xav0iJbbBuw/aUedrcUI05WPD49MRfgHCzxuN\nhSoZUpyCXBu7OomR5Kjr8RMc2eqTxgqgJ9sxd4t4ZScw1a5TnCPqVMrXjKd6taaO\nI5Bu37NRsosCNE4xknSjLujKdQKBgQDKtGd8DUzStwl9e+PgbafkbvFZKNoBslfe\nRaYj4YFPa9RVpIc5TEOpLaanQ/cI5HCZTbXsi8oC0jaKiMqwLbH0kUu3xzURNiVV\nB7d/MB6Md62yluGzrUED/o7GP0566+dVrt1rHyGrYcwrzDqqWSx45SgcEQScjBDn\nVMylcb510QKBgFkhabrAN7TZZemBFcDheH+NfSYmCKzYtwKY1twbxrCh3NdJuYVq\nWMaL3i/vLCUMRcxRztjcagfd1PL83ZrjYSMIj0mSYXwcv5GkYOx55RAK9vSmWGzY\najCZhgBR2ANZVyLH/KFxKce8zlysZCAZzHjoFSgFPqAkuXnxRQgxjxaRAoGBAKqZ\nfML+Gpr5a6ZNv7Lh9zydVsjYRerJo4QxkCuAnikusm1F5H0Hv6ZCApGh9OZqBI4x\nxhwIZoNLUpXznMr8Glqgcl6A7RvIO1E+BmSoJf3It8qni9uBxEdNVfJp025G3tLR\nMg73C4pG6+QspW87T9+L1d8RP5VVmOBpETdo7IgRAoGAchELpTFBqL6gJS8UdBIY\n6fDjI7bLAbS857GK0nZGirnf5K7jsLqWhPXH8P1MdeQI07h3MhdFhNIVNMW+Aw/X\nv3laRSxE3sKVF8aRAjP/1JbwuN9/3hp7qd14X6cM8UR4VjdLrqBNvDcbIev5rlk+\ner8uVa4IHwqz2SbI76nmw1M=\n-----END PRIVATE KEY-----\n";
 
     #[cfg(feature = "distributed")]
     fn temp_pem(contents: &str) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().expect("temp file");
-        std::io::Write::write_all(file.as_file_mut(), contents.as_bytes())
-            .expect("write pem");
+        std::io::Write::write_all(file.as_file_mut(), contents.as_bytes()).expect("write pem");
         file
     }
 
@@ -289,8 +287,8 @@ mod tests {
         config.tls.cert_path = Some(server_cert.path().display().to_string());
         config.tls.key_path = Some(server_key.path().display().to_string());
 
-        let server_config = build_server_config(&config.tls, DistributedAuthMode::Token)
-            .expect("server config");
+        let server_config =
+            build_server_config(&config.tls, DistributedAuthMode::Token).expect("server config");
         let client_config = build_client_config(
             &config.tls,
             DistributedAuthMode::Token,
@@ -311,10 +309,12 @@ mod tests {
         });
 
         let connector = TlsConnector::from(client_config);
-        let server_name = ServerName::try_from("localhost")
-            .expect("server name");
+        let server_name = ServerName::try_from("localhost").expect("server name");
         let mut stream = connector
-            .connect(server_name, tokio::net::TcpStream::connect(addr).await.expect("connect"))
+            .connect(
+                server_name,
+                tokio::net::TcpStream::connect(addr).await.expect("connect"),
+            )
             .await
             .expect("tls connect");
         stream.write_all(b"ping").await.expect("write");
@@ -368,10 +368,12 @@ mod tests {
         });
 
         let connector = TlsConnector::from(client_tls);
-        let server_name = ServerName::try_from("localhost")
-            .expect("server name");
+        let server_name = ServerName::try_from("localhost").expect("server name");
         let mut stream = connector
-            .connect(server_name, tokio::net::TcpStream::connect(addr).await.expect("connect"))
+            .connect(
+                server_name,
+                tokio::net::TcpStream::connect(addr).await.expect("connect"),
+            )
             .await
             .expect("tls connect");
         stream.write_all(b"ok").await.expect("write");

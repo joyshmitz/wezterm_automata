@@ -119,6 +119,7 @@ Notes:
 ```bash
 wa tui          # requires --features tui
 wa mcp serve    # requires --features mcp
+wa web          # requires --features web
 wa sync         # requires --features sync
 ```
 
@@ -127,7 +128,6 @@ wa sync         # requires --features sync
 ```text
 wa history
 wa undo
-wa web
 ```
 
 ## Robot mode (stable JSON/TOON)

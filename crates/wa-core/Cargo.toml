@@ -61,6 +61,9 @@ crossterm = { workspace = true, optional = true }
 
 # MCP server (optional, behind feature)
 fastmcp = { workspace = true, optional = true }
+# Web server (optional, behind feature)
+fastapi = { workspace = true, optional = true }
+fastapi-core = { workspace = true, optional = true }
 # Sync (optional, behind feature)
 asupersync = { workspace = true, optional = true }
 # Distributed mode (optional, behind feature)
@@ -101,7 +104,7 @@ default = []
 vendored = ["vendored-wezterm"]
 browser = ["browser-automation"]
 mcp = ["mcp-server"]
-web = []
+web = ["dep:fastapi", "dep:fastapi-core", "dep:asupersync"]
 tui = ["dep:ratatui", "dep:crossterm"]
 metrics = []
 distributed = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]

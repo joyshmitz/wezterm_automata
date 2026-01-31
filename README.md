@@ -592,7 +592,7 @@ wa robot send 0 "test" --dry-run
 |------------|---------------|---------|
 | Browser automation (OAuth) | Feature-gated, partial | v0.2 |
 | MCP server integration | Feature-gated (stdio) | v0.2 |
-| Web dashboard | Not started | v0.3 |
+| Web dashboard | Feature-gated (health-only) | v0.3 |
 | Multi-host federation | Not started | v2.0 |
 
 ---

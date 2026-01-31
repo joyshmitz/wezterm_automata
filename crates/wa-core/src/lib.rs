@@ -32,6 +32,7 @@
 //! - `plan`: Action plan types for unified workflow representation
 //! - `browser`: Browser automation scaffolding (feature-gated: `browser`)
 //! - `sync`: Optional sync scaffolding (feature-gated: `sync`)
+//! - `web`: Optional HTTP server scaffolding (feature-gated: `web`)
 //!
 //! # Safety
 //!
@@ -98,14 +99,17 @@ pub mod browser;
 #[cfg(feature = "tui")]
 pub mod tui;
 
+#[cfg(feature = "web")]
+pub mod web;
+
 #[cfg(feature = "distributed")]
 pub mod distributed;
 
 #[cfg(feature = "sync")]
 pub mod sync;
 
-#[cfg(feature = "sync")]
-pub mod sync;
+#[cfg(feature = "web")]
+pub mod web;
 
 pub use error::{Error, Result, StorageError};
 

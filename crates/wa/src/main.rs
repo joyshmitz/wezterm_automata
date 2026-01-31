@@ -918,6 +918,21 @@ SEE ALSO:
         details: bool,
     },
 
+    /// Start the web server (requires --features web)
+    #[cfg(feature = "web")]
+    #[command(after_help = r#"EXAMPLES:
+    wa web                            Start web server on 127.0.0.1:8000
+    wa web --port 0                   Bind to an ephemeral port (tests)
+
+SEE ALSO:
+    wa status     CLI status overview
+    wa triage     Operator dashboard"#)]
+    Web {
+        /// Port to bind on localhost (0 for ephemeral)
+        #[arg(long, default_value = "8000")]
+        port: u16,
+    },
+
     /// Launch the interactive TUI (requires --features tui)
     #[cfg(feature = "tui")]
     #[command(after_help = r#"EXAMPLES:
@@ -936,6 +951,20 @@ SEE ALSO:
         /// Refresh interval in seconds
         #[arg(long, default_value = "5")]
         refresh: u64,
+    },
+
+    /// Start the optional web server (requires --features web)
+    #[cfg(feature = "web")]
+    #[command(after_help = r#"EXAMPLES:
+    wa web                            Start web server on 127.0.0.1:8080
+    wa web --port 0                   Bind to an ephemeral port (tests)
+
+SEE ALSO:
+    docs/architecture.md"#)]
+    Web {
+        /// Port to bind (0 = ephemeral)
+        #[arg(long, default_value = "8080")]
+        port: u16,
     },
 
     /// MCP server commands (Model Context Protocol)
@@ -12059,6 +12088,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
+        #[cfg(feature = "web")]
+        Some(Commands::Web { port }) => {
+            let config = wa_core::web::WebServerConfig::new(port);
+            wa_core::web::run_web_server(config).await?;
+        }
+
         #[cfg(feature = "tui")]
         Some(Commands::Tui { debug, refresh }) => {
             use std::time::Duration;
@@ -12092,6 +12127,40 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             if let Err(e) = result {
                 eprintln!("TUI error: {e}");
                 return Err(e.into());
+            }
+        }
+
+        #[cfg(feature = "web")]
+        Some(Commands::Web { port }) => {
+            let bind_addr = wa_core::web::resolve_bind_addr(port)
+                .map_err(|e| anyhow::anyhow!("web bind failed: {e}"))?;
+            println!("wa web listening on http://{bind_addr}");
+
+            let controller = wa_core::web::ShutdownController::new();
+            let shutdown = controller.subscribe();
+            let config_clone = config.clone();
+            let addr_clone = bind_addr.clone();
+
+            let server_handle = tokio::task::spawn_blocking(move || {
+                wa_core::web::run_web_server(&config_clone, addr_clone, shutdown)
+            });
+
+            let result = tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    controller.shutdown();
+                    server_handle.await
+                }
+                res = server_handle => res,
+            };
+
+            match result {
+                Ok(Ok(_outcome)) => {}
+                Ok(Err(err)) => {
+                    return Err(anyhow::anyhow!("web server error: {err}"));
+                }
+                Err(err) => {
+                    return Err(anyhow::anyhow!("web server thread failed: {err}"));
+                }
             }
         }
 

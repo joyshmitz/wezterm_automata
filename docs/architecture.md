@@ -47,7 +47,6 @@ WezTerm panes
 | charmed_rust | Optional TUI (pane picker, event feed, transcript viewer) | feature-gated (tui) |
 | fastmcp_rust | MCP tool surface (mirrors robot mode) | feature-gated (mcp) |
 | fastapi_rust | Optional HTTP server for dashboards/webhooks | planned |
-| asupersync | Remote bootstrap/sync layer (configs, binaries, DB snapshots) | planned |
+| asupersync | Remote bootstrap/sync layer (configs, binaries, DB snapshots); see docs/sync-spec.md | planned |
 | playwright | Automate device auth flows with persistent profiles | feature-gated (browser) |
 | ast-grep | Structure-aware scans for rule hygiene tooling | tooling |
-

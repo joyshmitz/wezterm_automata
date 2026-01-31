@@ -69,6 +69,26 @@ pub struct EventView {
     pub handled: bool,
 }
 
+/// Action associated with a triage item
+#[derive(Debug, Clone)]
+pub struct TriageAction {
+    pub label: String,
+    pub command: String,
+}
+
+/// Triage item for the TUI
+#[derive(Debug, Clone)]
+pub struct TriageItemView {
+    pub section: String,
+    pub severity: String,
+    pub title: String,
+    pub detail: String,
+    pub actions: Vec<TriageAction>,
+    pub event_id: Option<i64>,
+    pub pane_id: Option<u64>,
+    pub workflow_id: Option<String>,
+}
+
 /// Search result for TUI display
 #[derive(Debug, Clone)]
 pub struct SearchResultView {
@@ -111,6 +131,9 @@ pub trait QueryClient: Send + Sync {
     /// List recent events with optional filters
     fn list_events(&self, filters: &EventFilters) -> Result<Vec<EventView>, QueryError>;
 
+    /// List triage items for operator attention
+    fn list_triage_items(&self) -> Result<Vec<TriageItemView>, QueryError>;
+
     /// Full-text search across captured output
     fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResultView>, QueryError>;
 
@@ -119,6 +142,9 @@ pub trait QueryClient: Send + Sync {
 
     /// Check if the watcher is running
     fn is_watcher_running(&self) -> bool;
+
+    /// Mark an event as muted (handled without workflow)
+    fn mark_event_muted(&self, event_id: i64) -> Result<(), QueryError>;
 }
 
 /// Production implementation of QueryClient
@@ -247,6 +273,193 @@ impl QueryClient for ProductionQueryClient {
             .collect())
     }
 
+    fn list_triage_items(&self) -> Result<Vec<TriageItemView>, QueryError> {
+        use crate::crash::{HealthSnapshot, latest_crash_bundle};
+        use crate::output::{HealthDiagnosticStatus, HealthSnapshotRenderer};
+
+        fn action(label: &str, command: String) -> TriageAction {
+            TriageAction {
+                label: label.to_string(),
+                command,
+            }
+        }
+
+        fn severity_rank(sev: &str) -> u8 {
+            match sev {
+                "error" => 3,
+                "warning" => 2,
+                "info" => 1,
+                _ => 0,
+            }
+        }
+
+        let mut items: Vec<TriageItemView> = Vec::new();
+
+        // Health diagnostics (in-process snapshot)
+        if let Some(snapshot) = HealthSnapshot::get_global() {
+            let checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
+            for check in &checks {
+                let severity = match check.status {
+                    HealthDiagnosticStatus::Error => "error",
+                    HealthDiagnosticStatus::Warning => "warning",
+                    _ => continue,
+                };
+                items.push(TriageItemView {
+                    section: "health".to_string(),
+                    severity: severity.to_string(),
+                    title: check.name.clone(),
+                    detail: check.detail.clone(),
+                    actions: vec![
+                        action("Run diagnostics", "wa doctor".to_string()),
+                        action("Machine diagnostics", "wa doctor --json".to_string()),
+                    ],
+                    event_id: None,
+                    pane_id: None,
+                    workflow_id: None,
+                });
+            }
+        }
+
+        // Recent crash bundle
+        if let Some(bundle) = latest_crash_bundle(&self.workspace_layout.crash_dir) {
+            let detail = if let Some(ref report) = bundle.report {
+                let msg = if report.message.len() > 100 {
+                    format!("{}...", &report.message[..97])
+                } else {
+                    report.message.clone()
+                };
+                format!(
+                    "{msg} (at {})",
+                    report.location.as_deref().unwrap_or("unknown")
+                )
+            } else if let Some(ref manifest) = bundle.manifest {
+                format!("crash at {}", manifest.created_at)
+            } else {
+                "crash bundle found".to_string()
+            };
+            items.push(TriageItemView {
+                section: "crashes".to_string(),
+                severity: "warning".to_string(),
+                title: "Recent crash".to_string(),
+                detail,
+                actions: vec![
+                    action(
+                        "Export crash bundle",
+                        "wa reproduce --kind crash".to_string(),
+                    ),
+                    action("Run diagnostics", "wa doctor".to_string()),
+                ],
+                event_id: None,
+                pane_id: None,
+                workflow_id: None,
+            });
+        }
+
+        // Unhandled events + incomplete workflows (require DB)
+        let Some(storage) = &self.storage else {
+            items.push(TriageItemView {
+                section: "health".to_string(),
+                severity: "warning".to_string(),
+                title: "Database unavailable".to_string(),
+                detail: "Could not open storage".to_string(),
+                actions: vec![
+                    action("Start watcher", "wa watch".to_string()),
+                    action("Run diagnostics", "wa doctor".to_string()),
+                ],
+                event_id: None,
+                pane_id: None,
+                workflow_id: None,
+            });
+            items.sort_by(|a, b| severity_rank(&b.severity).cmp(&severity_rank(&a.severity)));
+            return Ok(items);
+        };
+
+        // Unhandled events
+        let query = crate::storage::EventQuery {
+            limit: Some(20),
+            pane_id: None,
+            rule_id: None,
+            event_type: None,
+            unhandled_only: true,
+            since: None,
+            until: None,
+        };
+        let events = self.runtime.block_on(async {
+            storage
+                .get_events(query)
+                .await
+                .map_err(|e| QueryError::StorageError(e.to_string()))
+        })?;
+        for event in events {
+            items.push(TriageItemView {
+                section: "events".to_string(),
+                severity: event.severity,
+                title: format!(
+                    "[pane {}] {}: {}",
+                    event.pane_id, event.event_type, event.rule_id
+                ),
+                detail: event
+                    .matched_text
+                    .unwrap_or_default()
+                    .chars()
+                    .take(120)
+                    .collect(),
+                actions: vec![
+                    action(
+                        "List unhandled events",
+                        format!("wa events --pane {} --unhandled", event.pane_id),
+                    ),
+                    action(
+                        "Explain detection",
+                        format!("wa why --recent --pane {}", event.pane_id),
+                    ),
+                    action("Show pane details", format!("wa show {}", event.pane_id)),
+                ],
+                event_id: Some(event.id),
+                pane_id: Some(event.pane_id),
+                workflow_id: None,
+            });
+        }
+
+        // Incomplete workflows
+        let workflows = self.runtime.block_on(async {
+            storage
+                .find_incomplete_workflows()
+                .await
+                .map_err(|e| QueryError::StorageError(e.to_string()))
+        })?;
+        for wf in workflows {
+            items.push(TriageItemView {
+                section: "workflows".to_string(),
+                severity: "info".to_string(),
+                title: format!("{} (pane {})", wf.workflow_name, wf.pane_id),
+                detail: format!("status={}, step={}", wf.status, wf.current_step),
+                actions: vec![
+                    action(
+                        "Check workflow status",
+                        format!("wa workflow status {}", wf.id),
+                    ),
+                    action(
+                        "Explain decisions",
+                        format!("wa why --recent --pane {}", wf.pane_id),
+                    ),
+                    action("Show pane details", format!("wa show {}", wf.pane_id)),
+                ],
+                event_id: None,
+                pane_id: Some(wf.pane_id),
+                workflow_id: Some(wf.id.clone()),
+            });
+        }
+
+        items.sort_by(|a, b| {
+            let sa = severity_rank(&a.severity);
+            let sb = severity_rank(&b.severity);
+            sb.cmp(&sa).then_with(|| a.title.cmp(&b.title))
+        });
+
+        Ok(items)
+    }
+
     fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResultView>, QueryError> {
         let Some(storage) = &self.storage else {
             return Err(QueryError::DatabaseNotInitialized(
@@ -306,6 +519,21 @@ impl QueryClient for ProductionQueryClient {
     fn is_watcher_running(&self) -> bool {
         self.workspace_layout.lock_path.exists()
     }
+
+    fn mark_event_muted(&self, event_id: i64) -> Result<(), QueryError> {
+        let Some(storage) = &self.storage else {
+            return Err(QueryError::DatabaseNotInitialized(
+                "Database connection not available".to_string(),
+            ));
+        };
+
+        self.runtime.block_on(async {
+            storage
+                .mark_event_handled(event_id, None, "muted")
+                .await
+                .map_err(|e| QueryError::StorageError(e.to_string()))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -316,6 +544,7 @@ mod tests {
     struct MockQueryClient {
         panes: Vec<PaneView>,
         events: Vec<EventView>,
+        triage_items: Vec<TriageItemView>,
         watcher_running: bool,
     }
 
@@ -331,6 +560,19 @@ mod tests {
                     agent_type: Some("claude-code".to_string()),
                 }],
                 events: Vec::new(),
+                triage_items: vec![TriageItemView {
+                    section: "events".to_string(),
+                    severity: "warning".to_string(),
+                    title: "[pane 0] test".to_string(),
+                    detail: "detail".to_string(),
+                    actions: vec![TriageAction {
+                        label: "Explain".to_string(),
+                        command: "wa why --recent --pane 0".to_string(),
+                    }],
+                    event_id: Some(1),
+                    pane_id: Some(0),
+                    workflow_id: None,
+                }],
                 watcher_running: true,
             }
         }
@@ -343,6 +585,10 @@ mod tests {
 
         fn list_events(&self, _filters: &EventFilters) -> Result<Vec<EventView>, QueryError> {
             Ok(self.events.clone())
+        }
+
+        fn list_triage_items(&self) -> Result<Vec<TriageItemView>, QueryError> {
+            Ok(self.triage_items.clone())
         }
 
         fn search(&self, _query: &str, _limit: usize) -> Result<Vec<SearchResultView>, QueryError> {
@@ -363,6 +609,10 @@ mod tests {
 
         fn is_watcher_running(&self) -> bool {
             self.watcher_running
+        }
+
+        fn mark_event_muted(&self, _event_id: i64) -> Result<(), QueryError> {
+            Ok(())
         }
     }
 

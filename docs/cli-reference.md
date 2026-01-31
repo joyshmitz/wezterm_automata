@@ -22,7 +22,7 @@ wa get-text <pane_id> [--escapes]   # stub (not yet implemented)
 wa search "<fts query>" [--pane <id>] [--limit <n>] [--since <epoch_ms>]
 wa query "<fts query>"             # alias for wa search
 wa events [--unhandled] [--pane-id <id>] [--rule-id <id>] [--event-type <type>]
-wa triage [--severity <error|warning|info>] [--only <section>] [--verbose]
+wa triage [--severity <error|warning|info>] [--only <section>] [--details]
 ```
 
 ### Actions, approvals, and audit
@@ -83,7 +83,7 @@ wa setup shell [--remove] [--shell <bash|zsh|fish>]
 wa config init [--force]
 wa config validate [--strict]
 wa config show [--effective] [--json]
-wa config set <key> <value>
+wa config set <key> <value> [--dry-run]
 wa config export [-o <path>] [--json]
 wa config import <path> [--dry-run] [--replace] [--yes]
 ```
@@ -119,6 +119,7 @@ Notes:
 ```bash
 wa tui          # requires --features tui
 wa mcp serve    # requires --features mcp
+wa sync         # requires --features sync
 ```
 
 ## Planned (not yet implemented)
@@ -127,7 +128,6 @@ wa mcp serve    # requires --features mcp
 wa history
 wa undo
 wa web
-wa sync
 ```
 
 ## Robot mode (stable JSON/TOON)

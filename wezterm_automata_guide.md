@@ -2,6 +2,9 @@
 
 > **Purpose**: A complete technical guide for building `wezterm_automata` (`wa`), a high-performance Rust CLI tool for orchestrating fleets of AI coding agents (Claude Code, Codex CLI, Gemini CLI) across distributed WezTerm multiplexer sessions.
 
+> **Note**: wa removed the Lua `update-status` hook in v0.2.0 due to performance overhead. Prefer
+> `wezterm cli list` polling, user-var signaling, and escape-sequence detection instead.
+
 ---
 
 ## Table of Contents

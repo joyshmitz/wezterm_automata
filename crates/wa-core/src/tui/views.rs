@@ -11,7 +11,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Tabs, Widget},
 };
 
-use super::query::{EventView, HealthStatus, PaneView};
+use super::query::{EventView, HealthStatus, PaneView, TriageItemView};
 use crate::circuit_breaker::CircuitStateKind;
 
 /// Available views in the TUI
@@ -24,6 +24,8 @@ pub enum View {
     Panes,
     /// Event feed
     Events,
+    /// Triage view (prioritized issues + quick actions)
+    Triage,
     /// Search interface
     Search,
     /// Help screen
@@ -38,6 +40,7 @@ impl View {
             Self::Home => "Home",
             Self::Panes => "Panes",
             Self::Events => "Events",
+            Self::Triage => "Triage",
             Self::Search => "Search",
             Self::Help => "Help",
         }
@@ -50,6 +53,7 @@ impl View {
             Self::Home,
             Self::Panes,
             Self::Events,
+            Self::Triage,
             Self::Search,
             Self::Help,
         ]
@@ -62,8 +66,9 @@ impl View {
             Self::Home => 0,
             Self::Panes => 1,
             Self::Events => 2,
-            Self::Search => 3,
-            Self::Help => 4,
+            Self::Triage => 3,
+            Self::Search => 4,
+            Self::Help => 5,
         }
     }
 
@@ -73,7 +78,8 @@ impl View {
         match self {
             Self::Home => Self::Panes,
             Self::Panes => Self::Events,
-            Self::Events => Self::Search,
+            Self::Events => Self::Triage,
+            Self::Triage => Self::Search,
             Self::Search => Self::Help,
             Self::Help => Self::Home,
         }
@@ -86,7 +92,8 @@ impl View {
             Self::Home => Self::Help,
             Self::Panes => Self::Home,
             Self::Events => Self::Panes,
-            Self::Search => Self::Events,
+            Self::Triage => Self::Events,
+            Self::Search => Self::Triage,
             Self::Help => Self::Search,
         }
     }
@@ -99,6 +106,8 @@ pub struct ViewState {
     pub panes: Vec<PaneView>,
     /// Events list for display
     pub events: Vec<EventView>,
+    /// Triage items for display
+    pub triage_items: Vec<TriageItemView>,
     /// Current health status
     pub health: Option<HealthStatus>,
     /// Search query input
@@ -107,6 +116,8 @@ pub struct ViewState {
     pub error_message: Option<String>,
     /// Selected index in list views
     pub selected_index: usize,
+    /// Selected index in triage view
+    pub triage_selected_index: usize,
 }
 
 impl ViewState {
@@ -364,6 +375,102 @@ pub fn render_search_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     results.render(chunks[1], buf);
 }
 
+/// Render the triage view
+pub fn render_triage_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(8),    // Triage list
+            Constraint::Length(6), // Details + actions
+        ])
+        .split(area);
+
+    let block = Block::default()
+        .title("Triage (prioritized)")
+        .borders(Borders::ALL);
+    let inner = block.inner(chunks[0]);
+    block.render(chunks[0], buf);
+
+    if state.triage_items.is_empty() {
+        let empty_msg = Paragraph::new(Span::styled(
+            "All clear. No items need attention.",
+            Style::default().fg(Color::Green),
+        ));
+        empty_msg.render(inner, buf);
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, item) in state.triage_items.iter().enumerate() {
+        let severity_style = match item.severity.as_str() {
+            "error" => Style::default().fg(Color::Red),
+            "warning" => Style::default().fg(Color::Yellow),
+            "info" => Style::default().fg(Color::Blue),
+            _ => Style::default().fg(Color::Gray),
+        };
+        if i == state.triage_selected_index {
+            let row = format!(
+                "[{:7}] {} | {}",
+                truncate_str(&item.severity, 7),
+                truncate_str(&item.section, 8),
+                truncate_str(&item.title, 80),
+            );
+            lines.push(Line::styled(
+                row,
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("[{:7}]", truncate_str(&item.severity, 7)),
+                    severity_style,
+                ),
+                Span::raw(format!(
+                    " {} | {}",
+                    truncate_str(&item.section, 8),
+                    truncate_str(&item.title, 80),
+                )),
+            ]));
+        }
+    }
+
+    let list = Paragraph::new(lines);
+    list.render(inner, buf);
+
+    // Details + actions panel
+    let detail_block = Block::default()
+        .title("Details / Actions (Enter or 1-9 to run, m to mute)")
+        .borders(Borders::ALL);
+    let detail_inner = detail_block.inner(chunks[1]);
+    detail_block.render(chunks[1], buf);
+
+    if let Some(item) = state.triage_items.get(state.triage_selected_index) {
+        let mut detail_lines: Vec<Line> = Vec::new();
+        if !item.detail.is_empty() {
+            detail_lines.push(Line::from(Span::raw(truncate_str(&item.detail, 120))));
+        }
+        if !item.actions.is_empty() {
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                "Actions:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            for (idx, action) in item.actions.iter().enumerate() {
+                detail_lines.push(Line::from(Span::raw(format!(
+                    "  {}. {} ({})",
+                    idx + 1,
+                    action.label,
+                    truncate_str(&action.command, 40)
+                ))));
+            }
+        }
+        let details = Paragraph::new(detail_lines);
+        details.render(detail_inner, buf);
+    }
+}
+
 /// Render the help view
 pub fn render_help_view(area: Rect, buf: &mut Buffer) {
     let help_text = vec![
@@ -389,7 +496,9 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
         )),
         Line::from("  j / Down   Move selection down"),
         Line::from("  k / Up     Move selection up"),
-        Line::from("  Enter      Select/inspect item"),
+        Line::from("  Enter      Run primary action (triage)"),
+        Line::from("  1-9        Run action by number (triage)"),
+        Line::from("  m          Mute selected event (triage)"),
         Line::from(""),
         Line::from(Span::styled(
             "Views:",
@@ -398,8 +507,9 @@ pub fn render_help_view(area: Rect, buf: &mut Buffer) {
         Line::from("  1. Home    System overview and health"),
         Line::from("  2. Panes   List all WezTerm panes"),
         Line::from("  3. Events  Recent detection events"),
-        Line::from("  4. Search  Full-text search"),
-        Line::from("  5. Help    This screen"),
+        Line::from("  4. Triage  Prioritized issues + actions"),
+        Line::from("  5. Search  Full-text search"),
+        Line::from("  6. Help    This screen"),
     ];
 
     let help =
@@ -421,6 +531,8 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
 
     #[test]
     fn view_navigation_wraps() {
@@ -428,6 +540,7 @@ mod tests {
         assert_eq!(View::Help.next(), View::Home);
         assert_eq!(View::Home.prev(), View::Help);
         assert_eq!(View::Panes.prev(), View::Home);
+        assert_eq!(View::Triage.prev(), View::Events);
     }
 
     #[test]
@@ -442,5 +555,30 @@ mod tests {
         assert_eq!(truncate_str("hello", 10), "hello");
         assert_eq!(truncate_str("hello world", 8), "hello...");
         assert_eq!(truncate_str("ab", 2), "ab");
+    }
+
+    #[test]
+    fn render_triage_view_handles_empty_and_populated_state() {
+        let mut state = ViewState::default();
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+
+        render_triage_view(&state, area, &mut buf);
+
+        state.triage_items = vec![TriageItemView {
+            section: "events".to_string(),
+            severity: "warning".to_string(),
+            title: "test".to_string(),
+            detail: "detail".to_string(),
+            actions: vec![super::super::query::TriageAction {
+                label: "Explain".to_string(),
+                command: "wa why --recent --pane 0".to_string(),
+            }],
+            event_id: Some(1),
+            pane_id: Some(0),
+            workflow_id: None,
+        }];
+
+        render_triage_view(&state, area, &mut buf);
     }
 }

@@ -31,6 +31,7 @@
 //! - `accounts`: Account management and selection policy
 //! - `plan`: Action plan types for unified workflow representation
 //! - `browser`: Browser automation scaffolding (feature-gated: `browser`)
+//! - `sync`: Optional sync scaffolding (feature-gated: `sync`)
 //!
 //! # Safety
 //!
@@ -96,6 +97,15 @@ pub mod browser;
 
 #[cfg(feature = "tui")]
 pub mod tui;
+
+#[cfg(feature = "distributed")]
+pub mod distributed;
+
+#[cfg(feature = "sync")]
+pub mod sync;
+
+#[cfg(feature = "sync")]
+pub mod sync;
 
 pub use error::{Error, Result, StorageError};
 

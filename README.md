@@ -387,6 +387,28 @@ metadata_only = false
 notify_on_failure = true
 notify_on_success = false
 
+[sync]
+# Feature gate
+enabled = false
+# Require confirmation for any write
+require_confirmation = true
+# Default overwrite policy
+allow_overwrite = false
+# Payload toggles (global defaults)
+allow_binary = false
+allow_config = true
+allow_snapshots = true
+# Optional allow/deny path globs
+allow_paths = []
+deny_paths = ["~/.local/share/wa/wa.db", "~/.local/share/wa/wa.db-wal", "~/.local/share/wa/wa.db-shm"]
+
+[[sync.targets]]
+name = "staging"
+transport = "ssh"
+endpoint = "wa@staging-host"
+root = "~/.local/share/wa/sync"
+default_direction = "push"
+
 [patterns]
 # Which detection packs to enable
 packs = ["core"]
@@ -491,6 +513,8 @@ Every detection has a stable `rule_id` like `core.codex:usage_reached`. Use thes
 ---
 
 ## Troubleshooting
+
+For a step-by-step operator guide (triage → why → reproduce), see `docs/operator-playbook.md`.
 
 ### "wezterm cli list" returns empty
 

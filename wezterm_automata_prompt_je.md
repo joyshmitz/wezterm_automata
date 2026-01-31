@@ -1,5 +1,9 @@
 Research and write for me an extremely long, detailed, comprehensive, and elaborate guide all about automating wezterm from end to end using Lua in a way that would be suitable for the automated management of a fleet of ai coding agents (claude code, codex-cli, gemini-cli, etc.) operating in one or more remote domains using wezterm's built in terminal multiplexer;  Research all the best practices and techniques and strategies and things that you can do to achieve maximum performance, reliability, robustness, responsiveness, safety, etc for doing that. 
 
+Note: wa removed the Lua `update-status` hook in v0.2.0 due to performance overhead. Any `update-status`
+examples in this prompt should be treated as historical; prefer CLI polling + user-var signaling +
+escape-sequence detection instead.
+
 The guide below shows how I have my wezsterm set up on my mac locally and remote linux machines, and you can assume that it will be set up this way:
 
 ```

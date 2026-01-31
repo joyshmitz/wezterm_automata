@@ -25,7 +25,7 @@ use ratatui::{
 use super::query::{EventFilters, QueryClient, QueryError};
 use super::views::{
     View, ViewState, render_events_view, render_help_view, render_home_view, render_panes_view,
-    render_search_view, render_tabs,
+    render_search_view, render_tabs, render_triage_view,
 };
 
 /// Application configuration
@@ -76,6 +76,8 @@ pub struct App<Q: QueryClient> {
     should_quit: bool,
     /// Last time data was refreshed
     last_refresh: Instant,
+    /// Pending command to run (triggered from UI)
+    pending_command: Option<String>,
 }
 
 impl<Q: QueryClient> App<Q> {
@@ -90,6 +92,7 @@ impl<Q: QueryClient> App<Q> {
             last_refresh: Instant::now()
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(Instant::now), // Force initial refresh
+            pending_command: None,
         }
     }
 
@@ -138,6 +141,13 @@ impl<Q: QueryClient> App<Q> {
             terminal.draw(|frame| {
                 self.render(frame.area(), frame.buffer_mut());
             })?;
+
+            // Execute any pending command outside the draw phase
+            if let Some(command) = self.pending_command.take() {
+                if let Err(err) = self.run_command(terminal, &command) {
+                    self.view_state.set_error(format!("Action failed: {err}"));
+                }
+            }
 
             // Handle events with timeout
             if event::poll(tick_rate)? {
@@ -197,10 +207,14 @@ impl<Q: QueryClient> App<Q> {
                 return;
             }
             KeyCode::Char('4') => {
-                self.current_view = View::Search;
+                self.current_view = View::Triage;
                 return;
             }
             KeyCode::Char('5') => {
+                self.current_view = View::Search;
+                return;
+            }
+            KeyCode::Char('6') => {
                 self.current_view = View::Help;
                 return;
             }
@@ -211,6 +225,7 @@ impl<Q: QueryClient> App<Q> {
         match self.current_view {
             View::Panes => self.handle_panes_key(key),
             View::Events => self.handle_events_key(key),
+            View::Triage => self.handle_triage_key(key),
             View::Search => self.handle_search_key(key),
             View::Home | View::Help => {}
         }
@@ -254,6 +269,41 @@ impl<Q: QueryClient> App<Q> {
                         .selected_index
                         .checked_sub(1)
                         .unwrap_or(self.view_state.events.len() - 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle key events in the triage view
+    fn handle_triage_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !self.view_state.triage_items.is_empty() {
+                    self.view_state.triage_selected_index = (self.view_state.triage_selected_index
+                        + 1)
+                        % self.view_state.triage_items.len();
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if !self.view_state.triage_items.is_empty() {
+                    self.view_state.triage_selected_index = self
+                        .view_state
+                        .triage_selected_index
+                        .checked_sub(1)
+                        .unwrap_or(self.view_state.triage_items.len() - 1);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('a') => {
+                self.queue_triage_action(0);
+            }
+            KeyCode::Char('m') => {
+                self.mute_selected_event();
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                let idx = c.to_digit(10).unwrap_or(0);
+                if idx > 0 {
+                    self.queue_triage_action(idx as usize - 1);
                 }
             }
             _ => {}
@@ -328,6 +378,20 @@ impl<Q: QueryClient> App<Q> {
             }
         }
 
+        // Refresh triage items
+        match self.query_client.list_triage_items() {
+            Ok(items) => {
+                self.view_state.triage_items = items;
+                if self.view_state.triage_selected_index >= self.view_state.triage_items.len() {
+                    self.view_state.triage_selected_index = 0;
+                }
+            }
+            Err(e) => {
+                self.view_state
+                    .set_error(format!("Failed to build triage: {e}"));
+            }
+        }
+
         self.last_refresh = Instant::now();
     }
 
@@ -349,9 +413,84 @@ impl<Q: QueryClient> App<Q> {
             View::Home => render_home_view(&self.view_state, chunks[1], buf),
             View::Panes => render_panes_view(&self.view_state, chunks[1], buf),
             View::Events => render_events_view(&self.view_state, chunks[1], buf),
+            View::Triage => render_triage_view(&self.view_state, chunks[1], buf),
             View::Search => render_search_view(&self.view_state, chunks[1], buf),
             View::Help => render_help_view(chunks[1], buf),
         }
+    }
+
+    fn queue_triage_action(&mut self, index: usize) {
+        let Some(item) = self
+            .view_state
+            .triage_items
+            .get(self.view_state.triage_selected_index)
+        else {
+            self.view_state.set_error("No triage items available");
+            return;
+        };
+
+        let Some(action) = item.actions.get(index) else {
+            self.view_state
+                .set_error(format!("No action #{} for this item", index + 1));
+            return;
+        };
+
+        self.pending_command = Some(action.command.clone());
+    }
+
+    fn mute_selected_event(&mut self) {
+        let Some(item) = self
+            .view_state
+            .triage_items
+            .get(self.view_state.triage_selected_index)
+        else {
+            self.view_state.set_error("No triage items available");
+            return;
+        };
+
+        let Some(event_id) = item.event_id else {
+            self.view_state
+                .set_error("Selected triage item is not an event");
+            return;
+        };
+
+        if let Err(e) = self.query_client.mark_event_muted(event_id) {
+            self.view_state
+                .set_error(format!("Failed to mute event: {e}"));
+        } else {
+            self.refresh_data();
+        }
+    }
+
+    fn run_command(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        command: &str,
+    ) -> TuiResult<()> {
+        let mut parts = command.split_whitespace();
+        let Some(program) = parts.next() else {
+            return Ok(());
+        };
+
+        // Leave alternate screen to show command output
+        disable_raw_mode()?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        println!("Running: {command}\n");
+
+        let status = std::process::Command::new(program).args(parts).status();
+        match status {
+            Ok(status) => println!("Exit status: {status}"),
+            Err(err) => println!("Command failed: {err}"),
+        }
+        println!("\nPress Enter to return to the TUI...");
+        let mut input = String::new();
+        let _ = io::stdin().read_line(&mut input);
+
+        // Restore TUI
+        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+        enable_raw_mode()?;
+        self.refresh_data();
+        Ok(())
     }
 }
 
@@ -395,6 +534,10 @@ mod tests {
             Ok(Vec::new())
         }
 
+        fn list_triage_items(&self) -> Result<Vec<crate::tui::query::TriageItemView>, QueryError> {
+            Ok(Vec::new())
+        }
+
         fn search(&self, _: &str, _: usize) -> Result<Vec<SearchResultView>, QueryError> {
             Ok(Vec::new())
         }
@@ -413,6 +556,10 @@ mod tests {
 
         fn is_watcher_running(&self) -> bool {
             true
+        }
+
+        fn mark_event_muted(&self, _event_id: i64) -> Result<(), QueryError> {
+            Ok(())
         }
     }
 

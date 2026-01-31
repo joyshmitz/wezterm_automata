@@ -45,6 +45,7 @@ web = ["wa-core/web"]
 tui = ["wa-core/tui"]
 metrics = ["wa-core/metrics"]
 distributed = ["wa-core/distributed"]
+sync = ["wa-core/sync"]
 
 [dev-dependencies]
 assert_cmd = "2.1.2"

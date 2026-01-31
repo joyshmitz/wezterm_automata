@@ -5877,6 +5877,7 @@ name = "wa-core"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
+ "asupersync",
  "base64",
  "bloomfilter",
  "chrono",

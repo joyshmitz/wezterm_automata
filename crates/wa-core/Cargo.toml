@@ -61,6 +61,12 @@ crossterm = { workspace = true, optional = true }
 
 # MCP server (optional, behind feature)
 fastmcp = { workspace = true, optional = true }
+# Sync (optional, behind feature)
+asupersync = { workspace = true, optional = true }
+# Distributed mode (optional, behind feature)
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
@@ -98,7 +104,8 @@ mcp = ["mcp-server"]
 web = []
 tui = ["dep:ratatui", "dep:crossterm"]
 metrics = []
-distributed = []
+distributed = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
+sync = ["dep:asupersync"]
 
 # Optional heavy integrations - feature-gated (internal)
 vendored-wezterm = ["dep:codec", "dep:config", "dep:mux", "dep:wezterm-term"]

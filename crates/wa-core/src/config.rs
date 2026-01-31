@@ -9,6 +9,7 @@
 //! - `ingest`: Poll interval, concurrency, gap detection
 //! - `storage`: DB path, retention, flush intervals
 //! - `backup`: Scheduled backup configuration
+//! - `sync`: Asupersync targets, allow/deny rules, safety defaults
 //! - `patterns`: Enabled packs, per-pack overrides
 //! - `workflows`: Enable/disable, allowlist/denylist, concurrency
 //! - `safety`: Capability gates, rate limits, approval, redaction, reservations
@@ -20,7 +21,7 @@
 //! Unknown fields are ignored to support forward compatibility.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -48,6 +49,12 @@ pub struct Config {
 
     /// Backup settings (scheduled backups)
     pub backup: BackupConfig,
+
+    /// Sync settings (asupersync)
+    pub sync: SyncConfig,
+
+    /// Distributed mode settings (agent ↔ aggregator)
+    pub distributed: DistributedConfig,
 
     /// Pattern detection settings
     pub patterns: PatternsConfig,
@@ -511,6 +518,303 @@ impl Default for ScheduledBackupConfig {
             notify_on_failure: true,
             notify_on_success: false,
         }
+    }
+}
+
+// =============================================================================
+// Sync Config
+// =============================================================================
+
+/// Sync direction for a target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncDirection {
+    /// Push local data to target (default)
+    Push,
+    /// Pull data from target to local
+    Pull,
+}
+
+impl Default for SyncDirection {
+    fn default() -> Self {
+        Self::Push
+    }
+}
+
+/// Sync configuration (asupersync).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncConfig {
+    /// Enable sync feature (gated, default false)
+    pub enabled: bool,
+    /// Require explicit confirmation before any write
+    pub require_confirmation: bool,
+    /// Allow overwriting existing files (default false)
+    pub allow_overwrite: bool,
+    /// Allow syncing the wa binary
+    pub allow_binary: bool,
+    /// Allow syncing wa config directory
+    pub allow_config: bool,
+    /// Allow syncing exported DB snapshots (never live DB)
+    pub allow_snapshots: bool,
+    /// Explicit allowlist paths (globs supported)
+    pub allow_paths: Vec<String>,
+    /// Explicit denylist paths (globs supported)
+    pub deny_paths: Vec<String>,
+    /// Named sync targets
+    pub targets: Vec<SyncTargetConfig>,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            require_confirmation: true,
+            allow_overwrite: false,
+            allow_binary: false,
+            allow_config: true,
+            allow_snapshots: true,
+            allow_paths: Vec::new(),
+            deny_paths: Vec::new(),
+            targets: Vec::new(),
+        }
+    }
+}
+
+impl SyncConfig {
+    fn validate(&self) -> Result<(), String> {
+        let mut seen = HashSet::new();
+        for target in &self.targets {
+            if target.name.trim().is_empty() {
+                return Err("sync.targets entries must have a non-empty name".to_string());
+            }
+            if !seen.insert(target.name.trim().to_string()) {
+                return Err(format!(
+                    "sync.targets contains duplicate name '{}'",
+                    target.name
+                ));
+            }
+            if target.endpoint.trim().is_empty() {
+                return Err(format!(
+                    "sync.targets '{}' must define a non-empty endpoint",
+                    target.name
+                ));
+            }
+            if target.root.trim().is_empty() {
+                return Err(format!(
+                    "sync.targets '{}' must define a non-empty root path",
+                    target.name
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Per-target sync configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncTargetConfig {
+    /// Unique target name
+    pub name: String,
+    /// Transport identifier (e.g., "ssh")
+    pub transport: String,
+    /// Endpoint (e.g., "user@host" or "ssh://user@host")
+    pub endpoint: String,
+    /// Remote root path for sync payloads
+    pub root: String,
+    /// Default direction for sync operations
+    pub default_direction: SyncDirection,
+    /// Optional per-target override for binary sync
+    pub allow_binary: Option<bool>,
+    /// Optional per-target override for config sync
+    pub allow_config: Option<bool>,
+    /// Optional per-target override for snapshots sync
+    pub allow_snapshots: Option<bool>,
+}
+
+impl Default for SyncTargetConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            transport: "ssh".to_string(),
+            endpoint: String::new(),
+            root: String::new(),
+            default_direction: SyncDirection::default(),
+            allow_binary: None,
+            allow_config: None,
+            allow_snapshots: None,
+        }
+    }
+}
+
+// =============================================================================
+// Distributed Config
+// =============================================================================
+
+/// Authentication mode for distributed connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DistributedAuthMode {
+    /// Shared token authentication
+    #[serde(rename = "token")]
+    Token,
+    /// Mutual TLS client authentication
+    #[serde(rename = "mtls")]
+    Mtls,
+    /// Token + mTLS
+    #[serde(rename = "token+mtls")]
+    TokenAndMtls,
+}
+
+impl DistributedAuthMode {
+    #[must_use]
+    pub const fn requires_token(self) -> bool {
+        matches!(self, Self::Token | Self::TokenAndMtls)
+    }
+
+    #[must_use]
+    pub const fn requires_mtls(self) -> bool {
+        matches!(self, Self::Mtls | Self::TokenAndMtls)
+    }
+}
+
+impl Default for DistributedAuthMode {
+    fn default() -> Self {
+        Self::Token
+    }
+}
+
+/// TLS settings for distributed mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DistributedTlsConfig {
+    /// Enable TLS for agent ↔ aggregator connections
+    pub enabled: bool,
+    /// Server certificate path (PEM)
+    pub cert_path: Option<String>,
+    /// Server private key path (PEM)
+    pub key_path: Option<String>,
+    /// Optional client CA bundle for mTLS
+    pub client_ca_path: Option<String>,
+    /// Minimum TLS version (e.g., "1.2")
+    pub min_tls_version: String,
+}
+
+impl Default for DistributedTlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_path: None,
+            key_path: None,
+            client_ca_path: None,
+            min_tls_version: "1.2".to_string(),
+        }
+    }
+}
+
+/// Distributed mode configuration (agent ↔ aggregator).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DistributedConfig {
+    /// Enable distributed mode
+    pub enabled: bool,
+    /// Bind address for the aggregator listener
+    pub bind_addr: String,
+    /// Allow plaintext connections (dangerous)
+    pub allow_insecure: bool,
+    /// Require TLS when binding to non-loopback interfaces
+    pub require_tls_for_non_loopback: bool,
+    /// Authentication mode
+    pub auth_mode: DistributedAuthMode,
+    /// Shared token (required when auth_mode includes token)
+    pub token: Option<String>,
+    /// Optional allowlist of agent identifiers
+    pub allow_agent_ids: Vec<String>,
+    /// TLS configuration
+    pub tls: DistributedTlsConfig,
+}
+
+impl Default for DistributedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: "127.0.0.1:4141".to_string(),
+            allow_insecure: false,
+            require_tls_for_non_loopback: true,
+            auth_mode: DistributedAuthMode::default(),
+            token: None,
+            allow_agent_ids: Vec::new(),
+            tls: DistributedTlsConfig::default(),
+        }
+    }
+}
+
+impl DistributedConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let bind_addr = self.bind_addr.trim();
+        if bind_addr.is_empty() {
+            return Err("distributed.bind_addr must not be empty".to_string());
+        }
+
+        let is_loopback = bind_addr_is_loopback(bind_addr)?;
+
+        if self.require_tls_for_non_loopback
+            && !is_loopback
+            && !self.tls.enabled
+            && !self.allow_insecure
+        {
+            return Err(
+                "distributed.tls.enabled must be true for non-loopback binds (or set distributed.allow_insecure = true)"
+                    .to_string(),
+            );
+        }
+
+        if self.tls.enabled {
+            let cert_path = self.tls.cert_path.as_deref().unwrap_or("").trim();
+            if cert_path.is_empty() {
+                return Err("distributed.tls.cert_path must be set when TLS is enabled".to_string());
+            }
+            let key_path = self.tls.key_path.as_deref().unwrap_or("").trim();
+            if key_path.is_empty() {
+                return Err("distributed.tls.key_path must be set when TLS is enabled".to_string());
+            }
+        }
+
+        if self.auth_mode.requires_token() {
+            let token = self.token.as_deref().unwrap_or("").trim();
+            if token.is_empty() {
+                return Err(
+                    "distributed.token must be set when auth_mode includes token".to_string(),
+                );
+            }
+        }
+
+        if self.auth_mode.requires_mtls() {
+            if !self.tls.enabled {
+                return Err(
+                    "distributed.tls.enabled must be true when auth_mode includes mtls".to_string(),
+                );
+            }
+            let ca_path = self.tls.client_ca_path.as_deref().unwrap_or("").trim();
+            if ca_path.is_empty() {
+                return Err(
+                    "distributed.tls.client_ca_path must be set when auth_mode includes mtls"
+                        .to_string(),
+                );
+            }
+        }
+
+        for agent_id in &self.allow_agent_ids {
+            if agent_id.trim().is_empty() {
+                return Err("distributed.allow_agent_ids entries must be non-empty".to_string());
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1677,6 +1981,14 @@ impl Config {
             });
         }
 
+        if self.distributed != new_config.distributed {
+            forbidden.push(ForbiddenChange {
+                name: "distributed".to_string(),
+                reason: "Distributed mode settings cannot be hot-reloaded; requires restart"
+                    .to_string(),
+            });
+        }
+
         // Check hot-reloadable settings
         if self.general.log_level != new_config.general.log_level {
             changes.push(HotReloadChange {
@@ -1934,6 +2246,36 @@ impl Config {
             let dest_path = expand_tilde(&dest);
             self.backup.scheduled.destination = Some(path_to_string(&dest_path));
         }
+
+        for target in &mut self.sync.targets {
+            if !target.root.trim().is_empty() {
+                let root_path = expand_tilde(&target.root);
+                target.root = path_to_string(&root_path);
+            }
+        }
+
+        for allow in &mut self.sync.allow_paths {
+            let allow_path = expand_tilde(allow);
+            *allow = path_to_string(&allow_path);
+        }
+
+        for deny in &mut self.sync.deny_paths {
+            let deny_path = expand_tilde(deny);
+            *deny = path_to_string(&deny_path);
+        }
+
+        if let Some(cert) = self.distributed.tls.cert_path.take() {
+            let cert_path = expand_tilde(&cert);
+            self.distributed.tls.cert_path = Some(path_to_string(&cert_path));
+        }
+        if let Some(key) = self.distributed.tls.key_path.take() {
+            let key_path = expand_tilde(&key);
+            self.distributed.tls.key_path = Some(path_to_string(&key_path));
+        }
+        if let Some(ca) = self.distributed.tls.client_ca_path.take() {
+            let ca_path = expand_tilde(&ca);
+            self.distributed.tls.client_ca_path = Some(path_to_string(&ca_path));
+        }
     }
 
     /// Validate semantic constraints
@@ -1985,6 +2327,14 @@ impl Config {
 
         self.workflows
             .compaction_prompts
+            .validate()
+            .map_err(crate::error::ConfigError::ValidationError)?;
+
+        self.sync
+            .validate()
+            .map_err(crate::error::ConfigError::ValidationError)?;
+
+        self.distributed
             .validate()
             .map_err(crate::error::ConfigError::ValidationError)?;
 
@@ -2218,6 +2568,22 @@ fn resolve_path(path: &Path) -> crate::Result<PathBuf> {
         })?;
         Ok(cwd.join(expanded))
     }
+}
+
+fn bind_addr_is_loopback(bind_addr: &str) -> Result<bool, String> {
+    if let Ok(addr) = bind_addr.parse::<std::net::SocketAddr>() {
+        return Ok(addr.ip().is_loopback());
+    }
+
+    if let Some(port) = bind_addr.strip_prefix("localhost:") {
+        if port.parse::<u16>().is_ok() {
+            return Ok(true);
+        }
+    }
+
+    Err(format!(
+        "distributed.bind_addr must be a host:port pair (got '{bind_addr}')"
+    ))
 }
 
 fn parse_env_bool(value: &str) -> crate::Result<bool> {
@@ -2489,6 +2855,15 @@ disabled_rules = ["codex.usage_warning"]
         config.general.data_dir = "~/wa-data".to_string();
         config.storage.db_path = "~/wa.db".to_string();
         config.backup.scheduled.destination = Some("~/wa-backups".to_string());
+        config.sync.allow_paths = vec!["~/wa-allow".to_string()];
+        config.sync.deny_paths = vec!["~/wa-deny".to_string()];
+        config.sync.targets = vec![SyncTargetConfig {
+            name: "primary".to_string(),
+            transport: "ssh".to_string(),
+            endpoint: "user@host".to_string(),
+            root: "~/wa-sync".to_string(),
+            ..SyncTargetConfig::default()
+        }];
         config.normalize_paths();
 
         assert!(!config.general.data_dir.contains('~'));
@@ -2500,6 +2875,27 @@ disabled_rules = ["codex.usage_warning"]
                 .destination
                 .as_ref()
                 .is_some_and(|path| !path.contains('~'))
+        );
+        assert!(
+            config
+                .sync
+                .targets
+                .first()
+                .is_some_and(|target| !target.root.contains('~'))
+        );
+        assert!(
+            config
+                .sync
+                .allow_paths
+                .iter()
+                .all(|path| !path.contains('~'))
+        );
+        assert!(
+            config
+                .sync
+                .deny_paths
+                .iter()
+                .all(|path| !path.contains('~'))
         );
     }
 
@@ -2597,6 +2993,59 @@ disabled_rules = ["codex.usage_warning"]
 
         // Redaction should be enabled
         assert!(config.safety.redaction.enabled);
+    }
+
+    #[test]
+    fn distributed_defaults_are_safe() {
+        let config = Config::default();
+        assert!(!config.distributed.enabled);
+        assert_eq!(config.distributed.bind_addr, "127.0.0.1:4141");
+        assert!(!config.distributed.allow_insecure);
+        assert!(config.distributed.require_tls_for_non_loopback);
+    }
+
+    #[test]
+    fn distributed_requires_tls_for_non_loopback() {
+        let mut config = Config::default();
+        config.distributed.enabled = true;
+        config.distributed.bind_addr = "0.0.0.0:4141".to_string();
+        config.distributed.token = Some("token".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.enabled"));
+    }
+
+    #[test]
+    fn distributed_allows_insecure_override() {
+        let mut config = Config::default();
+        config.distributed.enabled = true;
+        config.distributed.bind_addr = "0.0.0.0:4141".to_string();
+        config.distributed.allow_insecure = true;
+        config.distributed.token = Some("token".to_string());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn distributed_tls_requires_cert_and_key() {
+        let mut config = Config::default();
+        config.distributed.enabled = true;
+        config.distributed.token = Some("token".to_string());
+        config.distributed.tls.enabled = true;
+        config.distributed.tls.cert_path = None;
+        config.distributed.tls.key_path = None;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("cert_path"));
+    }
+
+    #[test]
+    fn distributed_mtls_requires_client_ca() {
+        let mut config = Config::default();
+        config.distributed.enabled = true;
+        config.distributed.auth_mode = DistributedAuthMode::Mtls;
+        config.distributed.tls.enabled = true;
+        config.distributed.tls.cert_path = Some("/tmp/server.crt".to_string());
+        config.distributed.tls.key_path = Some("/tmp/server.key".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("client_ca_path"));
     }
 
     // =========================================================================

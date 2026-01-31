@@ -33,6 +33,7 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - policy_denial
 - prepare_commit_approvals
 - quickfix_suggestions
+- triage_multi_issue
 - rules_explain_trace
 - stress_scale
 - graceful_shutdown
@@ -105,6 +106,9 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - [ ] E2E: metrics endpoint responds when enabled. Scenario(s): none
 - [ ] E2E: watcher health snapshot visible via CLI. Scenario(s): none
 - [ ] Artifacts: diag bundle layout + redaction proofs. Scenario(s): none
+
+#### Triage (wa-upg.9)
+- [x] E2E: triage ordering and suggested actions with multiple issues. Scenario(s): triage_multi_issue
 
 #### Notifications (wa-psm)
 - [x] E2E: events trigger notifications (webhook mock server). Scenario(s): notification_webhook

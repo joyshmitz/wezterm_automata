@@ -2,6 +2,10 @@ Automating WezTerm with Lua for AI Coding Agent Fleet Management
 
 Managing a fleet of coding agents (e.g. Claude, Codex, Gemini CLI, etc.) across multiple remote servers can be streamlined by leveraging WezTerm’s built-in terminal multiplexer and Lua scripting capabilities. This comprehensive guide covers end-to-end automation of WezTerm for such use cases – from setting up persistent remote sessions, to capturing and reacting to terminal output in real-time, to building a high-performance Rust CLI (“wezterm_automaton” or wa) that can manage these agent sessions automatically. We will discuss best practices for maximum performance, reliability, robustness, responsiveness, and safety in this automated environment.
 
+Note: wa removed the Lua `update-status` hook in v0.2.0 due to performance overhead. Any `update-status`
+examples below should be treated as historical; prefer CLI polling + user-var signaling + escape-sequence
+detection instead.
+
 Why Use WezTerm (and Not tmux)?
 
 WezTerm is a GPU-accelerated terminal emulator that also functions as a multiplexer, which means it can replace tmux in many scenarios ￼ ￼. Unlike tmux, WezTerm integrates directly with the terminal UI, eliminating the need for nested sessions and providing a more seamless experience. The table below summarizes key differences:

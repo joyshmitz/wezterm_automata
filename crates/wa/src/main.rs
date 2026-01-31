@@ -728,6 +728,21 @@ SEE ALSO:
         command: BackupCommands,
     },
 
+    /// Sync commands (feature-gated)
+    #[cfg(feature = "sync")]
+    #[command(after_help = r#"EXAMPLES:
+    wa sync status                    Show sync targets and defaults
+    wa sync push --dry-run            Preview a push plan
+    wa sync pull --apply --yes        Apply a pull plan (confirmation required)
+
+SEE ALSO:
+    wa config     Configuration management
+    wa backup     Export snapshots for sync"#)]
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommands,
+    },
+
     /// Pattern detection rules (list, test, show)
     #[command(after_help = r#"EXAMPLES:
     wa rules list                     List all detection rules
@@ -899,8 +914,8 @@ SEE ALSO:
         only: Option<String>,
 
         /// Show additional detail for each item
-        #[arg(long)]
-        verbose: bool,
+        #[arg(long = "details")]
+        details: bool,
     },
 
     /// Launch the interactive TUI (requires --features tui)
@@ -1558,6 +1573,10 @@ enum ConfigCommands {
         /// Value to set
         value: String,
 
+        /// Preview changes without applying
+        #[arg(long)]
+        dry_run: bool,
+
         /// Custom config path
         #[arg(long)]
         path: Option<String>,
@@ -1694,6 +1713,77 @@ enum BackupCommands {
         /// Only verify the backup integrity without importing
         #[arg(long)]
         verify: bool,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+}
+
+#[cfg(feature = "sync")]
+#[derive(Subcommand)]
+enum SyncCommands {
+    /// Show configured targets and sync defaults
+    Status {
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+    /// Preview or apply a push plan
+    Push {
+        /// Target name (if multiple are configured)
+        #[arg(long)]
+        target: Option<String>,
+
+        /// Show what would change without modifying files
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Apply changes (requires confirmation)
+        #[arg(long)]
+        apply: bool,
+
+        /// Skip confirmation when applying
+        #[arg(long)]
+        yes: bool,
+
+        /// Allow overwriting existing files
+        #[arg(long)]
+        allow_overwrite: bool,
+
+        /// Limit payloads to the selected categories
+        #[arg(long, value_enum)]
+        include: Vec<SyncInclude>,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+    /// Preview or apply a pull plan
+    Pull {
+        /// Target name (if multiple are configured)
+        #[arg(long)]
+        target: Option<String>,
+
+        /// Show what would change without modifying files
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Apply changes (requires confirmation)
+        #[arg(long)]
+        apply: bool,
+
+        /// Skip confirmation when applying
+        #[arg(long)]
+        yes: bool,
+
+        /// Allow overwriting existing files
+        #[arg(long)]
+        allow_overwrite: bool,
+
+        /// Limit payloads to the selected categories
+        #[arg(long, value_enum)]
+        include: Vec<SyncInclude>,
 
         /// Output format: auto, plain, or json
         #[arg(long, short = 'f', default_value = "auto")]
@@ -1852,6 +1942,25 @@ const ROBOT_REFRESH_COOLDOWN_MS: i64 = 30_000;
 enum RobotOutputFormat {
     Json,
     Toon,
+}
+
+#[cfg(feature = "sync")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SyncInclude {
+    Binary,
+    Config,
+    Snapshots,
+}
+
+#[cfg(feature = "sync")]
+impl From<SyncInclude> for wa_core::sync::SyncCategory {
+    fn from(value: SyncInclude) -> Self {
+        match value {
+            SyncInclude::Binary => wa_core::sync::SyncCategory::Binary,
+            SyncInclude::Config => wa_core::sync::SyncCategory::Config,
+            SyncInclude::Snapshots => wa_core::sync::SyncCategory::Snapshots,
+        }
+    }
 }
 
 fn parse_robot_output_format(s: &str) -> Option<RobotOutputFormat> {
@@ -11138,6 +11247,204 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             handle_backup_command(command, &layout, &workspace_root).await?;
         }
 
+        #[cfg(feature = "sync")]
+        Some(Commands::Sync { command }) => {
+            use wa_core::output::{OutputFormat, detect_format};
+            use wa_core::sync::{SyncPlanOptions, SyncResult, build_sync_plan, build_sync_status};
+
+            let render_status = |format: &str| -> SyncResult<()> {
+                let output_format = match format.to_lowercase().as_str() {
+                    "json" => OutputFormat::Json,
+                    "plain" => OutputFormat::Plain,
+                    _ => detect_format(),
+                };
+
+                let status = build_sync_status(&config);
+                if output_format.is_json() {
+                    let result = serde_json::json!({
+                        "ok": true,
+                        "version": wa_core::VERSION,
+                        "data": status,
+                    });
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    println!("wa sync status\n");
+                    println!("Enabled: {}", status.enabled);
+                    println!(
+                        "Defaults: binary={}, config={}, snapshots={}, overwrite={}, confirm={}",
+                        status.allow_binary,
+                        status.allow_config,
+                        status.allow_snapshots,
+                        status.allow_overwrite,
+                        status.require_confirmation
+                    );
+                    if status.targets.is_empty() {
+                        println!("\nTargets: (none configured)");
+                    } else {
+                        println!("\nTargets:");
+                        for target in &status.targets {
+                            println!(
+                                "  - {} ({}) {}",
+                                target.name, target.transport, target.endpoint
+                            );
+                            println!("      root: {}", target.root);
+                            println!(
+                                "      allow: binary={}, config={}, snapshots={}",
+                                target.allow_binary, target.allow_config, target.allow_snapshots
+                            );
+                        }
+                    }
+                    if !status.deny_paths.is_empty() {
+                        println!("\nDenied paths:");
+                        for deny in &status.deny_paths {
+                            println!("  - {deny}");
+                        }
+                    }
+                }
+                Ok(())
+            };
+
+            let render_plan = |plan: wa_core::sync::SyncPlan, format: &str| {
+                let output_format = match format.to_lowercase().as_str() {
+                    "json" => OutputFormat::Json,
+                    "plain" => OutputFormat::Plain,
+                    _ => detect_format(),
+                };
+
+                if output_format.is_json() {
+                    let result = serde_json::json!({
+                        "ok": true,
+                        "version": wa_core::VERSION,
+                        "data": plan,
+                    });
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    let direction = match plan.direction {
+                        wa_core::config::SyncDirection::Push => "push",
+                        wa_core::config::SyncDirection::Pull => "pull",
+                    };
+                    println!("wa sync {direction} - plan\n");
+                    println!(
+                        "Target: {} ({}) {}",
+                        plan.target.name, plan.target.transport, plan.target.endpoint
+                    );
+                    println!("Root: {}", plan.target.root);
+                    println!("Dry-run: {}", plan.dry_run);
+                    println!("Apply: {}", plan.apply);
+                    println!("Allow overwrite: {}", plan.allow_overwrite);
+                    if !plan.warnings.is_empty() {
+                        println!("\nWarnings:");
+                        for warning in &plan.warnings {
+                            println!("  - {warning}");
+                        }
+                    }
+                    if plan.payloads.is_empty() {
+                        println!("\nPayloads: (none)");
+                    } else {
+                        println!("\nPayloads:");
+                        for payload in &plan.payloads {
+                            println!(
+                                "  - {:?}: {} -> {}",
+                                payload.category, payload.source, payload.destination
+                            );
+                            if let Some(ref note) = payload.note {
+                                println!("      note: {note}");
+                            }
+                        }
+                    }
+                }
+            };
+
+            match command {
+                SyncCommands::Status { format } => {
+                    if let Err(err) = render_status(&format) {
+                        eprintln!("Error: {err}");
+                        std::process::exit(1);
+                    }
+                }
+                SyncCommands::Push {
+                    target,
+                    dry_run,
+                    apply,
+                    yes,
+                    allow_overwrite,
+                    include,
+                    format,
+                } => {
+                    let mut dry_run = dry_run;
+                    if apply {
+                        dry_run = false;
+                    } else if !dry_run {
+                        dry_run = true;
+                    }
+                    let plan = build_sync_plan(
+                        &config,
+                        &layout,
+                        SyncPlanOptions {
+                            target,
+                            direction: wa_core::config::SyncDirection::Push,
+                            dry_run,
+                            apply,
+                            yes,
+                            allow_overwrite,
+                            include: include.into_iter().map(Into::into).collect(),
+                            config_path: resolved_config_path.clone(),
+                        },
+                    );
+                    match plan {
+                        Ok(plan) => render_plan(plan, &format),
+                        Err(err) => {
+                            eprintln!("Error: {err}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                SyncCommands::Pull {
+                    target,
+                    dry_run,
+                    apply,
+                    yes,
+                    allow_overwrite,
+                    include,
+                    format,
+                } => {
+                    let mut dry_run = dry_run;
+                    if apply {
+                        dry_run = false;
+                    } else if !dry_run {
+                        dry_run = true;
+                    }
+                    let plan = build_sync_plan(
+                        &config,
+                        &layout,
+                        SyncPlanOptions {
+                            target,
+                            direction: wa_core::config::SyncDirection::Pull,
+                            dry_run,
+                            apply,
+                            yes,
+                            allow_overwrite,
+                            include: include.into_iter().map(Into::into).collect(),
+                            config_path: resolved_config_path.clone(),
+                        },
+                    );
+                    match plan {
+                        Ok(plan) => render_plan(plan, &format),
+                        Err(err) => {
+                            eprintln!("Error: {err}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
+
         Some(Commands::Rules { command }) => {
             handle_rules_command(command);
         }
@@ -11397,7 +11704,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             format,
             severity,
             only,
-            verbose: verbose_flag,
+            details: details_flag,
         }) => {
             use wa_core::output::{OutputFormat, detect_format};
 
@@ -11413,9 +11720,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             // Collect triage items as JSON values for uniform sorting/filtering
             let mut items: Vec<serde_json::Value> = Vec::new();
 
-            // 1. Health diagnostics (in-process snapshot)
+            // 1. Health diagnostics (in-process snapshot or persisted fallback)
             if show_all || section == "health" {
-                if let Some(snapshot) = wa_core::crash::HealthSnapshot::get_global() {
+                let snapshot = wa_core::crash::HealthSnapshot::get_global().or_else(|| {
+                    let path = layout.wa_dir.join("health_snapshot.json");
+                    fs::read_to_string(&path).ok().and_then(|data| {
+                        serde_json::from_str::<wa_core::crash::HealthSnapshot>(&data).ok()
+                    })
+                });
+
+                if let Some(snapshot) = snapshot {
                     use wa_core::output::{HealthDiagnosticStatus, HealthSnapshotRenderer};
                     let checks = HealthSnapshotRenderer::diagnostic_checks(&snapshot);
                     for hc in &checks {
@@ -11694,7 +12008,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let title = item["title"].as_str().unwrap_or("");
                     println!("  {icon} {title}");
 
-                    let is_verbose = verbose_flag || cli.verbose > 0;
+                    let is_verbose = details_flag || cli.verbose > 0;
 
                     if is_verbose {
                         if let Some(detail) = item["detail"].as_str() {
@@ -12627,7 +12941,12 @@ async fn handle_config_command(
             }
         }
 
-        ConfigCommands::Set { key, value, path } => {
+        ConfigCommands::Set {
+            key,
+            value,
+            dry_run,
+            path,
+        } => {
             // Find config path
             let config_path = if let Some(p) = path {
                 std::path::PathBuf::from(p)
@@ -12667,13 +12986,35 @@ async fn handle_config_command(
             // Navigate to the target and set value
             set_toml_value(&mut doc, &parts, &value)?;
 
+            let updated = doc.to_string();
+            let diff_lines = compute_config_diff(&content, &updated);
+            if diff_lines.is_empty() {
+                println!("No changes detected — configuration already matches.");
+                return Ok(());
+            }
+
+            println!(
+                "Set preview ({} change{}):",
+                diff_lines.len(),
+                if diff_lines.len() == 1 { "" } else { "s" }
+            );
+            for line in &diff_lines {
+                println!("  {line}");
+            }
+
+            if dry_run {
+                println!("\n(dry run — no changes applied)");
+                println!("Config file: {}", config_path.display());
+                return Ok(());
+            }
+
             // Create parent directory if needed
             if let Some(parent) = config_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
 
             // Write back
-            std::fs::write(&config_path, doc.to_string())?;
+            std::fs::write(&config_path, updated)?;
 
             println!("Set {key} = {value}");
             println!("Config file: {}", config_path.display());

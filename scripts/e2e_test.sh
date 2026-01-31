@@ -346,6 +346,7 @@ SCENARIO_REGISTRY=(
     "policy_denial:Validate safety gates block sends to protected panes"
     "prepare_commit_approvals:Validate prepare/commit approvals with hash mismatch guard"
     "quickfix_suggestions:Validate quick-fix suggestions for events and errors"
+    "triage_multi_issue:Validate triage ordering and suggested actions with multiple issues"
     "rules_explain_trace:Validate rules test trace + lint artifacts (explain-match)"
     "stress_scale:Validate scaled stress test (panes + large transcript)"
     "graceful_shutdown:Validate wa watch graceful shutdown (SIGINT flush, lock release, restart clean)"
@@ -2854,6 +2855,236 @@ EOF
     return $result
 }
 
+run_scenario_triage_multi_issue() {
+    local scenario_dir="$1"
+    local temp_workspace
+    temp_workspace=$(mktemp -d /tmp/wa-e2e-triage-XXXXXX)
+    local result=0
+    local db_path=""
+    local pane_id=9001
+    local old_wa_data_dir="${WA_DATA_DIR:-}"
+    local old_wa_workspace="${WA_WORKSPACE:-}"
+    local old_wa_config="${WA_CONFIG:-}"
+
+    log_info "Workspace: $temp_workspace"
+
+    cleanup_triage_multi_issue() {
+        log_verbose "Cleaning up triage_multi_issue scenario"
+        if [[ -d "${temp_workspace:-}" ]]; then
+            cp -r "$temp_workspace/.wa"/* "$scenario_dir/" 2>/dev/null || true
+            cp "$temp_workspace/wa.toml" "$scenario_dir/" 2>/dev/null || true
+        fi
+        if [[ -n "$old_wa_data_dir" ]]; then
+            export WA_DATA_DIR="$old_wa_data_dir"
+        else
+            unset WA_DATA_DIR
+        fi
+        if [[ -n "$old_wa_workspace" ]]; then
+            export WA_WORKSPACE="$old_wa_workspace"
+        else
+            unset WA_WORKSPACE
+        fi
+        if [[ -n "$old_wa_config" ]]; then
+            export WA_CONFIG="$old_wa_config"
+        else
+            unset WA_CONFIG
+        fi
+        rm -rf "${temp_workspace:-}"
+    }
+    trap cleanup_triage_multi_issue EXIT
+
+    # Setup environment for isolated wa instance
+    export WA_DATA_DIR="$temp_workspace/.wa"
+    export WA_WORKSPACE="$temp_workspace"
+    mkdir -p "$WA_DATA_DIR"
+
+    local baseline_config="$PROJECT_ROOT/fixtures/e2e/config_baseline.toml"
+    if [[ -f "$baseline_config" ]]; then
+        cp "$baseline_config" "$temp_workspace/wa.toml"
+        export WA_CONFIG="$temp_workspace/wa.toml"
+        log_verbose "Using baseline config: $baseline_config"
+    fi
+
+    # Step 1: Initialize DB
+    log_info "Step 1: Initializing DB..."
+    "$WA_BINARY" db migrate --yes > "$scenario_dir/db_migrate.txt" 2>&1 || true
+    "$WA_BINARY" db check -f json > "$scenario_dir/db_check.json" 2>&1 || true
+    db_path="$temp_workspace/.wa/wa.db"
+    if [[ ! -f "$db_path" ]]; then
+        log_fail "DB not created at $db_path"
+        result=1
+    fi
+
+    if [[ $result -eq 0 ]]; then
+        # Step 2: Seed health snapshot (ingest lag warning)
+        log_info "Step 2: Seeding health snapshot..."
+        local now_ms
+        now_ms=$(python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+)
+        cat > "$temp_workspace/.wa/health_snapshot.json" <<EOF
+{
+  "timestamp": $now_ms,
+  "observed_panes": 1,
+  "capture_queue_depth": 0,
+  "write_queue_depth": 0,
+  "last_seq_by_pane": [[${pane_id}, 10]],
+  "warnings": ["Index lag above threshold"],
+  "ingest_lag_avg_ms": 3500.0,
+  "ingest_lag_max_ms": 6500,
+  "db_writable": true,
+  "db_last_write_at": $now_ms
+}
+EOF
+
+        # Step 3: Create crash bundle
+        log_info "Step 3: Creating crash bundle..."
+        local crash_dir="$temp_workspace/.wa/crash"
+        mkdir -p "$crash_dir"
+        local crash_ts
+        crash_ts=$(date -u +"%Y%m%d_%H%M%S")
+        local crash_path="$crash_dir/wa_crash_${crash_ts}"
+        mkdir -p "$crash_path"
+        local epoch_secs
+        epoch_secs=$(date +%s)
+        local created_at
+        created_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+        cat > "$crash_path/crash_report.json" <<EOF
+{
+  "message": "E2E crash for triage scenario",
+  "location": "e2e.rs:1",
+  "backtrace": null,
+  "timestamp": $epoch_secs,
+  "pid": 1234,
+  "thread_name": "e2e"
+}
+EOF
+
+        cat > "$crash_path/manifest.json" <<EOF
+{
+  "wa_version": "e2e",
+  "created_at": "$created_at",
+  "files": ["crash_report.json"],
+  "has_health_snapshot": false,
+  "bundle_size_bytes": 0
+}
+EOF
+
+        # Step 4: Seed DB with pane, events, and a waiting workflow
+        log_info "Step 4: Seeding DB (pane, events, workflow)..."
+        sqlite3 "$db_path" <<SQL
+PRAGMA foreign_keys = ON;
+INSERT OR REPLACE INTO panes (
+    pane_id, pane_uuid, domain, window_id, tab_id, title, cwd, tty_name,
+    first_seen_at, last_seen_at, observed, ignore_reason, last_decision_at
+) VALUES (
+    $pane_id, 'e2e-pane-uuid', 'local', 1, 1, 'e2e-pane', '$temp_workspace', 'tty-e2e',
+    $now_ms, $now_ms, 1, NULL, $now_ms
+);
+
+INSERT INTO events (
+    pane_id, rule_id, agent_type, event_type, severity, confidence,
+    extracted, matched_text, segment_id, detected_at, handled_at,
+    handled_by_workflow_id, handled_status, dedupe_key
+) VALUES (
+    $pane_id, 'e2e.triage:error', 'codex', 'error', 'error', 0.9,
+    NULL, 'E2E error event', NULL, $now_ms, NULL,
+    NULL, NULL, 'e2e-triage-error'
+);
+
+INSERT INTO events (
+    pane_id, rule_id, agent_type, event_type, severity, confidence,
+    extracted, matched_text, segment_id, detected_at, handled_at,
+    handled_by_workflow_id, handled_status, dedupe_key
+) VALUES (
+    $pane_id, 'e2e.triage:warning', 'codex', 'warning', 'warning', 0.6,
+    NULL, 'E2E warning event', NULL, $now_ms, NULL,
+    NULL, NULL, 'e2e-triage-warning'
+);
+
+INSERT INTO workflow_executions (
+    id, workflow_name, pane_id, trigger_event_id, current_step, status,
+    wait_condition, context, result, error, started_at, updated_at, completed_at
+) VALUES (
+    'e2e-workflow-1', 'handle_compaction', $pane_id, NULL, 2, 'waiting',
+    '{"type":"pattern","rule_id":"e2e.wait"}', NULL, NULL, NULL,
+    $now_ms, $now_ms, NULL
+);
+SQL
+
+        # Step 5: Run triage and capture output
+        log_info "Step 5: Running wa triage..."
+        "$WA_BINARY" triage -f json > "$scenario_dir/triage.json" \
+            2> "$scenario_dir/triage_stderr.log" || true
+        "$WA_BINARY" triage --details > "$scenario_dir/triage.txt" \
+            2> "$scenario_dir/triage_details_stderr.log" || true
+
+        if ! jq -e '.ok == true' "$scenario_dir/triage.json" >/dev/null 2>&1; then
+            log_fail "Triage JSON missing ok=true"
+            result=1
+        fi
+
+        if jq -e '.items | length >= 4' "$scenario_dir/triage.json" >/dev/null 2>&1; then
+            log_pass "Triage returned multiple items"
+        else
+            log_fail "Expected multiple triage items"
+            result=1
+        fi
+
+        if jq -e '.items | map(.section) | index("health") != null' "$scenario_dir/triage.json" >/dev/null 2>&1; then
+            log_pass "Health item present"
+        else
+            log_fail "Health item missing"
+            result=1
+        fi
+
+        if jq -e '.items | map(.section) | index("crashes") != null' "$scenario_dir/triage.json" >/dev/null 2>&1; then
+            log_pass "Crash item present"
+        else
+            log_fail "Crash item missing"
+            result=1
+        fi
+
+        if jq -e '.items | map(.section) | index("events") != null' "$scenario_dir/triage.json" >/dev/null 2>&1; then
+            log_pass "Event item present"
+        else
+            log_fail "Event item missing"
+            result=1
+        fi
+
+        if jq -e '.items | map(.section) | index("workflows") != null' "$scenario_dir/triage.json" >/dev/null 2>&1; then
+            log_pass "Workflow item present"
+        else
+            log_fail "Workflow item missing"
+            result=1
+        fi
+
+        local first_severity
+        first_severity=$(jq -r '.items[0].severity // empty' "$scenario_dir/triage.json" 2>/dev/null || echo "")
+        if [[ "$first_severity" == "error" ]]; then
+            log_pass "Triage ordering places error severity first"
+        else
+            log_fail "Unexpected triage ordering (first severity: $first_severity)"
+            result=1
+        fi
+
+        if jq -e 'all(.items[]; (.action != null) and (.actions != null))' "$scenario_dir/triage.json" >/dev/null 2>&1; then
+            log_pass "Triage items include actions"
+        else
+            log_fail "Missing actions in triage items"
+            result=1
+        fi
+    fi
+
+    trap - EXIT
+    cleanup_triage_multi_issue
+
+    return $result
+}
+
 run_scenario_rules_explain_trace() {
     local scenario_dir="$1"
     local result=0
@@ -5332,6 +5563,9 @@ run_scenario() {
             ;;
         quickfix_suggestions)
             run_scenario_quickfix_suggestions "$scenario_dir" || result=$?
+            ;;
+        triage_multi_issue)
+            run_scenario_triage_multi_issue "$scenario_dir" || result=$?
             ;;
         rules_explain_trace)
             run_scenario_rules_explain_trace "$scenario_dir" || result=$?

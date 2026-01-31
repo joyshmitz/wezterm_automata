@@ -4,6 +4,7 @@
 //! management for graceful shutdown.
 
 use crate::{Error, Result, VERSION};
+use asupersync::net::TcpListener;
 use fastapi::core::{ControlFlow, Cx, Handler, Middleware, StartupOutcome};
 use fastapi::prelude::{App, Method, Request, RequestContext, Response};
 use fastapi::{ServerConfig, ServerError, TcpServer};
@@ -11,7 +12,6 @@ use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
@@ -132,8 +132,6 @@ impl Middleware for RequestSpanLogger {
 
 fn build_app() -> App {
     App::builder()
-        .title("wa web")
-        .version(VERSION)
         .middleware(RequestSpanLogger::default())
         .route(
             "/health",
